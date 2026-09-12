@@ -27,6 +27,11 @@ ignoreUntil = 2027-02-28
 reason = "lru 0.7.8/0.8.1 pop() UAF requires a cache KEY whose Drop panics, caught via catch_unwind. Every LruCache key in this crate is [u8;32], String, or (u32,[u8;32]) — none has a panicking Drop — and catch_unwind is unused. 0.7.8 is pinned by reed-solomon-erasure 6.0.0 (latest), so only a filter can clear it. Re-review if a cache key type gains a Drop impl. Reviewed 2026-08-13."
 
 [[IgnoredVulns]]
+id = "RUSTSEC-2026-0192"
+ignoreUntil = 2027-02-28
+reason = "ttf-parser 0.25.1 is an unmaintained notice, not a defect -- the author has stopped maintaining it and recommends skrifa. It reaches only the wallet binary (iced 0.14 -> cosmic-text -> fontdb); the node does not link it. The fonts it parses are the five the wallet embeds with include_bytes! plus whatever fontdb finds installed locally -- none of them arrives over the network. Pinned by iced's text stack, so only a filter can clear it until that stack moves to skrifa. Reviewed 2026-09-12."
+
+[[IgnoredVulns]]
 id = "GHSA-vxx9-2994-q338"
 ignoreUntil = 2027-01-31
 reason = "yamux 0.12.1 remote-panic path is unreachable: runtime uses fixed 0.13.10 backend and Kademlia fallback is opt-in/off by default. Re-review on any libp2p change. Reviewed 2026-07-31."

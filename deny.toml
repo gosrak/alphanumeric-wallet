@@ -31,6 +31,14 @@ ignore = [
   # Reviewed 2026-08-13.
   "RUSTSEC-2026-0253",
 
+  # ttf-parser 0.25.1 — an unmaintained notice, not a defect: the author has stopped
+  # maintaining it and points at skrifa. Reaches only the wallet binary
+  # (iced 0.14 -> cosmic-text -> fontdb); the node does not link it. What it parses is
+  # the five fonts the wallet embeds with include_bytes! plus whatever fontdb finds
+  # installed locally — nothing arriving over the network. Pinned by iced's text stack,
+  # so it clears when that stack moves to skrifa, not before. Reviewed 2026-09-12.
+  "RUSTSEC-2026-0192",
+
 ]
 
 # NOT ignored, recorded so it is not re-investigated from scratch: yamux 0.12.1 carries
