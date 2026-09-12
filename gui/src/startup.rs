@@ -1,26 +1,29 @@
-//! 지갑을 열었을 때 노드가 어디까지 왔는가.
+//! How far along the node is when the wallet is opened.
 //!
-//! 순수하다 -- `iced` 도 I/O 도 없다. `app.rs` 가 상태와 로그를 가져오고,
-//! 이 모듈은 그것으로 단계만 말한다.
+//! Pure -- no `iced`, no I/O. `app.rs` fetches the state and the log; this
+//! module only turns that into a phase.
 //!
-//! 실측(2026-09-10, 스펙 §2.5)이 이 모듈의 모양을 정했다: 단계는 둘이다.
-//! `index_ready` 는 새 설치에서도 재기동에서도 첫 응답부터 참이었으므로
-//! 색인은 사용자가 기다리는 단계가 아니다 -- 확인은 하되 단계로 세우지 않는다.
+//! A measurement (2026-09-10, spec §2.5) settled this module's shape: there
+//! are two phases. `index_ready` was true from the first response, on both a
+//! fresh install and a restart, so indexing is not a phase the user waits
+//! on -- it's checked, but not set up as its own step.
 
 use crate::backend::NodeStatus;
 use crate::node::NodeState;
 
-/// 이 이하로 뒤처진 것은 "동기화됨"으로 본다.
+/// Lagging by this much or less counts as "synced".
 ///
-/// 0 이 아닌 이유는 실측이다: 정상 상태에서 `blocks_behind` 가 0↔4 를 계속
-/// 오간다 (새 블록 도착 → 흡수). 0 을 기준 삼으면 화면과 배너가 평생
-/// 깜빡인다.
+/// Not 0, and that's from measurement: in a healthy steady state,
+/// `blocks_behind` keeps swinging between 0 and 4 (a new block arrives, gets
+/// absorbed). Using 0 as the line would leave the screen and the banner
+/// flickering forever.
 pub const SYNCED_SLACK: u64 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
-    /// 노드가 뜨는 중. 익스플로러가 아직 답하지 않는다. 새 설치에서는 이
-    /// 구간 안에 스냅샷 내려받기가 들어가고, 그것만이 회선에 좌우된다.
+    /// The node is coming up. The explorer isn't answering yet. On a fresh
+    /// install, the snapshot download falls inside this span, and that part
+    /// alone depends on the connection.
     Starting {
         last_line: Option<String>,
         percent: Option<u8>,
@@ -64,8 +67,8 @@ pub fn phase(node: Option<&NodeState>, status: Option<&NodeStatus>, log_tail: &[
         Some(NodeState::Running { .. }) | None => {}
     }
 
-    // 셋이 다 있어야 판단할 수 있다. `network_height` 가 없다는 것은
-    // "따라잡았다"가 아니라 "비콘을 아직 못 봤다"이다.
+    // All three have to be present to judge anything. A missing
+    // `network_height` means "no beacon seen yet", not "caught up".
     let Some(status) = status else {
         return starting(log_tail);
     };
@@ -83,8 +86,8 @@ pub fn phase(node: Option<&NodeState>, status: Option<&NodeStatus>, log_tail: &[
         };
     }
     if !status.index_ready {
-        // 실측에서는 늘 참이었다. 거짓이면 따라잡기가 아니라 이상 상황이므로
-        // 진입시키지 않는다.
+        // Always true in measurement. If false, that's an anomaly rather
+        // than catching up, so it isn't let in as `Ready`.
         return Phase::CatchingUp {
             height,
             network_height,
@@ -104,8 +107,9 @@ fn starting(log_tail: &[String]) -> Phase {
     Phase::Starting { last_line, percent }
 }
 
-/// 줄에서 `NN%` 를 찾는다. **장식일 뿐이다** -- 없어도 화면은 옳아야 하고,
-/// 정확성이 여기 걸려 있으면 노드가 문구를 바꿀 때 화면이 조용히 거짓말한다.
+/// Finds `NN%` in a line. **Decoration only** -- the screen must still be
+/// correct without it, and if correctness depended on this, the screen would
+/// quietly start lying the moment the node changes its wording.
 pub fn parse_percent(line: &str) -> Option<u8> {
     let idx = line.find('%')?;
     let digits: String = line[..idx]
@@ -269,7 +273,8 @@ mod tests {
         );
     }
 
-    /// 정확성을 정규식에 걸지 않는다. 노드가 문구를 바꿔도 화면은 옳아야 한다.
+    /// Correctness isn't staked on a regex. The screen must stay right even
+    /// if the node changes its wording.
     #[test]
     fn a_line_without_a_percentage_still_produces_a_correct_phase() {
         let log = vec!["something nobody planned for".to_string()];
@@ -289,8 +294,8 @@ mod tests {
         assert_eq!(parse_percent("no digits here"), None);
     }
 
-    /// 비콘 전에는 network_height 가 null 이다. 그것은 "따라잡았다"가 아니라
-    /// "아직 모른다"이므로 Ready 로 넘어가면 안 된다.
+    /// Before a beacon, `network_height` is null. That means "not known
+    /// yet", not "caught up", so this must not fall through to `Ready`.
     #[test]
     fn a_status_without_a_beacon_is_still_starting() {
         let s = status(Some(10), None, None);
@@ -316,8 +321,9 @@ mod tests {
         );
     }
 
-    /// 실측: 정상 상태에서 blocks_behind 가 0↔4 를 계속 오간다. 0 을 기준
-    /// 삼으면 화면이 평생 깜빡인다.
+    /// Measured: in a healthy steady state, `blocks_behind` keeps swinging
+    /// between 0 and 4. Using 0 as the line would flicker the screen
+    /// forever.
     #[test]
     fn a_small_gap_counts_as_ready() {
         for behind in 0..=SYNCED_SLACK {
@@ -340,8 +346,8 @@ mod tests {
         ));
     }
 
-    /// 색인이 없으면 잔액도 이력도 못 믿는다. 실측에서는 늘 참이었으므로
-    /// 거짓이면 그것은 따라잡기가 아니라 이상 상황이다.
+    /// Without the index, neither balance nor history can be trusted. It was
+    /// always true in measurement, so false is an anomaly, not catching up.
     #[test]
     fn an_unready_index_is_not_ready_even_when_the_height_is_caught_up() {
         let mut s = status(Some(100), Some(100), Some(0));
@@ -365,7 +371,8 @@ mod tests {
         );
     }
 
-    /// 포트 충돌이 이 모양으로 온다. 로그 꼬리를 붙여야 사용자가 이유를 안다.
+    /// A port conflict arrives in this shape. The log tail has to be
+    /// attached for the user to know why.
     #[test]
     fn a_node_that_exited_reports_it_with_the_log_tail() {
         let node = NodeState::Exited { code: Some(1) };
@@ -387,8 +394,9 @@ mod tests {
         ));
     }
 
-    /// 우리가 세운 노드는 "죽었다"와 다르게 읽혀야 한다 -- Exited 는 로그
-    /// 꼬리를 원인처럼 붙이는데, 요청받아 내려간 것에는 붙일 원인이 없다.
+    /// A node we brought down ourselves must read differently from "it
+    /// crashed" -- `Exited` attaches the log tail as if it were the cause,
+    /// but a node stopped on request has no cause to attach.
     #[test]
     fn a_stopped_node_is_reported_as_stopped_not_as_a_crash() {
         let log = vec!["something unrelated".to_string()];

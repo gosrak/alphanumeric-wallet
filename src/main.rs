@@ -2358,11 +2358,11 @@ async fn async_main() -> Result<()> {
                                 }
                             }
                             P::Unminable { reason } => {
-                                // 락이 poison 되면 이 보고를 잃되, 패닉하지는
-                                // 않는다. unwrap 이면 이후 모든 보고가 패닉하고,
-                                // 그 unwind 는 session_ended() 앞을 지나가므로
-                                // 엔드포인트가 프로세스가 죽을 때까지
-                                // `mining: true` 로 얼어붙는다.
+                                // A poisoned lock loses this report rather than panicking.
+                                // Using `unwrap` instead would panic on every later report,
+                                // and since that unwind passes in front of `session_ended()`,
+                                // the endpoint would freeze at `mining: true` until the
+                                // process dies.
                                 if let Ok(mut slot) = end_reason_report.lock() {
                                     *slot = Some(format!("prep refused: {}", reason));
                                 }
@@ -6048,20 +6048,22 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 헤드리스 채굴 설정. `None` 이면 채굴하지 않는다 — 오류가 아니라 지금까지의
-/// 헤드리스 동작이다.
+/// Headless mining configuration. `None` means do not mine -- not an error,
+/// just the existing headless behaviour.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadlessMining {
     pub wallet: String,
     pub use_gpu: bool,
 }
 
-/// `ALPHANUMERIC_MINE` / `ALPHANUMERIC_MINE_BACKEND` 를 읽는다. `headless` 는
-/// `ALPHANUMERIC_HEADLESS` 다 — 채굴 변수를 받았는데 헤드리스가 아니면
-/// 거절한다(조용히 무시하면 채굴하지 않는 노드로 뜬다).
+/// Reads `ALPHANUMERIC_MINE` / `ALPHANUMERIC_MINE_BACKEND`. `headless` is
+/// `ALPHANUMERIC_HEADLESS` -- refuses if the mining variable is set but we
+/// are not headless (silently ignoring it would bring up a node that mines
+/// nothing).
 ///
-/// 환경변수를 직접 읽지 않고 인자로 받는 이유는 테스트다 — 프로세스 전역
-/// 환경을 건드리는 테스트는 병렬 실행에서 서로를 깨뜨린다.
+/// Takes the environment variables as arguments instead of reading them
+/// directly for testing -- a test that touches the process-global
+/// environment breaks its neighbours under parallel execution.
 fn parse_headless_mining(
     mine: Option<&str>,
     backend: Option<&str>,
@@ -6080,10 +6082,10 @@ fn parse_headless_mining(
         );
     }
     if !headless {
-        // 채굴하라는 변수를 받고도 대화형 메뉴를 띄우면, 그 노드는 아무것도
-        // 캐지 않으면서 아무 말도 하지 않는다 — `screen` 아래에서는 그대로
-        // 며칠 간다. 이 기능의 다른 네 거절과 같은 판단이다: 조용히 무시하지
-        // 않는다.
+        // If the interactive menu comes up despite a variable asking for mining,
+        // that node mines nothing while saying nothing about it -- under `screen`
+        // it sits like that for days. Same judgment as this feature's other four
+        // refusals: don't silently ignore it.
         return Err(
             "ALPHANUMERIC_MINE is set, but ALPHANUMERIC_HEADLESS is not: mining from an \
              environment variable only happens in headless mode, so this node would start \
@@ -6096,9 +6098,10 @@ fn parse_headless_mining(
         None => gpu_built,
         Some("gpu") => {
             if !gpu_built {
-                // CPU 로 강등하지 않는다. REPL 이 같은 판단을 하는 이유가
-                // 그대로 여기에도 적용된다 — 강등된 줄은 스크롤로 사라지고,
-                // 운영자는 기대치의 400분의 1로 한 세션을 통째로 채굴한다.
+                // Does not downgrade to CPU. The same reasoning behind the REPL's
+                // choice applies here too -- a downgrade line scrolls away, and the
+                // operator ends up mining an entire session at 1/400th of the
+                // expected rate.
                 return Err(
                     "ALPHANUMERIC_MINE_BACKEND=gpu, but this binary was built without GPU \
                      support. Rebuild with `--features gpu_miner`, or set \
@@ -6518,18 +6521,18 @@ fn boot_note(status: Option<&ProgressBar>, line: String) {
     }
 }
 
-/// 압축 해제 진행률을 바이트로 재는 쓰기 래퍼.
+/// A write wrapper that measures extraction progress in bytes.
 ///
-/// 파일 개수로 재면 안 된다: 실제 스냅샷 아카이브는 엔트리가 **하나**이고
-/// (`chain.redb`, ~1 GB), 파일 단위 십분위는 0 에서 움직이지 않는다.
-/// 2026-09-11 실측에서 그렇게 30~45초가 통째로 침묵했다.
+/// Must not measure by file count: a real snapshot archive has a **single**
+/// entry (`chain.redb`, ~1 GB), so a per-file decile never moves off 0. A
+/// 2026-09-11 measurement saw exactly that: 30-45 seconds of total silence.
 ///
-/// 진행 바가 있는 대화형 실행에서는 조용히 지나간다 -- 그쪽은 바가 화면을
-/// 갖고 있고, 여기서 또 찍으면 바를 망가뜨린다.
+/// Stays quiet during an interactive run with a progress bar -- that side
+/// owns the screen, and printing here on top of it would corrupt the bar.
 struct ExtractProgress<'a, W: std::io::Write> {
     inner: W,
     quiet: bool,
-    /// 엔트리를 가로질러 누적된다. 분모가 아카이브 전체이기 때문이다.
+    /// Accumulates across entries, since the denominator is the whole archive.
     written: &'a mut u64,
     last_decile: &'a mut u64,
     total: Option<u64>,
@@ -6544,8 +6547,8 @@ impl<W: std::io::Write> std::io::Write for ExtractProgress<'_, W> {
                 let decile = self.written.saturating_mul(10) / total;
                 if decile > *self.last_decile {
                     *self.last_decile = decile;
-                    // println! 인 이유: env_logger 가 LevelFilter::Error 라
-                    // (main.rs:727) log::info! 는 어디에도 나타나지 않는다.
+                    // Uses `println!` because `env_logger` is at `LevelFilter::Error`
+                    // (main.rs:727), so `log::info!` never shows up anywhere.
                     println!(
                         "  extracting snapshot {}% ({} / {} MB)",
                         decile.saturating_mul(10),
@@ -6701,9 +6704,10 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                 }
             }
             LaunchDbStatus::Missing | LaunchDbStatus::Empty => {
-                // 기존 체인을 고치는 분기들은 전부 무슨 일을 하는지 말하는데
-                // 처음 설치하는 이 분기만 말이 없었다. 새 기계의 첫 실행에서
-                // 가장 긴 구간이 통째로 침묵이었다 (2026-09-10 실측).
+                // Every branch that repairs an existing chain says what it's doing,
+                // but this fresh-install branch was silent. On a new machine's first
+                // run, this was the longest stretch that stayed silent (measured
+                // 2026-09-10).
                 boot_note(
                     status.as_ref(),
                     "no local chain yet — fetching the current snapshot".to_string(),
@@ -6934,9 +6938,9 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
             let decile = downloaded_size.saturating_mul(10) / total;
             if decile > dl_last_decile {
                 dl_last_decile = decile;
-                // boot_note 로 간다: env_logger 가 Error 레벨이라 log::info!
-                // 는 어디에도 나타나지 않았다. 느린 회선에서는 이 줄이
-                // 유일한 생명 신호다.
+                // Goes through `boot_note`: `env_logger` is at Error level, so
+                // `log::info!` never shows up anywhere. On a slow connection, this
+                // line is the only sign of life.
                 boot_note(
                     status.as_ref(),
                     format!(
@@ -7065,7 +7069,8 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         b
     });
     let extract_pb_worker = extract_pb.clone();
-    // 진행 바가 없는 실행(헤드리스)에서 압축 해제가 통째로 침묵하지 않도록.
+    // So extraction doesn't go completely silent on a run with no progress bar
+    // (headless).
     let extract_quiet = extract_pb.is_none();
     let extract_result = tokio::task::spawn_blocking(
         move || -> std::result::Result<BootstrapArchiveStats, String> {
@@ -10682,8 +10687,8 @@ mod tests {
         assert!(err.is_err());
     }
 
-    // 환경변수가 없으면 채굴하지 않는다. 이것은 오류가 아니다 — 지금까지의
-    // 헤드리스 동작이 그대로 남는다.
+    // No environment variable means no mining. This is not an error -- the
+    // existing headless behaviour is unchanged.
     #[test]
     fn no_mine_variable_means_no_mining_and_no_error() {
         assert_eq!(parse_headless_mining(None, None, true, true), Ok(None));
@@ -10693,7 +10698,8 @@ mod tests {
         );
     }
 
-    // 백엔드 기본값은 빌드가 정한다 — REPL 의 `mine` 과 같은 규칙이다.
+    // The backend default follows what the binary was built for -- same rule
+    // as the REPL's `mine`.
     #[test]
     fn the_backend_defaults_to_what_the_binary_was_built_for() {
         assert_eq!(
@@ -10730,14 +10736,18 @@ mod tests {
         );
     }
 
-    // GPU 를 못 하는 빌드에서 gpu 를 요구하면 **실패한다.** CPU 로 강등하지
-    // 않는다 — 강등 한 줄은 스크롤로 사라지고, 운영자가 400분의 1 속도로 한
-    // 세션을 통째로 채굴한 전례가 있다(REPL 의 같은 판단, main.rs:3090 부근).
+    // Requesting gpu on a build without GPU support **fails.** It does not
+    // downgrade to CPU -- a downgrade line scrolls away, and there is
+    // precedent for an operator mining an entire session at 1/400th of the
+    // expected speed (same judgment as the REPL, around `main.rs:3090`).
     #[test]
     fn asking_for_gpu_on_a_cpu_only_build_is_an_error_not_a_downgrade() {
         let err = parse_headless_mining(Some("w"), Some("gpu"), false, true).unwrap_err();
-        assert!(err.contains("gpu"), "무엇이 문제인지 말해야 한다: {err}");
-        assert!(err.contains("built"), "빌드 문제임을 말해야 한다: {err}");
+        assert!(err.contains("gpu"), "must say what the problem is: {err}");
+        assert!(
+            err.contains("built"),
+            "must say it's a build problem: {err}"
+        );
     }
 
     #[test]
@@ -10746,27 +10756,32 @@ mod tests {
         assert!(parse_headless_mining(Some("w"), Some(""), true, true).is_err());
     }
 
-    // 공백만 있는 지갑 이름은 이름이 아니다. 그대로 통과시키면 나중에
-    // "지갑을 찾을 수 없다"로 나오는데, 진짜 원인은 오타난 환경변수다.
+    // A wallet name that is only whitespace is not a name. Letting it through
+    // surfaces later as "wallet not found", when the real cause is a typo'd
+    // environment variable.
     #[test]
     fn a_blank_wallet_name_is_an_error() {
         assert!(parse_headless_mining(Some("   "), None, true, true).is_err());
     }
 
-    // ALPHANUMERIC_HEADLESS 없이 ALPHANUMERIC_MINE 만 주면 **거절한다.**
-    // 조용히 무시하면 노드는 대화형 메뉴를 띄우고 아무것도 캐지 않는데,
-    // systemd/docker/screen 아래에서는 그 상태가 며칠 간다.
+    // Giving ALPHANUMERIC_MINE without ALPHANUMERIC_HEADLESS **is refused.**
+    // Ignoring it silently would start the node's interactive menu while it
+    // mines nothing, and under systemd/docker/screen that state lasts for
+    // days.
     #[test]
     fn mine_without_headless_is_refused_not_ignored() {
         let err = parse_headless_mining(Some("w"), None, true, false).unwrap_err();
         assert!(
             err.contains("ALPHANUMERIC_HEADLESS"),
-            "무엇을 켜야 하는지 말해야 한다: {err}"
+            "must say what to turn on: {err}"
         );
-        assert!(err.contains("mine"), "대화형 대안을 말해야 한다: {err}");
+        assert!(
+            err.contains("mine"),
+            "must mention the interactive alternative: {err}"
+        );
     }
 
-    // 변수가 아예 없으면 대화형 기동은 지금까지와 같다 — 오류가 아니다.
+    // With no variable at all, interactive startup is unchanged -- not an error.
     #[test]
     fn no_mine_variable_outside_headless_is_still_not_an_error() {
         assert_eq!(parse_headless_mining(None, None, true, false), Ok(None));

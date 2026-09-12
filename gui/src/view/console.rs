@@ -1,7 +1,7 @@
-//! 맨 위 두 층: 상태 띠와 3줄 × 4칸 지표 격자.
+//! The top two layers: the status strip and a 3-row by 4-column metrics grid.
 //!
-//! 값이 없으면 `—` 다. 0 이 아니다 -- 이 화면에서 "피어 0" 은 고립됐다는
-//! 뜻이고 "모른다" 와 전혀 다른 이야기다.
+//! An absent value is `—`, not 0 -- on this screen "0 peers" means isolated,
+//! a completely different story from "unknown".
 
 use iced::widget::{column, container, row, text};
 use iced::{Element, Length};
@@ -106,11 +106,13 @@ pub(crate) fn sync_ratio(height: Option<u64>, network: Option<u64>) -> Option<f3
     }
 }
 
-/// External 모드에서는 격자의 절반이 영구히 `—` 다: CPU·MEMORY·DISK 는 잴
-/// 프로세스가 없고, PEERS·HASHRATE·MEMPOOL·AVG BLOCK·DIFFICULTY·BLOCK REWARD
-/// 는 노드의 `/stats` 포트에서 오는데 남의 노드는 그 포트를 알려주지 않는다.
-/// 대시 자체는 정직하지만 이유가 없으면 "고장났다"로 읽힌다 -- 한 줄로 말한다.
-/// Owned 에서 대시는 "아직 모른다"이고 곧 채워지므로 설명하지 않는다.
+/// In External mode, half the grid is permanently `—`: there's no process
+/// to measure CPU/MEMORY/DISK, and PEERS, HASHRATE, MEMPOOL, AVG BLOCK,
+/// DIFFICULTY, and BLOCK REWARD come from the node's `/stats` port, which
+/// someone else's node won't hand out. The dash itself is honest, but
+/// without a reason it reads as "broken" -- so we say so in one line. In
+/// Owned mode the dash means "not known yet" and fills in soon, so it goes
+/// unexplained.
 fn grid_note(external: bool) -> Option<&'static str> {
     external.then_some(
         "External node: the process figures and the node's own /stats figures \
@@ -118,9 +120,10 @@ fn grid_note(external: bool) -> Option<&'static str> {
     )
 }
 
-/// 동기화 여부만 색을 갖는다 -- 나머지는 사실이라 강조가 필요 없다. 비콘을
-/// 아직 못 본 것(`None`)은 "따라잡았다"와 다른 사실이므로 SYNCED 로도, 그
-/// 색으로도 접히면 안 된다.
+/// Only the sync state gets a color -- everything else is a plain fact
+/// that needs no emphasis. Not having seen a beacon yet (`None`) is a
+/// different fact from "caught up", so it must not collapse into SYNCED,
+/// or into its color.
 fn sync_label(behind: Option<u64>) -> (String, iced::Color) {
     match behind {
         Some(n) if n <= alphanumeric_gui::startup::SYNCED_SLACK => {
@@ -137,9 +140,10 @@ pub(crate) fn fmt_hashrate(hps: f64) -> String {
     format!("{:.1} GH/s", hps / 1e9)
 }
 
-/// 노드는 채굴 중이 아니면 `mining_*` 필드 전부(그리고 `mining` 자신)를 아예
-/// 생략한다. "안 캔다"(`Some(false, ..)`)와 "물어본 적 없다"(`None`)는 다른
-/// 사실이라 둘 다 "MINING OFF" 로 접으면 안 된다.
+/// When the node isn't mining, it omits every `mining_*` field entirely
+/// (`mining` itself included). "Not mining" (`Some(false, ..)`) and "never
+/// asked" (`None`) are different facts, so neither should collapse into
+/// "MINING OFF".
 fn mining_label(mining: &Option<(bool, Option<f64>, Option<String>)>) -> (String, iced::Color) {
     match mining {
         Some((true, hps, _)) => (
@@ -166,7 +170,7 @@ fn gap(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-/// 색인 지연: 0 은 "current" 라는 문장이지 "−0" 이 아니고, 모르면 대시다.
+/// Index lag: 0 reads as the word "current", not "-0"; unknown is a dash.
 fn lag_label(lag: Option<u64>) -> String {
     lag.map(|n| {
         if n == 0 {
@@ -316,8 +320,8 @@ pub fn meter_grid<'a>(data: &ConsoleData<'a>) -> Element<'a, Message> {
 mod tests {
     use super::*;
 
-    /// 없는 값은 0 이 아니라 `—` 다. 0 으로 그리면 "피어 0"(고립됐다),
-    /// "해시레이트 0"(아무도 안 캔다) 같은 거짓말을 하게 된다.
+    /// An absent value is `—`, not 0. Drawing it as 0 would lie: "0 peers"
+    /// (isolated), "0 hashrate" (nobody is mining).
     #[test]
     fn an_absent_value_is_a_dash_not_a_zero() {
         assert_eq!(or_dash(None::<u64>), "—");
@@ -325,8 +329,9 @@ mod tests {
         assert_eq!(or_dash(Some(11u64)), "11");
     }
 
-    /// External 에서 영구히 빈 칸들은 이유를 달고, Owned 의 대시는 "곧
-    /// 채워진다"이므로 설명을 달지 않는다 -- 달면 모든 기동 순간에 거짓이다.
+    /// External's permanently empty cells carry a reason; Owned's dash
+    /// means "will fill in soon", so it carries no explanation -- one
+    /// would be a lie at every moment during startup.
     #[test]
     fn only_an_external_node_explains_its_empty_cells() {
         assert_eq!(grid_note(false), None);

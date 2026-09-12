@@ -61,9 +61,10 @@ fn fmt_duration(total_secs: u64) -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
-/// 가동시간은 살아 있는 프로세스에 대해서만 뜻이 있다. `node_stats()` 는
-/// 재조회 실패와 재시작을 넘어 유지되므로, 이 문을 없애면 죽었거나 방금
-/// 재시작한 프로세스의 **이전 실행** 가동시간이 현재값인 양 나간다.
+/// Uptime only means something for a process that is alive. `node_stats()`
+/// persists across failed re-queries and restarts, so dropping this guard
+/// would show a dead or freshly restarted process's **previous run**
+/// uptime as if it were current.
 fn uptime_line(running: bool, uptime_secs: Option<u64>) -> String {
     if !running {
         return "—".to_string();

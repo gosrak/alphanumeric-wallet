@@ -4200,9 +4200,11 @@ impl App {
         Ok(())
     }
 
-    /// 탭 띠와 콘솔이 보이는 화면인가. `view()` 와 `subscription()` 이 **같은**
-    /// 답을 써야 한다 -- 두 곳에 같은 match 를 적어 두면 새 전체화면이 생길 때
-    /// 한쪽만 고쳐지고, 있으면 안 되는 화면에 F키가 살아난다.
+    /// Whether this screen shows the tab strip and console. `view()` and
+    /// `subscription()` must agree on the **same** answer -- keeping the
+    /// same match in two places means a new full-screen view can get fixed
+    /// in only one of them, leaving F-keys alive on a screen that
+    /// shouldn't have them.
     fn tabs_visible(&self) -> bool {
         !matches!(self.screen, Screen::Setup | Screen::Startup)
     }
@@ -4222,7 +4224,8 @@ impl App {
             Screen::Node => crate::view::node::view(self),
             Screen::Settings => crate::view::settings::view(self),
         };
-        // 지갑이 없으면 탭도 콘솔도 없다: 보낼 것도, 볼 노드도 아직 없다.
+        // No wallet means no tabs and no console either: nothing to send
+        // yet, no node to watch.
         if !self.tabs_visible() {
             return inner;
         }
@@ -4357,8 +4360,9 @@ impl App {
         // is ready.
         let tabs_visible = self.tabs_visible();
 
-        // 위젯이 소비하지 않은 키만 온다(iced_futures/src/keyboard.rs). 그래서
-        // 텍스트 입력 중에도 글자는 입력칸이 먹고 F 키만 여기로 온다.
+        // Only keys a widget hasn't consumed reach here
+        // (iced_futures/src/keyboard.rs). So even mid-text-entry, the input
+        // field eats the characters and only F-keys arrive here.
         let keys = if tabs_visible {
             iced::keyboard::listen().filter_map(|event| match event {
                 iced::keyboard::Event::KeyPressed { ref key, .. } => {
@@ -6005,8 +6009,9 @@ mod tests {
         }
     }
 
-    // 이력 화면에 들어가면 병합을 처음부터 짓는다. 새 블록은 내림차순의 맨
-    // 위에 붙으므로, 이어 붙이는 것이 아니라 다시 짓는 것이 맞다.
+    // Opening the history screen builds the merge from scratch. New blocks
+    // attach at the top of the descending order, so rebuilding is correct,
+    // not appending.
     #[test]
     fn opening_history_starts_a_fresh_merge() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6015,12 +6020,16 @@ mod tests {
         let wallet = app.wallet.as_ref().expect("wallet");
         let history = wallet.history.as_ref().expect("history started");
         assert!(history.rows_len() == 0);
-        assert!(history.in_flight, "첫 페이지 요청이 나가 있어야 한다");
+        assert!(
+            history.in_flight,
+            "the first page's request must be in flight"
+        );
         assert_eq!(app.screen, Screen::History);
     }
 
-    // 페이지가 실패하면 목록은 그 자리에 멈춘다. 실패한 주소를 건너뛰고
-    // 계속하면 병합 불변식이 깨져 목록이 조용히 틀린다.
+    // If a page fails, the list stops right there. Skipping the failed
+    // address and continuing would break the merge invariant and leave the
+    // list silently wrong.
     #[test]
     fn a_failed_page_stops_the_list_instead_of_skipping_the_address() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6038,7 +6047,7 @@ mod tests {
             0,
             generation,
             None,
-            Err(backend::ApiError::Transport("연결 거부".into())),
+            Err(backend::ApiError::Transport("connection refused".into())),
         ));
         let history = app
             .wallet
@@ -6048,12 +6057,16 @@ mod tests {
             .as_ref()
             .expect("history");
         assert!(history.error.is_some());
-        assert!(!history.in_flight, "다음 요청을 자동으로 보내지 않는다");
+        assert!(
+            !history.in_flight,
+            "does not automatically send the next request"
+        );
         assert_eq!(history.rows_len(), 0);
     }
 
-    // 이력 화면을 떠나면 상태를 버린다. 남겨 두면 다시 들어왔을 때 오래된
-    // 목록이 먼저 보이고, 그 사이 캔 블록이 빠진 채로 완결돼 보인다.
+    // Leaving the history screen drops its state. Keeping it would show
+    // the stale list first on re-entry, looking complete while missing
+    // whatever blocks were mined in between.
     #[test]
     fn leaving_history_drops_the_merge() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6886,9 +6899,10 @@ mod tests {
         }
     }
 
-    /// 한 번 들어간 지갑에서 새 블록 몇 개 때문에 동기화 화면으로 돌아가면
-    /// 안 된다. **`update` 를 실제로 태운다** -- 필드를 세팅하고 그 필드를
-    /// 다시 읽는 테스트는 아무것도 검사하지 않는다.
+    /// Once on the wallet screen, a few new blocks behind must not send it
+    /// back to the sync screen. **This actually drives `update`** -- a
+    /// test that sets a field and reads that same field back checks
+    /// nothing.
     #[test]
     fn once_on_the_wallet_screen_a_lagging_status_does_not_take_it_back() {
         let (mut app, _) = App::new();
@@ -6902,7 +6916,8 @@ mod tests {
         assert!(matches!(app.node_phase, Phase::CatchingUp { .. }));
     }
 
-    /// 반대 방향은 실제로 일어나야 한다: 동기화 화면에서 따라잡으면 나간다.
+    /// The reverse must actually happen: catching up on the sync screen
+    /// leaves it.
     #[test]
     fn the_startup_screen_hands_over_once_the_node_is_caught_up() {
         let (mut app, _) = App::new();
@@ -6980,8 +6995,9 @@ mod tests {
         assert!(!app.setup_settings_open);
     }
 
-    /// 폴링이 겹치지 않게 하는 깃발이 실제로 내려가는지. 안 내려가면
-    /// 구독이 영원히 죽어 화면이 얼어붙는다.
+    /// Whether the flag that keeps polls from overlapping actually clears.
+    /// If it doesn't, the subscription dies forever and the screen
+    /// freezes.
     #[test]
     fn a_finished_poll_clears_the_in_flight_flag() {
         let (mut app, _) = App::new();
@@ -7017,8 +7033,9 @@ mod tests {
         assert_eq!(app.node_source, NodeSource::Owned);
     }
 
-    /// 외부 노드를 고르면 자식은 뜨지 않는다 -- 남의 노드를 쓰겠다는 사람에게
-    /// 173 MB 를 내려받게 하면 안 된다.
+    /// Choosing an external node means no child process starts -- someone
+    /// who wants to use another node's shouldn't be made to download
+    /// 173 MB.
     #[test]
     fn choosing_an_external_node_stops_owning_one() {
         let (mut app, _) = App::new();
@@ -7034,7 +7051,8 @@ mod tests {
         assert_eq!(app.node_url, DEFAULT_NODE_URL);
     }
 
-    /// 입력 도중의 반쪽 값이 거부되면 사용자가 포트를 고칠 수 없다.
+    /// Rejecting a half-typed value while typing would leave the user
+    /// unable to fix the port.
     #[test]
     fn a_half_typed_port_is_kept_as_typed() {
         let (mut app, _) = App::new();
@@ -7053,7 +7071,8 @@ mod tests {
         assert_eq!(app.resolved_ports(), (7200, 8200, 8297));
     }
 
-    /// 빈 칸과 쓰레기는 기본값으로 떨어진다 -- 거부가 아니라 폴백이다.
+    /// An empty field or garbage falls back to the default -- a fallback,
+    /// not a rejection.
     #[test]
     fn an_unusable_port_falls_back_to_the_default() {
         let (mut app, _) = App::new();
@@ -7069,8 +7088,8 @@ mod tests {
         );
     }
 
-    /// 빈 바이너리 경로는 "설정 안 함"이지 "빈 경로"가 아니다 --
-    /// locate_binary 가 None 을 받아야 GUI 옆을 찾는다 (Task 1).
+    /// An empty binary path means "not configured", not "an empty path" --
+    /// `locate_binary` must receive `None` to look next to the GUI (Task 1).
     #[test]
     fn an_empty_binary_path_means_look_next_to_the_wallet() {
         let (mut app, _) = App::new();
@@ -7355,8 +7374,9 @@ mod tests {
         );
     }
 
-    /// 지갑이 없으면 탭 키가 아무것도 하지 않는다. 보낼 지갑이 없는데
-    /// "보내기" 화면으로 보내면 빈 화면이 나온다.
+    /// Tab keys do nothing before a wallet exists. Sending the user to the
+    /// "Send" screen with no wallet to send from would show an empty
+    /// screen.
     #[test]
     fn tab_keys_do_nothing_before_a_wallet_exists() {
         let (mut app, _) = App::new();
@@ -7365,9 +7385,10 @@ mod tests {
         assert_eq!(app.screen, Screen::Setup);
     }
 
-    /// F-8: "채굴 안 함" 은 아는 사실이다. 노드가 상태를 보냈다면 `mining`
-    /// 필드는 언제나 있으므로(`mining_status_json`), `Some((false, ..))` 이지
-    /// `None` 이 아니다. `None` 은 "상태 응답 자체가 없다"에만 쓴다.
+    /// F-8: "not mining" is a known fact. If the node sent a status at
+    /// all, the `mining` field is always present (`mining_status_json`),
+    /// so it's `Some((false, ..))`, not `None`. `None` is reserved for "no
+    /// status response at all".
     #[test]
     fn mining_from_status_distinguishes_no_status_from_not_mining() {
         assert_eq!(mining_from_status(None), None);
@@ -7385,9 +7406,10 @@ mod tests {
         );
     }
 
-    /// `ConsoleTick` 은 요청이 이미 나가 있으면 다시 부르지 않는다 -- 세
-    /// 주기(2초/10초/60초)를 하나의 틱으로 묶었으므로, 겹치는 요청을 막는
-    /// 이 락이 없으면 응답이 오기 전에 다음 틱이 또 쏜다.
+    /// `ConsoleTick` does not fire again while a request is already
+    /// outstanding -- it bundles three cadences (2s/10s/60s) into one
+    /// tick, so without this lock against overlap the next tick would
+    /// fire again before the response comes back.
     #[test]
     fn a_console_tick_does_not_issue_a_second_stats_request_while_one_is_outstanding() {
         let dir = tempfile::tempdir().expect("tempdir");

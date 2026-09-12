@@ -7692,19 +7692,20 @@ impl Node {
         }))
     }
 
-    /// 채굴 상태를 status 응답에 실을 조각으로 만든다.
+    /// Builds the mining status piece to fold into the status response.
     ///
-    /// 순수 함수로 떼어 둔 이유는 테스트다 — 전역 상태를 읽는 핸들러 전체를
-    /// 띄우지 않고 "채굴 중이 아닐 때 필드가 없다"를 직접 확인할 수 있다.
+    /// Kept as a pure function for testing -- it lets us check "no field
+    /// when not mining" directly, without spinning up the whole handler that
+    /// reads global state.
     ///
-    /// 채굴 중이 아니면 나머지 다섯을 **생략한다**(null 이 아니라 부재). null 로
-    /// 실으면 소비자가 "채굴 중인데 주소를 모른다"와 "채굴 중이 아니다"를
-    /// 구분하지 못한다. `mining_hps: 0` 은 "채굴 중인데 아직 측정 전"이라는
-    /// 뜻이므로 그것은 생략하지 않는다.
+    /// When not mining, the other five fields are **omitted** (absent, not
+    /// null). Sending null would leave a consumer unable to tell "mining, but
+    /// the address is unknown" apart from "not mining". `mining_hps: 0` means
+    /// "mining, but not measured yet", so that one is never omitted.
     ///
-    /// `payout_rotation` 이 참이면 코인베이스는 높이에 따라 도는 스케줄
-    /// 주소로 가고 `mining_address` 는 그 주소가 아니다 — 풀 운영에서 둘이
-    /// 갈라진다.
+    /// When `payout_rotation` is true, the coinbase goes to a schedule
+    /// address that rotates by height, and `mining_address` is not that
+    /// address -- the two diverge in pool operation.
     fn mining_status_json(
         mining: bool,
         address: Option<String>,
@@ -7790,9 +7791,9 @@ impl Node {
                     .saturating_sub(state.start_time),
             })
         };
-        // 채굴 조각을 같은 객체에 합친다. status 는 "이 노드가 무엇을 하고
-        // 있는가"를 답하는 엔드포인트이고 채굴은 그중 하나다 — 별도 라우트를
-        // 만들면 소비자가 두 번 물어야 한다.
+        // Merges the mining piece into the same object. status is the endpoint
+        // that answers "what is this node doing", and mining is one such
+        // thing -- a separate route would make a consumer ask twice.
         let mut payload = payload;
         if let (Value::Object(base), Value::Object(mining)) = (
             &mut payload,
@@ -7802,10 +7803,10 @@ impl Node {
                 crate::a9::miner::status::backend(),
                 crate::a9::miner::status::hashes_per_second(),
                 crate::a9::miner::status::blocks_mined(),
-                // 환경변수만 본다. 파일을 읽으면 status GET 마다 디스크 IO 가
-                // 생긴다 — mine_block 이 어차피 블록마다 다시 읽으므로,
-                // "변수가 설정돼 있다"가 곧 "이 프로세스에서 로테이션이
-                // 돈다"이다.
+                // Only looks at the environment variable. Reading a file would
+                // add disk IO to every status GET -- and since mine_block
+                // rereads it per block anyway, "the variable is set" already
+                // means "rotation runs in this process".
                 crate::a9::miner::PayoutSchedule::configured(),
             ),
         ) {
@@ -26279,8 +26280,9 @@ mod tests {
         assert!(waited >= Duration::from_secs(10));
     }
 
-    // 채굴 중이 아닐 때 나머지 넷은 **없어야** 한다. null 로 실으면 소비자가
-    // "채굴 중인데 주소를 모른다"와 "채굴 중이 아니다"를 구분하지 못한다.
+    // When not mining, the other four fields **must be absent**. Sending null
+    // would leave a consumer unable to tell "mining, but the address is
+    // unknown" apart from "not mining".
     #[test]
     fn an_idle_node_reports_mining_false_and_omits_the_rest() {
         let v = Node::mining_status_json(false, None, None, 0, 0, false);
@@ -26292,8 +26294,8 @@ mod tests {
         assert!(v.get("mining_payout_rotation").is_none());
     }
 
-    // 채굴 중이면 여섯 개가 다 나온다. hps 0 은 "아직 측정 전"이라는 뜻으로
-    // 남으므로 생략하지 않는다.
+    // When mining, all six fields appear. hps 0 keeps meaning "not measured
+    // yet", so it is not omitted.
     #[test]
     fn a_mining_node_reports_all_six_including_a_zero_rate() {
         let v = Node::mining_status_json(
@@ -26315,13 +26317,13 @@ mod tests {
         assert_eq!(
             v["mining_payout_rotation"],
             serde_json::json!(false),
-            "로테이션이 없으면 코인베이스는 mining_address 로 간다"
+            "with no rotation, the coinbase goes to mining_address"
         );
     }
 
-    // 로테이션이 돌면 코인베이스는 높이가 고르는 스케줄 주소로 가고
-    // `mining_address` 는 그 주소가 아니다. 풀 배포에서 정확히 이 경우가
-    // 나오므로, 필드가 그 사실을 말해야 한다.
+    // With rotation running, the coinbase goes to a schedule address chosen
+    // by height, and `mining_address` is not that address. Pool deployments
+    // hit exactly this case, so the field must say so.
     #[test]
     fn a_payout_rotation_is_reported_next_to_the_address_it_overrides() {
         let v = Node::mining_status_json(
@@ -26335,9 +26337,10 @@ mod tests {
         assert_eq!(
             v["mining_payout_rotation"],
             serde_json::json!(true),
-            "코인베이스가 다른 데로 가면 그렇게 말해야 한다"
+            "must say so when the coinbase goes elsewhere"
         );
-        // 주소는 계속 실린다 — 다만 뜻이 "이 세션이 채굴하는 지갑"이다.
+        // The address is still reported -- it just now means "the wallet this
+        // session mines with".
         assert_eq!(
             v["mining_address"],
             serde_json::json!("abc0000000000000000000000000000000000001")

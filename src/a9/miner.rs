@@ -56,15 +56,16 @@ const TIP_CHANGE_CHECK_INTERVAL: u64 = 256;
 /// many-core miner, throttling the very machines the thread pool freed up.
 const DB_TIP_CONFIRM_INTERVAL: u64 = 262_144;
 
-/// 채굴 상태를 프로세스 전역으로 들고 있는 곳.
+/// Where mining status is held as a process global.
 ///
-/// 전역인 이유: 노드는 한 번에 한 세션만 돌리고, 읽는 쪽(`/explorer/status`)은
-/// 채굴 루프에 대한 참조를 갖고 있지 않다. `node.rs` 의 `RELAY_BACKFILL_INFLIGHT`
-/// 와 같은 패턴이다.
+/// Global because the node only ever runs one session at a time, and the
+/// reader (`/explorer/status`) has no reference to the mining loop. Same
+/// pattern as `node.rs`'s `RELAY_BACKFILL_INFLIGHT`.
 ///
-/// 해시레이트를 여기에 두는 이유는 헤드리스다. GPU 경로와 CPU 경로가 각자
-/// 계산한 값을 `pb.set_message` 로만 보내는데, 헤드리스에는 진행바가 없어서
-/// 통째로 삼켜진다. 로그로 테일할 줄조차 없다.
+/// The hashrate lives here for headless mode's sake. The GPU and CPU paths
+/// each send their computed value only through `pb.set_message`, and headless
+/// has no progress bar to catch it -- it would be swallowed whole, with not
+/// even a log line to tail.
 pub mod status {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::RwLock;
@@ -73,7 +74,8 @@ pub mod status {
     static HPS: AtomicU64 = AtomicU64::new(0);
     static BLOCKS: AtomicU64 = AtomicU64::new(0);
     static USE_GPU: AtomicBool = AtomicBool::new(false);
-    // 주소만 문자열이라 락이 필요하다. 세션 시작·종료에만 쓰므로 경합이 없다.
+    // Only the address is a string, so it needs a lock. No contention, since
+    // it's only touched at session start and end.
     static ADDRESS: RwLock<Option<String>> = RwLock::new(None);
 
     // `cargo test` runs tests in parallel by default, and this module's state
@@ -118,8 +120,9 @@ pub mod status {
     }
 
     pub fn session_started(address: &str, use_gpu: bool) {
-        // 카운터를 먼저 되돌린 뒤 MINING 을 세운다. 반대로 하면 그 사이에
-        // 읽은 소비자가 이전 세션의 숫자를 이번 것으로 본다.
+        // Resets the counters before setting MINING. Doing it the other way
+        // round lets a consumer that reads in between see the previous
+        // session's numbers as this one's.
         HPS.store(0, Ordering::Relaxed);
         BLOCKS.store(0, Ordering::Relaxed);
         USE_GPU.store(use_gpu, Ordering::Relaxed);
@@ -131,9 +134,9 @@ pub mod status {
 
     pub fn session_ended() {
         MINING.store(false, Ordering::Relaxed);
-        // 레이트도 같이 0 으로 돌린다. 안 그러면 세션이 끝난 뒤에도 마지막
-        // grind 의 수치가 그대로 남아, `mining_hps == 0` 을 보는 감시가
-        // 영원히 울리지 않는다.
+        // Resets the rate to 0 too. Otherwise the last grind's number would
+        // stick around after the session ends, and a watch on
+        // `mining_hps == 0` would never fire.
         HPS.store(0, Ordering::Relaxed);
         if let Ok(mut slot) = ADDRESS.write() {
             *slot = None;
@@ -144,10 +147,11 @@ pub mod status {
         HPS.store(hashes_per_second, Ordering::Relaxed);
     }
 
-    /// 세션 도중 백엔드가 바뀌었음을 알린다 — GPU 가 죽어 CPU 로 강등되는
-    /// 자리에서 부른다. `session_started` 가 한 번 찍고 마는 값이면, 죽은
-    /// GPU 를 계속 "gpu" 라고 보고해 1000배 떨어진 레이트를 설명할 유일한
-    /// 필드가 거짓말을 한다.
+    /// Reports that the backend changed mid-session -- called at the point
+    /// where a dead GPU downgrades to CPU. If `session_started` were a
+    /// write-once value, the field that's supposed to explain a rate that
+    /// just dropped 1000x would keep lying and reporting the dead GPU as
+    /// "gpu".
     pub fn record_backend(use_gpu: bool) {
         USE_GPU.store(use_gpu, Ordering::Relaxed);
     }
@@ -659,8 +663,8 @@ impl MiningManager {
                     } else {
                         String::new()
                     };
-                    // 같은 값을 화면과 상태 양쪽에 보낸다. 화면만 보내면
-                    // 헤드리스에서 사라진다.
+                    // Sends the same value to both the screen and status.
+                    // Sending it only to the screen would lose it in headless.
                     status::record_rate((ghs * 1.0e9) as u64);
                     pb.set_message(format!(
                         "{:.2} GH/s · block in {} · diff {}{}",
@@ -1770,16 +1774,18 @@ mod tests {
 mod status_tests {
     use super::status;
 
-    // 상태는 프로세스 전역이라 테스트가 서로 간섭한다. 한 테스트 안에서
-    // 전체 수명을 확인하고, 다른 테스트를 이 값에 걸지 않는다.
+    // The state is a process global, so tests interfere with each other.
+    // This checks the whole lifecycle within one test, and no other test
+    // relies on this value.
     #[test]
     fn a_session_records_its_address_backend_rate_and_blocks() {
-        // 이 상태는 프로세스 전역이다. 다른 테스트와 병렬로 돌면 서로의
-        // session_started/record_* 가 섞인다 — 이 락으로 직렬화한다.
+        // This state is a process global. Running in parallel with another
+        // test would interleave their session_started/record_* calls --
+        // this lock serializes them.
         let _guard = status::TEST_LOCK.blocking_lock();
         assert!(
             !status::is_mining(),
-            "테스트 시작 시점에는 채굴 중이 아니어야 한다"
+            "should not be mining at the start of the test"
         );
 
         status::session_started("abc0000000000000000000000000000000000001", false);
@@ -1789,7 +1795,8 @@ mod status_tests {
             Some("abc0000000000000000000000000000000000001")
         );
         assert_eq!(status::backend(), Some("cpu"));
-        // 시작 직후에는 아직 측정 전이다. 0 은 "모름"이 아니라 "아직"이다.
+        // Right after start, nothing has been measured yet. 0 means "not yet",
+        // not "unknown".
         assert_eq!(status::hashes_per_second(), 0);
 
         status::record_rate(1_234_567);
@@ -1804,20 +1811,21 @@ mod status_tests {
         assert_eq!(
             status::address(),
             None,
-            "끝난 세션의 주소를 계속 보여주면 안 된다"
+            "must not keep showing a finished session's address"
         );
         assert_eq!(status::backend(), None);
-        // 끝난 세션의 레이트를 계속 실으면 `mining_hps == 0` 을 보는 감시가
-        // 영원히 울리지 않는다.
+        // Keeping a finished session's rate around would mean a watch on
+        // `mining_hps == 0` never fires.
         assert_eq!(
             status::hashes_per_second(),
             0,
-            "세션이 끝났으면 레이트도 0 이어야 한다"
+            "the rate must also be 0 once the session has ended"
         );
     }
 
-    // 세션 도중 GPU 가 죽으면 백엔드가 바뀐다. 바뀐 것을 안 실으면, 1000배
-    // 떨어진 레이트를 설명할 유일한 필드가 "gpu" 라고 우긴다.
+    // If the GPU dies mid-session, the backend changes. Failing to report
+    // that change leaves the one field meant to explain a 1000x rate drop
+    // insisting it's "gpu".
     #[test]
     fn a_mid_session_demotion_changes_the_published_backend() {
         let _guard = status::TEST_LOCK.blocking_lock();
@@ -1828,25 +1836,26 @@ mod status_tests {
         assert_eq!(
             status::backend(),
             Some("cpu"),
-            "GPU 가 죽어 CPU 로 강등됐으면 그렇게 보고해야 한다"
+            "a GPU that died and demoted to CPU should be reported as such"
         );
 
-        // 회복 방향. `gpu_active` 는 라운드마다 다시 정해지므로 카드가
-        // 돌아오면 다시 GPU 로 간다. 그때 되돌려 쓰지 않으면 상태는
-        // 프로세스가 사는 내내 "cpu" 로 남는다 -- session_started 가 한 번
-        // 찍고 끝이라, 이 함수 말고는 true 를 쓰는 곳이 없다.
+        // The recovery direction. `gpu_active` is redecided every round, so the
+        // backend goes back to GPU once the card returns. Without writing it
+        // back here, the status would stay "cpu" for the rest of the
+        // process's life -- `session_started` fires once and is done, so this
+        // function is the only other place that writes `true`.
         status::record_backend(true);
         assert_eq!(
             status::backend(),
             Some("gpu"),
-            "카드가 돌아왔으면 상태도 돌아와야 한다"
+            "once the card comes back, the status should come back too"
         );
 
         status::session_ended();
     }
 
-    // 새 세션은 이전 세션의 숫자를 물려받지 않는다. 물려받으면 화면이
-    // 이번 실행에서 캔 것보다 많은 블록을 보여준다.
+    // A new session does not inherit the previous session's numbers.
+    // Inheriting them would show more blocks on screen than this run mined.
     #[test]
     fn a_new_session_resets_the_counters() {
         let _guard = status::TEST_LOCK.blocking_lock();

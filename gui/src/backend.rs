@@ -9,13 +9,17 @@ use crate::model::parse_units;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeStatus {
-    /// 체인이 비어 있으면 `None` (`explorer_status_handler` 의 `tip.as_ref().map`).
+    /// `None` when the chain is empty (`explorer_status_handler`'s
+    /// `tip.as_ref().map`).
     pub height: Option<u64>,
-    /// 서명된 비콘을 하나도 못 봤으면 `None`. 기동 직후가 그렇다.
+    /// `None` when not a single signed beacon has been seen yet. That's the
+    /// case right after startup.
     pub network_height: Option<u64>,
-    /// 위와 짝. 둘 중 하나라도 없으면 노드가 이것도 보내지 않는다.
+    /// Paired with the field above. If either one is missing, the node
+    /// doesn't send this one either.
     pub blocks_behind: Option<u64>,
-    /// 주소 색인이 쓸 수 있는 상태인가. 잔액과 이력이 여기에 달려 있다.
+    /// Whether the address index is in a usable state. Balance and history
+    /// both hang on this.
     pub index_ready: bool,
     pub index_height: Option<u64>,
     pub version: String,
@@ -101,12 +105,14 @@ pub struct FeeEstimate {
     pub floor_units: i128,
 }
 
-/// 지갑 전체의 성숙 대기 금액. 주소 하나라도 지출가능을 모르면 전체가
-/// `None` 이다 -- 부분 합계는 "덜 익은 게 이만큼"이라는 거짓말이 된다.
+/// The whole wallet's amount still maturing. If even one address's spendable
+/// is unknown, the whole total is `None` -- a partial sum would be a lie
+/// about "this much is still maturing".
 ///
-/// 성숙 지연은 코인베이스에만 걸린다 (`src/a9/blockchain.rs` 의
-/// `MINING_REWARD_MATURITY`). 일반 송금은 확정되면 바로 쓸 수 있으므로
-/// `성숙 대기 = 잔액 − 지출가능`, 지갑의 모든 주소에 대해 합산한다.
+/// The maturity delay applies only to coinbase (`src/a9/blockchain.rs`'s
+/// `MINING_REWARD_MATURITY`). An ordinary transfer is spendable as soon as it
+/// confirms, so `maturing = balance - spendable`, summed over every address
+/// in the wallet.
 pub fn maturing_units(addresses: &[(i128, Option<i128>)]) -> Option<i128> {
     let mut total: i128 = 0;
     for (balance, spendable) in addresses {
@@ -120,9 +126,10 @@ pub fn maturing_units(addresses: &[(i128, Option<i128>)]) -> Option<i128> {
 // read here.
 #[derive(Deserialize)]
 struct WireStatus {
-    // 셋 다 실제로 `null` 로 온다 -- 비콘 전, 그리고 빈 체인. 필수로 두면
-    // 건강한 "아직 뜨는 중" 응답이 ApiError::Malformed 가 된다. `WireAddress`
-    // 가 같은 이유로 같은 선택을 이미 하고 있다.
+    // All three really do arrive as `null` -- before a beacon, and on an
+    // empty chain. Making them required would turn a healthy "still coming
+    // up" response into `ApiError::Malformed`. `WireAddress` already makes
+    // the same choice for the same reason.
     height: Option<u64>,
     network_height: Option<u64>,
     blocks_behind: Option<u64>,
@@ -187,19 +194,21 @@ pub fn parse_status(json: &str) -> Result<NodeStatus, String> {
         index_ready: wire.index_ready,
         index_height: wire.index_height,
         version: wire.version,
-        // 노드는 이 필드를 생략하지 않고 0 을 보낸다. 그 0 은 "0번 블록까지
-        // 확정"이 아니라 "아직 체크포인트가 없다"는 뜻이다 (`explorer_status_handler`
-        // 의 "0 means not yet seeded"). 경계에서 None 으로 바꿔 두면 소비자마다
-        // 0 을 기억해 특수 처리할 필요가 없다 -- 한 곳만 잊어도 "0번 블록까지
-        // 확정"이라는 거짓이 화면에 샌다.
+        // The node doesn't omit this field -- it sends 0. That 0 means "no
+        // checkpoint yet", not "confirmed through block 0"
+        // (`explorer_status_handler`'s "0 means not yet seeded"). Turning it
+        // into `None` at the boundary means no consumer has to remember to
+        // special-case 0 -- forget that in even one place and the lie
+        // "confirmed through block 0" leaks onto the screen.
         finalized_height: wire.finalized_height.filter(|h| *h != 0),
         mining: wire.mining,
         mining_address: wire.mining_address,
         mining_backend: wire.mining_backend,
-        // 같은 모양의 센티널이다: 노드는 채굴을 켜기 직전에 `HPS=0` 을 먼저
-        // 적는다(`miner.rs` 의 `session_started`, `node.rs` 의
-        // `mining_status_json` 문서 "채굴 중인데 아직 측정 전"). 그 0 을
-        // 여기서 None 으로 바꾸면 띠는 이미 있는 `MINING ON` 갈래로 간다.
+        // The same shape of sentinel: the node writes `HPS=0` first, the
+        // instant before it switches mining on (`miner.rs`'s
+        // `session_started`, documented in `node.rs`'s `mining_status_json`
+        // as "mining but not measured yet"). Turning that 0 into `None` here
+        // sends the strip down the `MINING ON` branch it already has.
         mining_hps: wire.mining_hps.filter(|h| *h != 0.0),
         mining_blocks: wire.mining_blocks,
         mining_payout_rotation: wire.mining_payout_rotation,
@@ -327,8 +336,9 @@ pub struct NodeStats {
     pub hashrate_ths: Option<f64>,
     pub difficulty: Option<f64>,
     pub uptime_secs: Option<u64>,
-    /// 아래 셋은 노드가 아직 안 낼 수 있다(계획 Task 3 이 더한다). 없으면
-    /// 그 칸만 `—` 이고 나머지 격자는 산다.
+    /// The three below can still be absent from the node (planned Task 3
+    /// adds them). When one is absent, only that field reads `—` and the
+    /// rest of the grid stays alive.
     pub mempool: Option<u64>,
     pub avg_block_time_secs: Option<f64>,
     pub block_reward: Option<f64>,
@@ -336,8 +346,9 @@ pub struct NodeStats {
 
 #[derive(Deserialize)]
 struct WireStats {
-    // 전부 Option: 노드 버전에 따라 없을 수 있고, 있어도 null 일 수 있다.
-    // null 을 0 으로 접으면 "피어 0"(고립됐다)과 "모른다"가 같아진다.
+    // All `Option`: depending on the node's version, a field may be absent,
+    // and even present it may be null. Folding `null` into 0 would make "0
+    // peers" (isolated) the same thing as "unknown".
     peers: Option<u64>,
     hashrate_ths: Option<f64>,
     difficulty: Option<f64>,
@@ -727,7 +738,8 @@ impl Client {
         parse_status(&fetched.body).map_err(ApiError::Malformed)
     }
 
-    /// 노드의 stats 서버. 익스플로러와 **다른 포트**라 base 를 따로 받는다.
+    /// The node's stats server. It's on a **different port** from the
+    /// explorer, so it takes `base` separately.
     pub async fn stats(&self, base: &str) -> Result<NodeStats, ApiError> {
         let url = format!("{}/stats", base.trim_end_matches('/'));
         let fetched = self.get_absolute(&url).await?;
@@ -842,8 +854,9 @@ mod tests {
         );
     }
 
-    /// 한 주소의 지출가능을 모르면 합계도 모른다. 그 주소를 빼고 더하면
-    /// "덜 익은 게 이만큼"이라고 확언하게 되는데 그건 아는 바가 아니다.
+    /// If one address's spendable is unknown, the total is unknown too.
+    /// Leaving that address out of the sum would assert "this much is still
+    /// maturing", which isn't something actually known.
     #[test]
     fn one_unknown_spendable_makes_the_whole_total_unknown() {
         assert_eq!(maturing_units(&[(1000, Some(400)), (50, None)]), None);
@@ -884,9 +897,10 @@ mod tests {
         assert_eq!(status.version, "8.0.0");
     }
 
-    /// 기동 직후 노드가 실제로 보내는 모양. 비콘을 보기 전까지
-    /// network_height 와 blocks_behind 가 null 이다 (`explorer_status_handler`).
-    /// 이것을 Malformed 로 취급하면 동기화 화면이 첫 폴링부터 오류를 그린다.
+    /// The shape the node actually sends right after startup. Both
+    /// `network_height` and `blocks_behind` are null until a beacon is seen
+    /// (`explorer_status_handler`). Treating this as `Malformed` would have
+    /// the sync screen draw an error from the very first poll.
     const STATUS_JSON_NO_BEACON: &str = r#"{"blocks_behind":null,"finality_margin":64,"finalized_height":0,"height":12,"index_height":12,"index_ready":true,"network_height":null,"network_id":"66b4","ok":true,"tip_hash":"0000","uptime_secs":3,"version":"8.0.0"}"#;
 
     #[test]
@@ -1448,8 +1462,9 @@ mod tests {
         }
     }
 
-    /// 채굴 중이 아니면 노드가 mining_* 를 아예 보내지 않는다(생략 규칙).
-    /// 그것을 Malformed 로 취급하면 안 캐는 노드에서 격자가 통째로 죽는다.
+    /// When not mining, the node omits `mining_*` entirely (the omission
+    /// rule). Treating that as `Malformed` would kill the whole grid on any
+    /// node that isn't mining.
     #[test]
     fn a_status_from_a_node_that_is_not_mining_still_parses() {
         let json = r#"{"ok":true,"height":10,"network_height":10,"blocks_behind":0,"index_ready":true,"index_height":10,"finalized_height":9,"version":"8.0.0","mining":false}"#;
@@ -1459,8 +1474,8 @@ mod tests {
         assert_eq!(s.finalized_height, Some(9));
     }
 
-    /// 회전 중이면 mining_address 한 줄이 거짓이 된다 -- 그 사실이 파싱되어야
-    /// 화면이 거짓말을 피할 수 있다.
+    /// While rotating, a single `mining_address` line would be a lie -- this
+    /// fact has to be parsed out for the screen to avoid telling it.
     #[test]
     fn a_rotating_payout_is_carried_through() {
         let json = r#"{"ok":true,"height":10,"network_height":10,"blocks_behind":0,"index_ready":true,"version":"8.0.0","mining":true,"mining_hps":2.78e10,"mining_payout_rotation":true}"#;
@@ -1469,10 +1484,11 @@ mod tests {
         assert_eq!(s.mining_hps, Some(2.78e10));
     }
 
-    /// 노드는 채굴을 시작하는 순간 `HPS=0` 을 먼저 적고 `MINING=true` 를 켠다
-    /// (`miner.rs` 의 `session_started`). 그 `0` 은 노드 자신의 문서대로
-    /// "채굴 중인데 아직 측정 전"이지 잰 값이 아니다. 띠가 `MINING 0.0 GH/s`
-    /// 라고 하면 "채굴기가 죽었다"로 읽힌다 -- 측정 전은 `MINING ON` 이다.
+    /// The instant it starts mining, the node writes `HPS=0` first and then
+    /// switches `MINING=true` on (`miner.rs`'s `session_started`). By the
+    /// node's own documentation, that `0` is "mining but not measured yet",
+    /// not a measured value. A strip reading `MINING 0.0 GH/s` reads as "the
+    /// miner is dead" -- not-yet-measured is `MINING ON`.
     #[test]
     fn a_hashrate_not_yet_measured_is_absent_not_zero() {
         let json = r#"{"ok":true,"height":10,"network_height":10,"blocks_behind":0,"index_ready":true,"version":"8.0.0","mining":true,"mining_hps":0,"mining_payout_rotation":false}"#;
@@ -1498,12 +1514,13 @@ mod tests {
         );
     }
 
-    /// 손으로 쓴 예시다(`node.rs`의 실제 `stats_handler`는 `ok` 를 보내지
-    /// 않고, `difficulty`/`peers`/`uptime_secs` 는 정수, `version` 은
-    /// `"rust-<NETWORK_VERSION>"` 형태다) -- 여기서 못박는 것은 "노드
-    /// 버전에 따라 세 필드가 아직 없을 수 있고, 그래도 파싱되어야 한다"는
-    /// 생략 규칙이지 이 바이트 그대로의 캡처가 아니다. 이것이 Malformed 가
-    /// 되면 Task 3 을 배포하기 전까지 격자가 통째로 죽는다.
+    /// Hand-written, not a real capture (`node.rs`'s actual `stats_handler`
+    /// doesn't send `ok`, sends `difficulty`/`peers`/`uptime_secs` as
+    /// integers, and shapes `version` as `"rust-<NETWORK_VERSION>"`) -- what
+    /// this pins down is the omission rule, "three fields can still be
+    /// absent depending on node version, and this must still parse", not a
+    /// byte-for-byte capture. If this became `Malformed`, the whole grid
+    /// would die until Task 3 ships.
     const STATS_TODAY: &str = r#"{"ok":true,"height":1005522,"difficulty":464.0,"hashrate_ths":27.8,"peers":11,"uptime_secs":86400,"version":"8.0.0"}"#;
 
     #[test]
@@ -1527,8 +1544,8 @@ mod tests {
         assert_eq!(s.block_reward, Some(50.0));
     }
 
-    /// null 은 "잴 수 없었다"이고 0 이 아니다. 피어가 null 인데 0 으로
-    /// 읽으면 "고립됐다"는 거짓말을 하게 된다.
+    /// `null` means "could not be measured", not 0. Reading a null peer
+    /// count as 0 tells the lie "isolated".
     #[test]
     fn nulls_stay_none_rather_than_becoming_zero() {
         let json =

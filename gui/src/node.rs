@@ -1,7 +1,8 @@
-//! 지갑이 데리고 다니는 노드.
+//! The node the wallet brings along.
 //!
-//! 이 모듈은 프로세스를 다루지만 `iced` 는 모른다 -- lib 크레이트의 규율이다.
-//! 단계 판정은 여기 있지 않다: `startup.rs` 가 순수 함수로 답한다.
+//! This module deals with the process but knows nothing of `iced` -- a
+//! discipline of the lib crate. Stage determination doesn't live here:
+//! `startup.rs` answers that as a pure function.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -9,19 +10,22 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 채굴 노드의 7177 을 피한다. 포트를 명시하면 노드는 충돌 시 조용히 다른
-/// 포트로 새지 않고 실패한다 -- `src/a9/node.rs` `initialize_listener` 의 랜덤 포트 폴백은 주소를
-/// 명시하지 않은 분기에만 있다. 실패하는 쪽이 우리가 원하는 거동이다.
+/// Avoids the mining node's 7177. Naming the port explicitly means the node
+/// fails on conflict instead of quietly leaking onto another one -- the
+/// random port fallback in `src/a9/node.rs`'s `initialize_listener` only
+/// applies to the branch where no address was given. Failing is the
+/// behavior we want.
 pub const DEFAULT_P2P_PORT: u16 = 7178;
-/// 채굴 노드의 8095 를 피한다.
+/// Avoids the mining node's 8095.
 pub const DEFAULT_EXPLORER_PORT: u16 = 8096;
-/// 채굴 노드의 8787 을 피한다.
+/// Avoids the mining node's 8787.
 pub const DEFAULT_STATS_PORT: u16 = 8097;
 pub const LOG_FILE: &str = "node.log";
-/// 노드가 자기 cwd 에 만드는 인스턴스 락 (`main.rs` 의 `INSTANCE_LOCK_PATH`). 데이터 디렉터리가
-/// GUI 소유이므로 고아를 걷어낼 때 여기서 pid 를 읽는다.
+/// The instance lock the node creates in its own cwd (`main.rs`'s
+/// `INSTANCE_LOCK_PATH`). The data directory belongs to the GUI, so this is
+/// where we read the pid back when reclaiming an orphan.
 pub const INSTANCE_LOCK: &str = ".alphanumeric.instance.lock";
-/// 노드 바이너리의 관례적 이름.
+/// The conventional name of the node binary.
 const BINARY_NAME: &str = "alphanumeric";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +47,8 @@ impl NodeConfig {
     }
 }
 
-/// keystore 와 같은 규칙 (`storage::default_path` 가 `~/.alphanumeric-gui/seed.enc`).
+/// Same convention as the keystore (`storage::default_path` is
+/// `~/.alphanumeric-gui/seed.enc`).
 pub fn default_data_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| {
         let mut path = PathBuf::from(home);
@@ -53,14 +58,15 @@ pub fn default_data_dir() -> Option<PathBuf> {
     })
 }
 
-/// 설정된 경로가 있으면 그것, 없으면 GUI 실행 파일 옆의 `alphanumeric`.
+/// The configured path if there is one, otherwise `alphanumeric` next to the
+/// GUI executable.
 ///
-/// `PATH` 는 뒤지지 않는다. 거기 있는 것은 채굴 노드의 바이너리일 가능성이
-/// 높고 버전도 빌드 피처도 다를 수 있다 -- 지갑이 띄우는 노드는 지갑이 아는
-/// 것이어야 한다.
+/// We do not search `PATH`. What's there is likely the mining node's
+/// binary, possibly a different version with different build features --
+/// the node the wallet starts must be one the wallet knows about.
 ///
-/// `exe_dir` 를 인자로 받는 이유는 테스트다: `current_exe()` 는 테스트
-/// 실행 파일을 가리킨다. 호출자가 `std::env::current_exe()?.parent()` 를 준다.
+/// `exe_dir` is a parameter for testing: `current_exe()` points at the test
+/// executable. Callers pass `std::env::current_exe()?.parent()`.
 pub fn locate_binary(configured: Option<&Path>, exe_dir: &Path) -> Result<PathBuf, String> {
     if let Some(path) = configured {
         return if path.is_file() {
@@ -85,14 +91,15 @@ pub fn locate_binary(configured: Option<&Path>, exe_dir: &Path) -> Result<PathBu
     }
 }
 
-/// 자식에게 줄 환경 전부. **부모 환경은 상속하지 않는다** -- 사용자의 셸에
-/// 있던 `ALPHANUMERIC_*` 가 지갑 노드를 채굴 노드 설정으로 끌고 간다.
-/// `HOME`/`PATH`/`LANG` 은 호출자가 따로 넘긴다 (Task 2).
+/// The whole environment given to the child. **It does not inherit the
+/// parent's environment** -- an `ALPHANUMERIC_*` left in the user's shell
+/// would drag the wallet's node into the mining node's configuration.
+/// `HOME`/`PATH`/`LANG` are passed separately by the caller (Task 2).
 pub fn child_env(config: &NodeConfig) -> Vec<(String, String)> {
     vec![
-        // 지갑 없는 노드로 뜬다. `private.key` 가 없으면 프롬프트 없이
-        // 계속한다 (`main.rs` `async_main` 의 "Headless mode: no private.key
-        // found" 분기).
+        // Starts as a node with no wallet. With no `private.key` it
+        // proceeds without a prompt (`main.rs`'s `async_main`, the
+        // "Headless mode: no private.key found" branch).
         ("ALPHANUMERIC_HEADLESS".into(), "true".into()),
         (
             "ALPHANUMERIC_DB_PATH".into(),
@@ -103,12 +110,14 @@ pub fn child_env(config: &NodeConfig) -> Vec<(String, String)> {
             "ALPHANUMERIC_EXPLORER_API".into(),
             config.explorer_port.to_string(),
         ),
-        // 받아오되 광고하지 않는다. 당겨오는 경로는 토글이 아니다
-        // (`src/a9/node.rs` 의 `block_relay_sync_enabled` 가 무조건 true).
+        // Receives but does not advertise. The pull path is not a toggle
+        // (`src/a9/node.rs`'s `block_relay_sync_enabled` is
+        // unconditionally true).
         ("ALPHANUMERIC_DISABLE_PUBLIC_ANNOUNCE".into(), "true".into()),
-        // 콘솔이 피어·해시레이트·난이도를 여기서 읽는다. 바인드는 기본이
-        // 127.0.0.1 이고, 바인드에 실패해도 노드는 죽지 않고 stats 만 꺼진다
-        // (`src/a9/node.rs` 의 `start_stats_server` 가 bind 실패에 `Ok(())`) -- 켜는 비용이 낮다.
+        // The console reads peers, hashrate, and difficulty from here. It
+        // binds 127.0.0.1 by default, and a bind failure doesn't kill the
+        // node, just stats (`src/a9/node.rs`'s `start_stats_server` returns
+        // `Ok(())` on a bind failure) -- turning it on costs little.
         ("ALPHANUMERIC_STATS_ENABLED".into(), "true".into()),
         (
             "ALPHANUMERIC_STATS_PORT".into(),
@@ -128,11 +137,12 @@ pub fn stats_url(port: u16) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopOutcome {
-    /// SIGTERM 으로 스스로 내려갔다. 노드가 락을 지우고 포트를 반납한 상태다.
+    /// Went down on its own via SIGTERM. The node has removed the lock and
+    /// released its ports.
     Graceful,
-    /// 유예를 넘겨 SIGKILL 했다. 노드의 `StartupLockGuard::drop` 이 돌지
-    /// 않았으므로 락이 남아 있을 수 있다 -- 다음 기동의 `reclaim_orphan` 이
-    /// 치운다.
+    /// Overran the grace period and was SIGKILLed. The node's
+    /// `StartupLockGuard::drop` never ran, so the lock may still be sitting
+    /// there -- the next start's `reclaim_orphan` cleans it up.
     Killed,
 }
 
@@ -162,11 +172,12 @@ impl NodeProcess {
         let mut command = std::process::Command::new(&config.binary);
         command
             .current_dir(&config.data_dir)
-            // 자식은 백지에서 시작한다. 사용자의 셸에 있던 ALPHANUMERIC_* 가
-            // 지갑 노드를 채굴 노드 설정으로 끌고 가면 안 된다.
+            // The child starts from a blank slate. An ALPHANUMERIC_* left
+            // in the user's shell must not drag the wallet's node into the
+            // mining node's configuration.
             .env_clear()
-            // 파이프가 아니라 파일이다: 파이프였다면 아무도 읽지 않는 사이
-            // 64 KB 에서 자식이 멎는다.
+            // A file, not a pipe: with a pipe, the child would stall at
+            // 64 KB while nobody was reading it.
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err));
@@ -182,10 +193,11 @@ impl NodeProcess {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt;
-            // GUI 가 죽으면 노드도 죽는다. 이것이 발동하는 기준은 fork 한
-            // *스레드*의 죽음이므로, 호출자는 GUI 수명에 묶인 전용 스레드에서
-            // 이 함수를 불러야 한다 (Task 3). tokio 워커에서 부르면 그
-            // 스레드가 유휴 회수될 때 자식이 동기화 중에 SIGTERM 을 맞는다.
+            // The node dies with the GUI. This fires on the death of the
+            // *thread* that forked, so callers must call this function
+            // from a dedicated thread tied to the GUI's lifetime (Task 3).
+            // Calling it from a tokio worker means the child gets
+            // SIGTERMed mid-sync once that thread is reclaimed as idle.
             unsafe {
                 command.pre_exec(|| {
                     nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGTERM)
@@ -213,7 +225,8 @@ impl NodeProcess {
             .map_err(|e| format!("Could not check on the node: {e}"))
     }
 
-    /// SIGTERM 을 보내고 `grace` 만큼 기다린다. 그래도 살아 있으면 SIGKILL.
+    /// Sends SIGTERM and waits `grace`. SIGKILLs if it's still alive after
+    /// that.
     pub fn stop(&mut self, grace: Duration) -> Result<StopOutcome, String> {
         if self.exited()?.is_some() {
             return Ok(StopOutcome::Graceful);
@@ -256,19 +269,21 @@ fn is_alive(pid: u32) -> bool {
     }
 }
 
-/// GUI 가 죽으면서 노드를 남겼을 때 그것을 걷어낸다.
+/// Cleans up a node the GUI left behind when it died.
 ///
-/// `PR_SET_PDEATHSIG` 는 리눅스 한정이고 최선노력이다 -- fork 와 prctl 사이에
-/// 부모가 죽으면 놓친다. 데이터 디렉터리가 GUI 소유이므로 락의 pid 는 우리
-/// 것이고, 살아 있으면 세운다. 노드 자신은 **죽은** pid 만 치워준다.
+/// `PR_SET_PDEATHSIG` is Linux-only and best-effort -- it misses a parent
+/// that dies between the fork and the prctl call. The data directory
+/// belongs to the GUI, so the lock's pid is ours, and we stop it if it's
+/// alive. The node itself only cleans up a **dead** pid.
 ///
-/// 걷어낸 pid 를 돌려준다. 치울 것이 없었으면 `None`.
+/// Returns the pid that was reclaimed, or `None` if there was nothing to
+/// clean up.
 pub fn reclaim_orphan(lock_path: &Path, grace: Duration) -> Result<Option<u32>, String> {
     let Ok(raw) = std::fs::read_to_string(lock_path) else {
         return Ok(None);
     };
     let Ok(pid) = raw.trim().parse::<u32>() else {
-        // 사람이 손댔거나 반쯤 쓰인 락. 이것 때문에 기동을 막지 않는다.
+        // A hand-edited or half-written lock. This must not block startup.
         let _ = std::fs::remove_file(lock_path);
         return Ok(None);
     };
@@ -292,17 +307,19 @@ pub fn reclaim_orphan(lock_path: &Path, grace: Duration) -> Result<Option<u32>, 
     ))
 }
 
-/// 로그의 마지막 `max_lines` 줄. 없는 파일은 빈 목록이지 오류가 아니다 --
-/// 노드가 아직 한 줄도 찍지 않은 순간이 정상이다.
+/// The last `max_lines` lines of the log. A missing file is an empty list,
+/// not an error -- a moment where the node hasn't printed a single line yet
+/// is normal.
 ///
-/// 파일 끝의 창만 읽는다. F6 는 열어 둔 채로 두는 화면이라 이게 2초마다
-/// 불리고, 로그는 `.append(true)` 로 열려 회전하지 않는다 -- 처음부터 읽으면
-/// 비용이 로그 크기를 따라 끝없이 자란다.
+/// Only reads a window at the end of the file. F6 is a screen left open, so
+/// this gets called every 2 seconds, and the log is opened with
+/// `.append(true)` so it never rotates -- reading from the start would make
+/// the cost grow without bound as the log grows.
 pub fn tail_log(log_path: &Path, max_lines: usize) -> Vec<String> {
     tail_log_window(log_path, max_lines, TAIL_WINDOW_BYTES)
 }
 
-/// 20줄에 넉넉하다. 모자라면 `tail_log_window` 가 두 배씩 넓힌다.
+/// Plenty for 20 lines. If it's not enough, `tail_log_window` doubles it.
 const TAIL_WINDOW_BYTES: u64 = 64 * 1024;
 
 fn tail_log_window(log_path: &Path, max_lines: usize, first_window: u64) -> Vec<String> {
@@ -321,18 +338,20 @@ fn tail_log_window(log_path: &Path, max_lines: usize, first_window: u64) -> Vec<
     loop {
         let start = len.saturating_sub(window);
         let mut buf = Vec::new();
-        // `len` 까지만 -- 읽는 사이에 노드가 덧붙인 것은 다음 틱의 몫이다.
+        // Only up to `len` -- anything the node appends while we're
+        // reading is the next tick's business.
         if file.seek(SeekFrom::Start(start)).is_err()
             || (&mut file).take(len - start).read_to_end(&mut buf).is_err()
         {
             return Vec::new();
         }
-        // UTF-8 이 아닌 바이트 하나가 그 뒤의 줄을 전부 가리면 안 된다.
+        // A single non-UTF-8 byte must not hide every line after it.
         let text = String::from_utf8_lossy(&buf);
         let mut lines: Vec<&str> = text.lines().collect();
-        // 파일 중간에서 시작한 창은 거의 언제나 줄 중간에서 시작한다. 그
-        // 첫 조각은 줄이 아니다. (창이 마침 줄 머리에서 시작했다면 온전한
-        // 줄 하나를 버리는 셈인데, 그러면 모자란 만큼 아래에서 창을 넓힌다.)
+        // A window starting mid-file almost always starts mid-line. That
+        // first fragment is not a line. (If the window happened to start
+        // right at a line boundary, this throws away one whole line, and
+        // the shortfall below widens the window to make up for it.)
         if start > 0 && !lines.is_empty() {
             lines.remove(0);
         }
@@ -350,16 +369,17 @@ pub enum NodeState {
     Running {
         pid: u32,
     },
-    /// 자식이 스스로 끝났다. 포트 충돌이 이 모양으로 온다 -- 노드는 명시된
-    /// 포트를 못 잡으면 실패로 끝낸다.
+    /// The child ended on its own. A port conflict arrives in this shape --
+    /// the node fails outright if it can't claim the port it was given.
     Exited {
         code: Option<i32>,
     },
     Failed {
         message: String,
     },
-    /// 우리가 세웠다. `Exited` 로 재활용하지 않는다 -- 그건 "자식이 스스로
-    /// 끝났다"는 뜻이고, 요청받아 내려간 것과는 다른 사건이다.
+    /// We stopped it. This is not recycled into `Exited` -- that means "the
+    /// child ended on its own", a different event from being asked to go
+    /// down.
     Stopped,
 }
 
@@ -367,9 +387,9 @@ enum Command {
     Stop,
 }
 
-/// 노드를 소유하는 전용 스레드. `PR_SET_PDEATHSIG` 가 fork 한 스레드의
-/// 죽음에 발동하므로, 이 스레드는 `Supervisor` 가 살아 있는 동안 절대 끝나지
-/// 않는다.
+/// The dedicated thread that owns the node. `PR_SET_PDEATHSIG` fires on the
+/// death of the thread that forked, so this thread never ends while the
+/// `Supervisor` is alive.
 pub struct Supervisor {
     tx: mpsc::Sender<Command>,
     state: Arc<Mutex<NodeState>>,
@@ -377,9 +397,9 @@ pub struct Supervisor {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-/// 노드가 SIGTERM 에 응답할 시간. 실측은 0.5초였다.
+/// Time for the node to respond to SIGTERM. Measured at 0.5 seconds.
 const STOP_GRACE: Duration = Duration::from_secs(10);
-/// 남의 고아를 세울 때 기다리는 시간.
+/// Time to wait when stopping someone else's orphan.
 const RECLAIM_GRACE: Duration = Duration::from_secs(10);
 
 impl Supervisor {
@@ -475,8 +495,9 @@ fn set_state(slot: &Arc<Mutex<NodeState>>, next: NodeState) {
 }
 
 fn supervise(config: NodeConfig, rx: mpsc::Receiver<Command>, state: Arc<Mutex<NodeState>>) {
-    // 지난 실행이 노드를 남겼을 수 있다. 먼저 걷어낸다 -- 안 그러면 새
-    // 노드가 락과 포트에 부딪혀 실패한다.
+    // A previous run may have left a node behind. Reclaim it first --
+    // otherwise the new node collides with the lock and the ports, and
+    // fails.
     if let Err(message) = reclaim_orphan(&config.lock_path(), RECLAIM_GRACE) {
         set_state(&state, NodeState::Failed { message });
         return;
@@ -553,8 +574,8 @@ mod tests {
         assert_eq!(locate_binary(None, dir.path()).expect("found"), sibling);
     }
 
-    // 배포 실수 중 가장 흔한 형태다. 어디를 찾았는지 말하지 않으면
-    // 사용자가 고칠 수 없다.
+    // The most common shape of deployment mistake. If the error doesn't say
+    // where it looked, the user can't fix it.
     #[test]
     fn when_nothing_is_found_the_error_names_where_it_looked() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -595,8 +616,9 @@ mod tests {
         );
     }
 
-    // 채굴 지갑 키는 채굴 노드의 cwd 에 있고 이 노드에는 없다. 채굴을 켜면
-    // "지갑이 키를 갖고 노드는 갖지 않는다"는 뼈대가 깨진다 (스펙 §12).
+    // The mining wallet key lives in the mining node's cwd, not this one.
+    // Turning on mining would break the "the wallet holds the key, the node
+    // doesn't" premise (spec §12).
     #[test]
     fn the_child_is_never_told_to_mine() {
         let env = child_env(&sample_config());
@@ -621,8 +643,9 @@ mod tests {
         );
     }
 
-    // 숫자만 주면 노드가 127.0.0.1 에 붙인다 (`src/a9/node.rs` 의 `start_explorer_server`). 지갑 노드의
-    // 익스플로러는 절대 밖을 향하지 않는다.
+    // Given a bare number, the node binds 127.0.0.1 (`src/a9/node.rs`'s
+    // `start_explorer_server`). The wallet node's explorer never faces
+    // outward.
     #[test]
     fn the_explorer_port_is_sent_as_a_bare_number() {
         let env = child_env(&sample_config());
@@ -636,8 +659,9 @@ mod tests {
         assert_eq!(explorer_url(8096), "http://127.0.0.1:8096");
     }
 
-    /// D 는 채굴 노드의 8787 과 부딪히지 않으려고 stats 를 껐다. 콘솔이
-    /// 피어와 해시레이트를 여기서 읽으므로 이제 자기 포트로 켠다.
+    /// D turned stats off to avoid colliding with the mining node's 8787.
+    /// The console reads peers and hashrate from here, so now it's turned
+    /// on with its own port.
     #[test]
     fn the_child_runs_its_own_stats_server() {
         let env = child_env(&sample_config());
@@ -649,8 +673,9 @@ mod tests {
             .any(|(k, v)| k == "ALPHANUMERIC_STATS_PORT" && v == "8097"));
     }
 
-    /// 채굴 노드가 쥔 포트들. 상수를 직접 겨눈다 -- sample_config 의 리터럴을
-    /// 훑는 것만으로는 상수가 8787 로 퇴행해도 통과한다.
+    /// The ports the mining node holds. Targets the constants directly --
+    /// just scanning sample_config's literals would still pass even if a
+    /// constant regressed to 8787.
     #[test]
     fn no_default_port_collides_with_the_running_miner() {
         for (name, port) in [
@@ -665,7 +690,8 @@ mod tests {
         }
     }
 
-    /// 채굴 노드의 포트를 절대 쓰지 않는다. 상수가 아니라 환경을 훑는다.
+    /// Never uses the mining node's ports. Scans the environment, not the
+    /// constants.
     #[test]
     fn the_child_environment_never_holds_miner_ports() {
         let env = child_env(&sample_config());
@@ -693,8 +719,9 @@ mod tests {
 
     use std::time::Duration;
 
-    /// 노드 대신 세울 가짜. `trap` 여부로 SIGTERM 을 받는 놈과 무시하는 놈을
-    /// 만든다 -- 후자가 SIGKILL 폴백 경로를 실제로 태운다.
+    /// A fake to stand in for the node. The `trap` flag makes one that
+    /// honors SIGTERM and one that ignores it -- the latter actually
+    /// exercises the SIGKILL fallback path.
     fn fake_node(dir: &Path, honors_sigterm: bool) -> PathBuf {
         let path = dir.join("fake-node");
         let body = if honors_sigterm {
@@ -786,7 +813,7 @@ mod tests {
             let node = NodeProcess::spawn(&config).expect("spawn");
             (node, config)
         };
-        // 자식이 한 줄 찍을 시간을 준다.
+        // Gives the child time to print a line.
         for _ in 0..100 {
             if !tail_log(&config.log_path(), 10).is_empty() {
                 break;
@@ -831,8 +858,9 @@ mod tests {
         );
     }
 
-    /// SIGKILL 은 노드의 `StartupLockGuard::drop` 을 건너뛰어 락과 포트를
-    /// 남긴다. 그래서 최후에만 쓰고, 최후가 실제로 있는지 확인한다.
+    /// SIGKILL skips the node's `StartupLockGuard::drop`, leaving the lock
+    /// and ports behind. So it's used only as a last resort, and this
+    /// checks that last resort actually exists.
     #[test]
     fn a_child_that_ignores_sigterm_is_killed_after_the_grace_period() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -869,14 +897,16 @@ mod tests {
         assert_eq!(reclaim_orphan(&lock, Duration::from_secs(1)), Ok(None));
     }
 
-    /// 노드 자신의 `is_process_alive` 는 죽은 pid 만 치워준다
-    /// (`main.rs`). 살아 있는 고아는 우리가 걷어내야 한다.
+    /// The node's own `is_process_alive` only cleans up a dead pid
+    /// (`main.rs`). A live orphan is ours to reclaim.
     ///
-    /// **우리 자식을 쓰면 안 된다:** SIGTERM 을 받은 자식은 누가 `wait()` 할
-    /// 때까지 좀비로 남고, 좀비는 `kill(pid, 0)` 에 계속 잡힌다 -- `is_alive`
-    /// 가 영원히 참이라 이 테스트가 유예를 다 쓰고 실패한다. `sh` 를 즉시
-    /// 끝내 손자를 고아로 만들면 subreaper 가 거둬가므로 실제로 사라진다.
-    /// 그것이 `reclaim_orphan` 이 상대하는 진짜 상황이기도 하다.
+    /// **Must not use our own child:** a child that got SIGTERM stays a
+    /// zombie until someone calls `wait()`, and a zombie keeps getting
+    /// caught by `kill(pid, 0)` -- `is_alive` would stay true forever, and
+    /// this test would burn through the grace period and fail. Ending `sh`
+    /// immediately orphans its grandchild, which a subreaper picks up, so
+    /// it actually goes away. That's also the real situation
+    /// `reclaim_orphan` deals with.
     #[test]
     fn a_live_orphan_named_by_the_lock_is_stopped() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -896,7 +926,7 @@ mod tests {
             .expect("the shell prints the orphan's pid");
         assert!(is_alive(pid), "the orphan is running before we reclaim it");
 
-        // 노드가 하듯 락에 pid 를 적어둔다.
+        // Writes the pid into the lock, the way the node does.
         std::fs::write(&lock, pid.to_string()).expect("write lock");
 
         assert_eq!(reclaim_orphan(&lock, Duration::from_secs(5)), Ok(Some(pid)));
@@ -911,7 +941,7 @@ mod tests {
     fn a_stale_lock_naming_a_dead_pid_is_just_removed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let lock = dir.path().join(INSTANCE_LOCK);
-        // 1 번은 init 이라 우리 것이 아니다. 절대 죽지 않을 아주 큰 pid 를 쓴다.
+        // pid 1 is init, not ours. Uses a very large pid that will never be alive.
         std::fs::write(&lock, "4194304").expect("write lock");
         assert_eq!(reclaim_orphan(&lock, Duration::from_secs(1)), Ok(None));
         assert!(!lock.exists());
@@ -936,10 +966,11 @@ mod tests {
         );
     }
 
-    /// F6 는 열어 둔 채로 두는 화면이고 로그는 `.append(true)` 로 열려
-    /// 회전하지 않는다. 20줄을 얻으려고 매 2초 파일 전체를 읽으면 비용이
-    /// 로그 크기에 비례해 끝없이 자란다. 창 크기보다 훨씬 큰 파일에서도
-    /// 마지막 줄들이 순서대로 나와야 한다.
+    /// F6 is a screen left open, and the log is opened with `.append(true)`
+    /// so it never rotates. Reading the whole file every 2 seconds just to
+    /// get 20 lines would make the cost grow without bound as the log
+    /// grows. Even in a file much larger than the window, the last lines
+    /// must still come out in order.
     #[test]
     fn the_log_tail_of_a_file_far_larger_than_the_window_is_still_exact() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -956,9 +987,10 @@ mod tests {
         );
     }
 
-    /// 창이 파일 중간에서 시작하면 거의 언제나 줄 중간에서 시작한다. 그
-    /// 조각은 줄이 아니다 -- `ine 4997` 같은 것이 로그에 보여서는 안 된다.
-    /// 한 줄이 창보다 길면 창을 넓혀서라도 온전한 줄을 낸다.
+    /// A window that starts mid-file almost always starts mid-line. That
+    /// fragment is not a line -- something like `ine 4997` must never show
+    /// up in the log. If a line is longer than the window, the window
+    /// widens until it yields a whole line.
     #[test]
     fn the_log_tail_never_returns_the_fragment_a_window_starts_in() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -971,8 +1003,8 @@ mod tests {
         );
     }
 
-    /// 전에는 `lines().map_while(Result::ok)` 이라 UTF-8 이 아닌 바이트
-    /// 하나에서 읽기가 멈췄다 -- 그 뒤의 줄은 영영 안 보였다.
+    /// It used to be `lines().map_while(Result::ok)`, so reading stopped at
+    /// a single non-UTF-8 byte -- every line after it was gone for good.
     #[test]
     fn the_log_tail_survives_a_line_that_is_not_utf8() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -981,7 +1013,8 @@ mod tests {
         assert_eq!(tail_log(&log, 1), vec!["after".to_string()]);
     }
 
-    /// 마지막 줄에 줄바꿈이 없어도 줄이다 -- 노드가 쓰는 중인 줄이다.
+    /// A final line with no trailing newline is still a line -- it's the
+    /// one the node is currently writing.
     #[test]
     fn the_log_tail_includes_an_unterminated_last_line() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1039,9 +1072,9 @@ mod tests {
         );
     }
 
-    /// 포트 충돌이 이 경로로 온다: 노드는 명시된 포트를 못 잡으면 실패로
-    /// 끝난다. 감독기가 그것을 `Exited` 로 보여주지 못하면 GUI 는 영원히
-    /// 기다린다.
+    /// A port conflict arrives through this path: the node fails outright
+    /// if it can't claim the port it was given. If the supervisor fails to
+    /// surface that as `Exited`, the GUI waits forever.
     #[test]
     fn a_child_that_dies_on_its_own_is_noticed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1085,10 +1118,11 @@ mod tests {
         wait_for(|| !is_alive(pid), "the node to be gone after drop");
     }
 
-    /// `stop()` 뒤에 `state()` 가 `Running` 으로 남아 있으면, 그 위에 세운
-    /// 폴링 루프는 죽은 노드를 기다리며 영원히 돈다. `Supervisor` 를 드롭하지
-    /// 않은 채로 확인한다 -- Drop 경로는 `dropping_the_supervisor_stops_the_node`
-    /// 가 이미 덮고 있고, 이 결함은 Drop 없이 `stop()` 만 불렀을 때 드러난다.
+    /// If `state()` still reads `Running` after `stop()`, a polling loop
+    /// built on top of it spins forever waiting for a dead node. Checked
+    /// without dropping the `Supervisor` -- the Drop path is already
+    /// covered by `dropping_the_supervisor_stops_the_node`, and this defect
+    /// only shows up when `stop()` is called without a Drop.
     #[test]
     fn an_explicitly_stopped_supervisor_stops_reporting_running() {
         let dir = tempfile::tempdir().expect("tempdir");

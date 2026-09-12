@@ -1619,8 +1619,8 @@ impl Mgmt {
                 break 'mining;
             }
 
-            // 8.0.1 부터 취소 플래그가 매니저 안에 산다 -- handle_mine_command 가
-            // stop 을 따로 받지 않는 것도 같은 이유다.
+            // As of 8.0.1 the cancel flag lives inside the manager -- the same
+            // reason `handle_mine_command` doesn't take `stop` separately.
             let mining_manager = MiningManager::new(
                 Arc::clone(blockchain),
                 Arc::clone(&session.shutdown),

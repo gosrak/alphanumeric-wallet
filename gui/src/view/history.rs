@@ -1,7 +1,7 @@
-//! 모든 주소를 합친 거래 이력.
+//! Transaction history merged across all addresses.
 //!
-//! 위젯 배치만 한다. 순서·접기·커서는 `alphanumeric_gui::history` 가 창 없이
-//! 결정하고, 페치는 `app.rs` 가 한다.
+//! Widget layout only. Order, collapsing, and the cursor are decided
+//! headlessly by `alphanumeric_gui::history`; fetching is `app.rs`'s job.
 
 use chrono::{DateTime, Local};
 use iced::widget::{button, column, container, text};
@@ -79,36 +79,40 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     let mut content = column![].spacing(f32::from(theme::SPACING));
 
-    // 노드의 인덱스 쓰기는 fail-open 이라 tip 뒤에 남을 수 있다. 그 상태의
-    // 목록을 완결된 것으로 보여주면 안 된다 -- 없는 거래가 아니라 아직 안 보이는
-    // 거래다.
+    // The node's index writes are fail-open, so the index can lag behind
+    // the tip. A list in that state must not be shown as complete -- these
+    // aren't missing transactions, just ones not visible yet.
     //
-    // 배너 문구가 비교의 *기준*을 함께 말한다. `index_height` 는 페이지마다
-    // 새로 오지만 체인 높이는 이 화면에 들어올 때 한 번 읽는다
-    // (`Message::HistoryStatusFetched`) -- `ConsoleTick` 이 그 뒤로도 같은
-    // 값(`wallet.node_status`)을 10초마다 갱신하긴 하지만, 화면을 막 연
-    // 사람에게 그 10초를 기다리라고 할 이유는 없다. 그래도 화면을 열어 둔
-    // 채 "더 보기"를 오래 누르면 그 기준이 다음 갱신 전까지 늙을 수 있다 --
-    // 기준을 적어 두면 낡은 기준이 눈에 보이고, 안 적으면 낡은 기준으로
-    // 내린 "완결" 판정이 조용히 통과한다.
+    // The banner text also states the *baseline* the comparison used.
+    // `index_height` arrives fresh on every page, but the chain height is
+    // read once, when this screen is entered (`Message::HistoryStatusFetched`)
+    // -- `ConsoleTick` keeps refreshing that same value (`wallet.node_status`)
+    // every 10 seconds afterward, but there's no reason to make someone who
+    // just opened the screen wait those 10 seconds. Still, if the screen
+    // stays open and "load more" gets pressed for a while, that baseline can
+    // go stale before the next refresh -- writing it down makes a stale
+    // baseline visible; leaving it out lets a "complete" verdict built on a
+    // stale baseline pass silently.
     //
-    // "the last time the node was asked" 이지 "이 화면을 열 때" 가 아니다.
-    // 진입 시 상태 읽기가 실패하면 `apply_status` 는 직전 값을 그대로 두므로
-    // (재시도 가능한 오류는 조용히, 아닌 오류도 `node_status` 는 건드리지
-    // 않는다) 화면에 남는 높이가 그 시점의 것이 아닐 수 있다. 기준을
-    // 정직하게 만들려고 넣은 문장이 지킬 수 없는 약속을 하면 같은 결함이다.
+    // It's "the last time the node was asked", not "when this screen was
+    // opened". If the status read on entry fails, `apply_status` leaves the
+    // previous value in place (a retryable error silently, and even a
+    // non-retryable one leaves `node_status` untouched), so the height left
+    // on screen may not be from that moment. A sentence added to keep the
+    // baseline honest is the same flaw if it makes a promise it can't keep.
     if let Some(indexed) = history.merge.lowest_index_height() {
-        // 노드에 물어본 적이 없는 것과, 물어봤지만 아직 높이가 없는 것을
-        // 여기서는 구분하지 않는다 -- 어느 쪽이든 비교가 성립하지 않는다는
-        // 점이 똑같다.
+        // This doesn't distinguish between never having asked the node and
+        // having asked but not yet getting a height -- either way the
+        // comparison can't be made, and that's all that matters here.
         let stale = match wallet.node_status.as_ref().and_then(|status| status.height) {
             Some(chain_height) if indexed < chain_height => Some(format!(
                 "The node's address index had reached block {indexed}, and the chain was at {chain_height} \
                  the last time the node was asked. Anything newer is not in this list yet.",
             )),
             Some(_) => None,
-            // 체인 높이를 못 읽었다 -- 노드가 답을 안 했거나, 답했지만 아직
-            // 높이가 없거나. 어느 쪽이든 비교가 성립하지 않는다.
+            // The chain height couldn't be read -- the node didn't answer,
+            // or it answered but has no height yet. Either way the
+            // comparison can't be made.
             None => Some(format!(
                 "The node's address index had reached block {indexed}, but the chain height \
                  could not be read, so this list cannot be judged complete.",
@@ -128,8 +132,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
     }
 
-    // 인덱스가 이 주소에 대해 대답 자체를 못 하는 상태. 빈 이력과 전혀 다른
-    // 뜻이므로 빈 목록으로 그리지 않는다.
+    // The index cannot answer for this address at all -- a completely
+    // different state from an empty history, so it isn't drawn as an
+    // empty list.
     let has_rows = history.rows_len() > 0;
     if let Some(address) = history.merge.stalled_address() {
         content = content.push(
@@ -142,10 +147,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
                         .size(f32::from(theme::CAPTION))
                         .color(theme::MUTED)
                         .wrapping(iced::widget::text::Wrapping::Glyph),
-                    // 두 문장으로 갈린다. 정지는 보통 첫 페이지에서 나고,
-                    // 그러면 `advance` 는 아무 행도 내지 못한 채 멈춘다 --
-                    // 그 화면에서 "the list below" 라고 말하면 아래에 아무
-                    // 것도 없는데 무언가를 보라고 시키는 거짓말이 된다.
+                    // Split into two sentences: a stall usually happens on
+                    // the first page, where `advance` stops without
+                    // producing any rows at all -- saying "the list below"
+                    // on that screen would be a lie, pointing at something
+                    // to look at when there's nothing below.
                     text(if has_rows {
                         "Its address index is unbuilt or rebuilding. This is not an empty \
                          history -- the list below is incomplete."
@@ -262,8 +268,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
                         .size(f32::from(theme::SMALL))
                         .color(theme::DANGER)
                         .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-                    // 목록은 여기서 멈춰 있다. 아래에 이미 나온 행은 맞지만
-                    // 완결이 아니다.
+                    // The list is stalled here. The rows already shown
+                    // below are real, just not the complete picture.
                     text("The list stops here until this succeeds.")
                         .size(f32::from(theme::CAPTION))
                         .color(theme::MUTED),

@@ -1,18 +1,18 @@
-//! 주소별 이력 스트림을 하나의 시간 역순 목록으로 합친다.
+//! Merges per-address history streams into one reverse-chronological list.
 //!
-//! `model.rs` 와 같은 규율이다: `iced` 를 import 하지 않고 I/O 도 하지
-//! 않는다. 그래서 창 없이, 노드 없이 테스트된다. 병합기는 *"이 주소의 이
-//! 커서로 한 페이지 더 필요하다"* 고 말할 뿐이고, 실제 요청은 `app.rs` 가
-//! 보낸다.
+//! Same discipline as `model.rs`: no `iced` import, no I/O. So it can be
+//! tested with no window and no node. The merger only ever says *"I need
+//! one more page for this address at this cursor"* -- the actual request
+//! is sent by `app.rs`.
 
 use std::collections::VecDeque;
 
 use crate::backend::{AddressPage, Cursor, TxEntry};
 
-/// 한 번에 받아 오는 페이지 크기. 노드 기본값과 같지만 명시해서 보낸다.
+/// Page size fetched at a time. Matches the node's default, but sent explicitly.
 pub const PAGE_LIMIT: u32 = 50;
 
-/// 코인베이스 유입의 상대방으로 노드가 쓰는 이름.
+/// The counterparty name the node uses for coinbase inflows.
 const MINING_COUNTERPARTY: &str = "MINING_REWARDS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +24,8 @@ pub enum RowKind {
     Out {
         to: String,
     },
-    /// 지갑의 두 주소 사이 이동. 두 스트림에서 같은 거래를 본 결과다.
+    /// A transfer between two of the wallet's own addresses. The result of
+    /// seeing the same transaction on both streams.
     Internal {
         from: String,
         to: String,
@@ -45,42 +46,46 @@ pub struct Row {
     pub owner: String,
 }
 
-/// 병합기를 더 진행시키려면 무엇이 필요한가.
+/// What the merger needs in order to make more progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Need {
-    /// `streams[index]` 의 다음 페이지를 이 커서로 받아 와야 한다.
+    /// The next page of `streams[index]` needs to be fetched with this cursor.
     ///
-    /// `address` 는 그 스트림이 이미 들고 있는 주소다. 호출자가 `index` 로
-    /// 다시 찾지 않게 하려고 같이 실어 보낸다 -- 화면이 열려 있는 동안
-    /// `Message::AddressStoreSaved` 가 지갑의 주소 목록에 새 주소를 밀어
-    /// 넣을 수 있고, 그러면 목록과 병합기가 서로 다른 것을 본다.
+    /// `address` is the address that stream already holds. It rides along
+    /// so the caller does not have to look it back up by `index` -- while
+    /// the screen is open, `Message::AddressStoreSaved` can push a new
+    /// address into the wallet's address list, and then the list and the
+    /// merger would be looking at different things.
     Page {
         index: usize,
         address: String,
         before: Option<Cursor>,
     },
-    /// 요청한 만큼 냈거나, 모든 스트림이 소진됐거나, 정지된(stalled) 스트림이
-    /// 있어 더 진행할 수 없다. 세 경우를 구분하지 않는다 -- `Idle` 은 "다
-    /// 냈다" 가 아니다. 호출자는 `is_done()` 과 `stalled_address()` 로 어느
-    /// 경우인지 갈라야 한다. 그러지 않으면 대답 못 한 주소를 목록이
-    /// 완결된 것으로 잘못 읽는다.
+    /// Either as many rows were emitted as asked for, all streams are
+    /// exhausted, or a stalled stream blocks further progress. The three
+    /// cases are not distinguished here -- `Idle` does not mean "all done".
+    /// The caller must tell them apart with `is_done()` and
+    /// `stalled_address()`; otherwise an address that never answered gets
+    /// misread as the list being complete.
     Idle,
 }
 
-/// 주소 하나의 스트림.
+/// A single address's stream.
 struct Stream {
     address: String,
-    /// 아직 안 낸 항목들, 내림차순.
+    /// Entries not yet emitted, descending order.
     buffer: VecDeque<TxEntry>,
-    /// 다음 페이지 커서. 첫 요청 전에는 `None` 이고, 그 구분은 `answered` 가 한다.
+    /// Cursor for the next page. `None` before the first request too --
+    /// `answered` is what tells the two apart.
     next: Option<Cursor>,
-    /// 한 번이라도 페이지를 받았는가.
+    /// Whether a page has ever been received.
     answered: bool,
-    /// 노드가 이 주소에 대해 더 줄 것이 없다고 말했는가.
+    /// Whether the node has said it has nothing more to give for this address.
     finished: bool,
-    /// 인덱스가 대답할 수 없다고 답했는가(`transactions: null`). 소진과 다르고
-    /// 재시도 대상도 아니다 -- 다시 물어도 같은 답이 오고, 그 되물음이
-    /// `app.rs` 의 재귀를 타고 노드를 무한히 두드린다.
+    /// Whether the index answered that it cannot answer (`transactions:
+    /// null`). Different from exhausted, and not something to retry --
+    /// asking again gets the same answer, and that re-ask rides `app.rs`'s
+    /// recursion into hammering the node forever.
     stalled: bool,
     index_height: Option<u64>,
 }
@@ -123,19 +128,20 @@ impl Merge {
         &self.rows
     }
 
-    /// 모든 스트림이 최소 한 번 대답했고, 더 줄 페이지가 없다고 말했고,
-    /// 버퍼도 비었다. 정지된(stalled) 스트림은 절대 이 조건을 만족하지
-    /// 못한다 -- 대답 못 한 주소를 끝난 것으로 세면 그 주소의 거래가
-    /// 조용히 사라진다.
+    /// Every stream has answered at least once, has said it has no more
+    /// pages to give, and its buffer is empty. A stalled stream can never
+    /// satisfy this -- counting an address that never answered as finished
+    /// would make that address's transactions vanish silently.
     pub fn is_done(&self) -> bool {
         self.streams
             .iter()
             .all(|stream| stream.answered && stream.finished && stream.buffer.is_empty())
     }
 
-    /// 인덱스가 대답할 수 없다고 답한 주소. 있으면 `advance` 는 계속
-    /// `Need::Idle` 을 돌려주고, 그 상태는 "다 냈다"(`is_done`) 와 다르다 --
-    /// 화면이 이 값을 봐서 둘을 갈라야 한다.
+    /// The address the index answered that it cannot answer. When set,
+    /// `advance` keeps returning `Need::Idle`, and that state is different
+    /// from "all done" (`is_done`) -- the screen must check this value to
+    /// tell the two apart.
     pub fn stalled_address(&self) -> Option<&str> {
         self.streams
             .iter()
@@ -143,8 +149,9 @@ impl Merge {
             .map(|stream| stream.address.as_str())
     }
 
-    /// 가장 뒤처진 스트림의 인덱스 높이. 하나라도 아직 대답하지 않았으면
-    /// `None` -- 그 주소가 최신인지 뒤처진 것인지 아직 모른다.
+    /// The index height of the most-behind stream. `None` if even one
+    /// stream has not answered yet -- whether that address is current or
+    /// behind is still unknown.
     pub fn lowest_index_height(&self) -> Option<u64> {
         self.streams
             .iter()
@@ -153,22 +160,24 @@ impl Merge {
             .flatten()
     }
 
-    /// 직전 `Need::Page` 가 지목한 스트림에 페치 결과를 먹인다. `index` 와
-    /// `before` 는 그 `Need::Page` 가 준 것과 같아야 한다.
+    /// Feeds a fetch result into the stream the last `Need::Page` pointed
+    /// at. `index` and `before` must match what that `Need::Page` gave.
     ///
-    /// `before` 는 이 페이지를 어느 커서로 요청했는지다. 노드는 그 커서
-    /// *아래*만 돌려줘야 하고(실측: 커서 (985776,0) 의 다음 페이지는
-    /// (985774,0) 부터 시작한다), 그래서 커서 이상인 항목은 버린다.
-    /// 이것이 없으면 `before` 를 무시하고 1페이지를 다시 내주는 노드가
-    /// 이미 내보낸 행보다 큰 키로 버퍼를 채우고, `pick_highest` 가 그것을
-    /// 낮은 행 아래에 붙인다 -- 중복된 데다 순서까지 틀린 목록이 오류
-    /// 하나 없이 그려진다. `node_url` 은 사용자가 고칠 수 있으므로 남의
-    /// 노드도 사정권이다.
+    /// `before` is the cursor this page was requested at. The node must
+    /// only return entries *below* that cursor (measured: the page after
+    /// cursor (985776,0) starts at (985774,0)), so entries at or above the
+    /// cursor are dropped. Without this, a node that ignores `before` and
+    /// hands back page 1 again fills the buffer with keys higher than rows
+    /// already emitted, and `pick_highest` tacks those onto the bottom of
+    /// lower rows -- a duplicated, out-of-order list drawn with no error at
+    /// all. `node_url` is user-editable, so someone else's node is in scope
+    /// too.
     ///
-    /// 버린 뒤 실제로 버퍼에 넣은 항목 수를 돌려준다. 호출자는 이 값이 0
-    /// 인데 `next` 가 살아 있는 경우를 잡아야 한다 -- 페이지에 항목이
-    /// 있었더라도 전부 버려졌다면 진행이 없는 것이고, 그대로 두면 같은
-    /// 커서로 무한히 다시 요청한다.
+    /// Returns how many entries actually made it into the buffer after
+    /// dropping. The caller must catch this being 0 while `next` is still
+    /// alive -- even if the page had entries, if all of them were dropped
+    /// there was no progress, and leaving it as-is re-requests the same
+    /// cursor forever.
     pub fn accept(&mut self, index: usize, before: Option<Cursor>, page: AddressPage) -> usize {
         let Some(stream) = self.streams.get_mut(index) else {
             return 0;
@@ -181,7 +190,7 @@ impl Merge {
             Some(entries) => {
                 for entry in entries {
                     if let Some(cursor) = before {
-                        // 첫 페이지(`before: None`)는 전부 받는다.
+                        // The first page (`before: None`) is accepted in full.
                         if (entry.height, entry.position)
                             >= (cursor.before_height, cursor.before_pos)
                         {
@@ -191,34 +200,38 @@ impl Merge {
                     stream.buffer.push_back(entry);
                     kept += 1;
                 }
-                // `next` 가 없다는 것이 "이 주소는 끝"의 유일한 신호다.
+                // The absence of `next` is the only signal that this
+                // address is done.
                 stream.finished = page.next.is_none();
             }
-            // 인덱스가 대답할 수 없는 상태다. 빈 이력이 아니므로 소진으로
-            // 세지 않는다 -- 그렇게 세면 이 주소의 거래가 조용히 사라진다.
-            // 재시도도 하지 않는다: 같은 답이 돌아오고, 그 되물음이 노드를
-            // 무한히 두드린다.
+            // The index cannot answer. This is not an empty history, so it
+            // does not count as exhausted -- counting it that way would
+            // make this address's transactions vanish silently. It is not
+            // retried either: the same answer comes back, and that re-ask
+            // hammers the node forever.
             None => stream.stalled = true,
         }
         kept
     }
 
-    /// 지금까지 쌓인 행이 `want` 개에 이를 때까지 낼 수 있는 만큼 내고, 그
-    /// 다음 필요를 돌려준다. `want` 는 누적 목표치다 -- 이미 낸 행 위에
-    /// 더하는 증분이 아니라 `rows().len()` 이 다다라야 할 총량이다.
-    /// 증분으로 읽으면 목표를 이미 채운 뒤에도 호출마다 더 요구하게 되고,
-    /// 이 병합기는 Task 3 의 페치 루프에서 반복 호출되므로 그 오독이 곧
-    /// 무한 요청이 된다.
+    /// Emits as many rows as it can until the rows accumulated so far reach
+    /// `want`, then returns the next need. `want` is a cumulative target --
+    /// not an increment on top of rows already emitted, but the total
+    /// `rows().len()` must reach. Reading it as an increment would keep
+    /// demanding more on every call even after the target is already met,
+    /// and since this merger is called repeatedly from Task 3's fetch loop,
+    /// that misreading turns straight into infinite requests.
     pub fn advance(&mut self, want: usize) -> Need {
         loop {
             if self.rows.len() >= want {
                 return Need::Idle;
             }
-            // 불변식: 버퍼가 빈 미소진 스트림이 하나라도 있으면 아무것도 내지
-            // 않는다. 아직 안 받아온 주소가 더 높은 키를 들고 있을 수 있고,
-            // 어기면 목록이 조용히 순서를 어긴다.
-            // 대답 못 한 주소가 하나라도 있으면 아무것도 낼 수 없고, 더 조를
-            // 수도 없다. 멈추고 화면이 그 사실을 말한다.
+            // Invariant: if any unexhausted stream has an empty buffer,
+            // nothing is emitted. An address not yet fetched could be
+            // holding a higher key, and breaking this silently puts the
+            // list out of order.
+            // If any address never answered, nothing can be emitted and
+            // none can be pressed further. Stop, and let the screen say so.
             if self.streams.iter().any(|stream| stream.stalled) {
                 return Need::Idle;
             }
@@ -236,8 +249,8 @@ impl Merge {
         }
     }
 
-    /// 머리가 가장 큰 스트림. 동점은 없다 -- 같은 키는 같은 거래이고,
-    /// 그 경우는 `emit` 이 접는다.
+    /// The stream whose head is largest. There are no ties -- the same key
+    /// is the same transaction, and that case is folded by `emit`.
     fn pick_highest(&self) -> Option<usize> {
         self.streams
             .iter()
@@ -255,24 +268,29 @@ impl Merge {
         let owner = self.streams[index].address.clone();
         let row_owner = owner.clone();
 
-        // 같은 키를 든 *다른* 스트림은 같은 거래를 반대쪽에서 본 것이다.
-        // 내림차순 정렬에서 같은 키는 반드시 인접하므로, 지금 머리들만 보면
-        // 된다. 두 줄로 두면 같은 돈이 두 번 움직인 것처럼 읽히고, 한쪽만
-        // 버리면 어느 쪽을 버려도 거짓말이 된다.
+        // A *different* stream holding the same key is the same transaction
+        // seen from the other side. Since equal keys are always adjacent in
+        // descending order, checking just the current heads is enough.
+        // Leaving both as separate rows reads as the same money moving
+        // twice, and dropping just one is a lie no matter which one you
+        // drop.
         //
-        // 방금 꺼낸 스트림은 후보에서 뺀다. 한 버퍼 안에 같은 키가 둘
-        // 있으면 -- `before` 를 포함(inclusive)으로 해석하는 노드가 페이지
-        // 경계에서 한 항목을 되풀이하면 바로 그렇게 된다 -- 스스로와
-        // 접혀서 `Internal { from: owner, to: owner }` 가 되고, 진짜 유입이
-        // 자기 송금으로, 금액 대신 수수료가 값 칸에 그려진다.
+        // The stream just popped from is excluded from the candidates. If
+        // one buffer holds the same key twice -- which is exactly what
+        // happens when a node that treats `before` as inclusive repeats one
+        // entry at a page boundary -- it would fold with itself into
+        // `Internal { from: owner, to: owner }`, turning a genuine inflow
+        // into a self-transfer, with the fee drawn in the amount column
+        // instead of the actual amount.
         let twin = self
             .streams
             .iter()
             .enumerate()
             .position(|(other, stream)| other != index && stream.head() == Some(key));
         if let Some(other) = twin {
-            // 반대쪽 사본은 버린다. 금액·수수료·시각은 같은 거래이므로
-            // 이미 `entry` 에 있다.
+            // The copy on the other side is discarded. Amount, fee, and
+            // timestamp are the same transaction, so they are already in
+            // `entry`.
             self.streams[other].buffer.pop_front();
             let (from, to) = if entry.direction == "out" {
                 (owner, self.streams[other].address.clone())
@@ -291,15 +309,17 @@ impl Merge {
             return;
         }
 
-        // 방향까지 봐야 한다. 상대방 이름만으로는 부족하다:
-        // `MINING_REWARDS` 로 *나가는* 결제가 체인에 남을 수 있다.
-        // 정규 수령자 검사는 mempool 진입에서만 하고 블록 검증에서는 일부러
-        // 하지 않으며(`src/a9/blockchain.rs` 의 `admit_transaction`, RELAY-POLICY
-        // 주석 "그런 블록도 완전히
-        // 유효하다"), 그 문서가 예로 드는 것이 바로 `"MINING_REWARDS"` 로
-        // 보내는 경우다. 그런 거래는 SENDER 로 색인돼 탐색기가
-        // `direction: "out"` 으로 내주는데, 방향을 안 보면 나간 돈이 강조색과
-        // 양수 금액으로, 수수료까지 감춰진 채 채굴 보상으로 그려진다.
+        // Direction has to be checked too. The counterparty name alone is
+        // not enough: a payment *out* to `MINING_REWARDS` can end up on
+        // chain. The canonical-recipient check runs only at mempool
+        // admission and is deliberately skipped at block validation
+        // (`admit_transaction` in `src/a9/blockchain.rs`, RELAY-POLICY
+        // comment "such a block is still fully valid"), and that same
+        // comment gives sending to `"MINING_REWARDS"` as its example. Such
+        // a transaction is indexed under SENDER, so the explorer reports it
+        // as `direction: "out"` -- and without checking direction, money
+        // that left gets drawn as a mining reward, in the accent color,
+        // with a positive amount, and the fee hidden.
         let kind = if entry.counterparty == MINING_COUNTERPARTY && entry.direction == "in" {
             RowKind::Mining
         } else if entry.direction == "self" {
@@ -374,7 +394,7 @@ mod tests {
         assert_eq!(owners, vec!["a", "b"]);
     }
 
-    /// 병합기를 끝까지 돌린다. `pages` 는 스트림 인덱스별 페이지 큐다.
+    /// Drives the merger to completion. `pages` is a per-stream-index page queue.
     fn drive(merge: &mut Merge, mut pages: Vec<Vec<AddressPage>>, want: usize) {
         loop {
             match merge.advance(want) {
@@ -386,17 +406,19 @@ mod tests {
                     } else {
                         queue.remove(0)
                     };
-                    // 요청에 쓴 커서를 그대로 넘긴다 -- `accept` 가 그 아래만
-                    // 받아들이므로, 이 헬퍼를 쓰는 모든 테스트가 그 여과를
-                    // 덤으로 지나간다.
+                    // Passes through the same cursor the request used --
+                    // since `accept` only accepts entries below it, every
+                    // test using this helper exercises that filtering for
+                    // free.
                     merge.accept(index, before, next);
                 }
             }
         }
     }
 
-    // 세 주소의 이력이 하나의 내림차순 목록으로 합쳐진다. 주소별로는 이미
-    // 정렬돼 있지만, 그 셋을 섞는 것은 병합기의 일이다.
+    // Three addresses' histories merge into one descending list. Each is
+    // already sorted on its own, but interleaving the three is the
+    // merger's job.
     #[test]
     fn three_streams_merge_into_one_descending_list() {
         let mut merge = Merge::new(vec!["a".into(), "b".into(), "c".into()]);
@@ -417,8 +439,9 @@ mod tests {
         assert!(merge.is_done());
     }
 
-    // 같은 블록 안에서는 position 이 순서를 정한다. height 만 비교하면 같은
-    // 높이의 두 거래가 임의 순서로 섞인다.
+    // Within the same block, position decides the order. Comparing height
+    // alone would let two transactions at the same height end up in
+    // arbitrary order.
     #[test]
     fn ties_on_height_are_broken_by_position_descending() {
         let mut merge = Merge::new(vec!["a".into(), "b".into()]);
@@ -438,8 +461,9 @@ mod tests {
         assert_eq!(keys, vec![(50, 7), (50, 1)]);
     }
 
-    // 내 주소 A -> 내 주소 B 는 같은 (height, position) 으로 두 스트림에
-    // 나타난다. 두 줄로 두면 같은 돈이 두 번 움직인 것처럼 읽힌다.
+    // My address A -> my address B shows up at the same (height, position)
+    // on both streams. Leaving it as two rows reads as the same money
+    // moving twice.
     #[test]
     fn a_transfer_between_my_own_addresses_folds_into_one_row() {
         let mut merge = Merge::new(vec!["a".into(), "b".into()]);
@@ -461,7 +485,8 @@ mod tests {
         );
     }
 
-    // 채굴 보상은 이 지갑에서 가장 흔한 행이 될 것이므로 일반 유입과 섞지 않는다.
+    // Mining rewards will be the most common row in this wallet, so they
+    // are not mixed in with ordinary inflows.
     #[test]
     fn a_mining_reward_is_its_own_kind() {
         let mut merge = Merge::new(vec!["a".into()]);
@@ -473,9 +498,10 @@ mod tests {
         assert_eq!(merge.rows()[0].kind, RowKind::Mining);
     }
 
-    // 이 계획 전체에서 가장 중요한 테스트다. 아직 한 번도 안 받아온 스트림이
-    // 있으면 어떤 행도 내보내면 안 된다 -- 그 스트림이 더 높은 키를 들고 있을
-    // 수 있고, 어기면 목록이 예외도 오류도 없이 조용히 순서를 어긴다.
+    // The single most important test in this whole plan. If any stream has
+    // never been fetched, no row may be emitted -- that stream could be
+    // holding a higher key, and breaking this silently puts the list out
+    // of order with no exception and no error.
     #[test]
     fn no_row_is_emitted_while_a_stream_has_never_answered() {
         let mut merge = Merge::new(vec!["a".into(), "b".into()]);
@@ -483,7 +509,8 @@ mod tests {
         assert!(matches!(need, Need::Page { .. }));
         assert!(merge.rows().is_empty());
 
-        // a 만 대답했다. b 는 아직 침묵이다 -- 여전히 아무것도 못 낸다.
+        // Only a has answered. b is still silent -- still nothing can be
+        // emitted.
         merge.accept(0, None, page(vec![tx(10, 0, "in", "x")], None));
         let need = merge.advance(10);
         assert_eq!(
@@ -496,18 +523,19 @@ mod tests {
         );
         assert!(
             merge.rows().is_empty(),
-            "b 가 100번 블록의 거래를 들고 있을 수 있다"
+            "b could be holding a transaction from block 100"
         );
 
-        // 이제 b 도 대답했다.
+        // Now b has answered too.
         merge.accept(1, None, page(vec![tx(100, 0, "in", "y")], None));
         merge.advance(10);
         let heights: Vec<u64> = merge.rows().iter().map(|r| r.height).collect();
         assert_eq!(heights, vec![100, 10]);
     }
 
-    // 한 주소가 먼저 끝나도 나머지는 계속 나와야 한다. 소진된 스트림을 계속
-    // 기다리면 목록이 그 자리에서 멈춘다.
+    // Even if one address finishes first, the rest must keep coming out.
+    // Waiting on an exhausted stream forever would stall the list right
+    // there.
     #[test]
     fn an_exhausted_stream_does_not_stall_the_others() {
         let mut merge = Merge::new(vec!["a".into(), "b".into()]);
@@ -532,8 +560,9 @@ mod tests {
         assert_eq!(heights, vec![100, 90, 80, 70]);
     }
 
-    // 커서는 노드가 준 것을 그대로 되돌려 보낸다. 클라이언트가 마지막 행에서
-    // 다시 계산하면 내부 이체를 접은 자리에서 한 건을 건너뛴다.
+    // The cursor is echoed back exactly as the node sent it. If the client
+    // recomputed it from the last row instead, it would skip one entry
+    // right where an internal transfer got folded.
     #[test]
     fn the_cursor_is_echoed_back_exactly_as_the_node_sent_it() {
         let mut merge = Merge::new(vec!["a".into()]);
@@ -556,7 +585,7 @@ mod tests {
                 }),
             ),
         );
-        // 1행을 냈으니 want=2 면 더 필요하다.
+        // One row has been emitted, so want=2 still needs more.
         assert_eq!(
             merge.advance(2),
             Need::Page {
@@ -570,8 +599,8 @@ mod tests {
         );
     }
 
-    // 신선도는 가장 뒤처진 주소가 정한다. 하나라도 뒤처지면 목록 전체가
-    // 완결됐다고 말할 수 없다.
+    // Freshness is decided by the most-behind address. If even one is
+    // behind, the whole list cannot be called complete.
     #[test]
     fn the_lowest_index_height_is_what_freshness_is_judged_on() {
         let mut merge = Merge::new(vec!["a".into(), "b".into()]);
@@ -603,11 +632,13 @@ mod tests {
         assert_eq!(merge.lowest_index_height(), Some(900));
     }
 
-    // 인덱스가 대답할 수 없는 주소(transactions: null)는 빈 이력이 아니다.
-    // 소진으로 처리하면 그 주소의 거래가 조용히 사라진다. 그렇다고 계속
-    // 조르면 -- 버퍼가 비었고 끝나지도 않았으니 advance 가 같은 페이지를
-    // 영원히 다시 요구하고, app.rs 의 재귀가 그것을 그대로 노드에 쏜다.
-    // 멈추고 말하는 것이 유일하게 맞는 답이다.
+    // An address the index cannot answer for (transactions: null) is not
+    // an empty history. Treating it as exhausted would make that address's
+    // transactions vanish silently. Pressing it anyway is no better --
+    // since the buffer is empty and it never finishes, `advance` would
+    // demand the same page forever, and `app.rs`'s recursion would fire
+    // that straight at the node. Stopping and saying so is the only
+    // correct answer.
     #[test]
     fn an_unanswerable_address_stops_the_merge_instead_of_being_retried() {
         let mut merge = Merge::new(vec!["a".into()]);
@@ -633,20 +664,21 @@ mod tests {
         assert_eq!(
             merge.advance(10),
             Need::Idle,
-            "같은 페이지를 다시 요구하면 노드를 무한히 두드린다"
+            "demanding the same page again would hammer the node forever"
         );
         assert!(merge.rows().is_empty());
         assert!(
             !merge.is_done(),
-            "대답 못 한 주소를 끝난 것으로 세면 안 된다"
+            "an address that never answered must not count as finished"
         );
         assert_eq!(merge.stalled_address(), Some("a"));
     }
 
-    // sender == recipient 는 실제 와이어 값이다(`node.rs` 의
-    // `explorer_entry_json` 이 `"self"` 를 내고, `blockchain.rs` 의
-    // `address_index_ops` 가 그 경우 한 항목에 두 플래그를 다 세운다). "self" 를 In 으로 읽으면 수수료만 태운
-    // 거래가 화면에서 자기 자신에게서 돈이 도착한 것처럼 보인다.
+    // sender == recipient is a real value on the wire (`node.rs`'s
+    // `explorer_entry_json` emits `"self"`, and `blockchain.rs`'s
+    // `address_index_ops` sets both flags on one entry in that case).
+    // Reading "self" as In would make a transaction that only burned a fee
+    // look, on screen, like money arrived from itself.
     #[test]
     fn a_self_send_is_internal_with_the_same_address_on_both_sides() {
         let mut merge = Merge::new(vec!["a".into()]);
@@ -664,12 +696,15 @@ mod tests {
         );
     }
 
-    // 상대방이 `MINING_REWARDS` 라도 방향이 `out` 이면 채굴 보상이 아니다.
-    // 정규 수령자 검사는 mempool 진입에서만 하고 블록 검증에서는 일부러 하지
-    // 않으므로(`src/a9/blockchain.rs` 의 `admit_transaction`), `MINING_REWARDS` 로 나가는
-    // 결제가 체인에 남을 수 있고 탐색기는 그것을 `direction: "out"` 으로
-    // 내준다. 상대방 이름만 보면 나간 돈이 강조색·양수 금액에 수수료까지
-    // 감춰진 채 "Mined" 로 그려진다 -- 돈이 나갔는데 들어온 것처럼 읽힌다.
+    // Even if the counterparty is `MINING_REWARDS`, it is not a mining
+    // reward when the direction is `out`. The canonical-recipient check
+    // runs only at mempool admission and is deliberately skipped at block
+    // validation (`admit_transaction` in `src/a9/blockchain.rs`), so a
+    // payment *out* to `MINING_REWARDS` can end up on chain, and the
+    // explorer reports it as `direction: "out"`. Looking only at the
+    // counterparty name would draw money that left as "Mined" -- in the
+    // accent color, with a positive amount, fee hidden -- reading as money
+    // that arrived when it actually left.
     #[test]
     fn a_payment_out_to_the_mining_counterparty_is_not_a_reward() {
         let mut merge = Merge::new(vec!["a".into()]);
@@ -683,16 +718,18 @@ mod tests {
             RowKind::Out {
                 to: "MINING_REWARDS".into()
             },
-            "나가는 결제를 채굴 보상으로 그리면 안 된다"
+            "an outgoing payment must not be drawn as a mining reward"
         );
     }
 
-    // 쌍둥이 검색은 방금 꺼낸 스트림을 제외해야 한다. 한 버퍼 안에 같은 키가
-    // 둘 있으면 -- `before` 를 포함으로 해석하는 노드가 페이지 경계에서 한
-    // 항목을 되풀이하면 그렇게 된다 -- 스스로와 접혀 `Internal { a, a }` 가
-    // 되고, 진짜 유입이 자기 송금으로 둔갑해 금액 대신 수수료가 값 칸에
-    // 그려진다. 중복 자체를 없애는 것은 `accept` 의 커서 여과(아래 테스트)
-    // 이고, 여기서 막는 것은 잘못된 라벨이다.
+    // The twin search must exclude the stream just popped from. If one
+    // buffer holds the same key twice -- which is what happens when a node
+    // that treats `before` as inclusive repeats one entry at a page
+    // boundary -- it would fold with itself into `Internal { a, a }`,
+    // turning a genuine inflow into a self-transfer with the fee drawn in
+    // the amount column instead. Removing the duplicate itself is
+    // `accept`'s cursor filtering (tested below); what is guarded here is
+    // the mislabeling.
     #[test]
     fn two_entries_with_one_key_in_one_stream_do_not_fold_into_internal() {
         let mut merge = Merge::new(vec!["a".into()]);
@@ -709,15 +746,16 @@ mod tests {
             assert_eq!(
                 row.kind,
                 RowKind::In { from: "x".into() },
-                "한 스트림이 자기 자신과 접히면 안 된다"
+                "a stream must not fold with itself"
             );
         }
     }
 
-    // `before` 를 무시하고 1페이지를 다시 내주는 노드. 커서 이상인 항목을
-    // 그대로 받으면 이미 내보낸 행보다 큰 키가 버퍼에 들어가고,
-    // `pick_highest` 가 그것을 낮은 행 아래에 붙인다 -- 중복에 역순인데
-    // 오류는 하나도 안 난다.
+    // A node that ignores `before` and hands back page 1 again. Accepting
+    // entries at or above the cursor as-is would put keys higher than rows
+    // already emitted into the buffer, and `pick_highest` would tack those
+    // onto the bottom of lower rows -- duplicated and out of order, with
+    // not a single error raised.
     #[test]
     fn a_page_at_or_above_the_cursor_it_was_asked_for_is_dropped() {
         let mut merge = Merge::new(vec!["a".into()]);
@@ -749,7 +787,8 @@ mod tests {
                 before: Some(cursor)
             }
         );
-        // 노드가 커서를 무시하고 같은 두 건을 다시 내준다.
+        // The node ignores the cursor and hands back the same two entries
+        // again.
         let kept = merge.accept(
             0,
             Some(cursor),
@@ -758,19 +797,23 @@ mod tests {
                 Some(cursor),
             ),
         );
-        assert_eq!(kept, 0, "커서 이상인 항목은 하나도 받지 않는다");
+        assert_eq!(kept, 0, "nothing at or above the cursor is accepted");
         merge.advance(10);
         let keys: Vec<(u64, u32)> = merge
             .rows()
             .iter()
             .map(|r| (r.height, r.position))
             .collect();
-        assert_eq!(keys, vec![(100, 0), (90, 0)], "중복도 역순도 없다");
+        assert_eq!(
+            keys,
+            vec![(100, 0), (90, 0)],
+            "no duplicates, no reversed order"
+        );
     }
 
-    // 전부 버려진 페이지는 항목이 있었더라도 진행이 없다. `accept` 가 0 을
-    // 돌려주지 않으면 `app.rs` 의 빈-페이지 감시가 이 경우를 못 보고, 같은
-    // 커서로 무한히 다시 요청한다.
+    // A page dropped in its entirety made no progress even though it had
+    // entries. If `accept` did not return 0 here, `app.rs`'s empty-page
+    // guard would miss this case and re-request the same cursor forever.
     #[test]
     fn a_fully_dropped_page_reports_no_progress() {
         let mut merge = Merge::new(vec!["a".into()]);
@@ -788,12 +831,14 @@ mod tests {
         assert!(merge.rows().is_empty());
     }
 
-    // `want` 는 누적 목표치다, 증분이 아니다. 버퍼에 낼 것이 두 개 더 남아
-    // 있고 커서도 살아 있는 채로(스트림이 finished 도 아닌 채로) 이미 2행을
-    // 낸 뒤 advance(2) 를 다시 부른다. 증분으로 읽는 구현이면 남은 두 개를
-    // 마저 내서 행 수가 4로 늘거나(버퍼가 딱 맞아떨어지지 않으면) 버퍼가
-    // 비고 살아 있는 커서 때문에 Need::Page 를 돌려준다 -- 어느 쪽이든
-    // 누적 목표를 어긴 것이다.
+    // `want` is a cumulative target, not an increment. Two more entries
+    // are still sitting in the buffer, and with the cursor still alive
+    // (the stream is not `finished`), advance(2) is called again after 2
+    // rows have already been emitted. An implementation that reads it as
+    // an increment would either emit the remaining two and grow the row
+    // count to 4, or (if the buffer does not line up exactly) empty the
+    // buffer and return `Need::Page` because the cursor is still alive --
+    // either way, the cumulative target was violated.
     #[test]
     fn advance_want_is_a_cumulative_target_not_an_increment() {
         let mut merge = Merge::new(vec!["a".into()]);
@@ -818,7 +863,7 @@ mod tests {
         assert_eq!(
             merge.rows().len(),
             2,
-            "누적 목표를 이미 채웠으면 다시 불러도 더 내면 안 된다"
+            "once the cumulative target is met, calling again must not emit more"
         );
     }
 }

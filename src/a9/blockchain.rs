@@ -14077,23 +14077,26 @@ mod tests {
         );
     }
 
-    // 진행바 없는 환경에서 해시레이트가 실제로 상태에 도달하는지가 이 하위
-    // 프로젝트의 존재 이유다. 코드를 읽어서는 알 수 없다 — 두 경로 모두 값을
-    // pb.set_message 로만 보내고 있었고, 테스트 프로세스에는 그 진행바가 없다.
-    // 즉 여기서 값이 보이면 헤드리스에서도 보인다.
+    // Whether the hashrate actually reaches status without a progress bar is
+    // the whole reason this test exists. Reading the code cannot tell you --
+    // both paths were sending the value only through `pb.set_message`, and
+    // the test process has no such progress bar. So if the value shows up
+    // here, it shows up in headless too.
     //
-    // 블록을 찾을 필요는 없다. CPU grind 는 8192 논스마다 레이트를 갱신하므로
-    // (miner.rs:509 `update_interval`), 값이 올라오는 즉시 멈춘다. 최소 난이도
-    // 실채굴은 느려서 `racing_miners_with_pending_tx_both_complete` 가 #[ignore]
-    // 인데, 이 테스트는 그 이유에 걸리지 않는다.
+    // No need to find a block. The CPU grind updates the rate every 8192
+    // nonces (`miner.rs:509` `update_interval`), so it stops the moment the
+    // value comes up. Real mining at the minimum difficulty is slow, which is
+    // why `racing_miners_with_pending_tx_both_complete` is `#[ignore]`d -- but
+    // that reason does not apply to this test.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mining_records_a_nonzero_rate_without_a_progress_bar() {
         use crate::a9::miner::status;
         use crate::a9::miner::{BlockHeader, MiningManager};
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // 이 상태는 프로세스 전역이다. status_tests 와 이 테스트가 병렬로
-        // 돌면 서로의 값이 섞인다 — 이 락으로 직렬화한다.
+        // This state is a process global. Running in parallel with
+        // status_tests would interleave their values -- this lock
+        // serializes them.
         let _guard = status::TEST_LOCK.lock().await;
 
         let blockchain = Arc::new(RwLock::new(test_blockchain()));
@@ -14118,8 +14121,9 @@ mod tests {
         status::session_started(address, false);
         let stop = Arc::new(AtomicBool::new(false));
 
-        // 8.0.1 부터 취소 플래그가 매니저 안에 산다. stop 을 넘겨 두면 아래의
-        // stop.store(true) 가 그대로 이 grind 를 세운다 -- 검사 의미는 그대로다.
+        // As of 8.0.1 the cancel flag lives inside the manager. Passing `stop`
+        // in means the `stop.store(true)` below still stops this grind
+        // directly -- the check's meaning is unchanged.
         let manager = MiningManager::new(
             Arc::clone(&blockchain),
             Arc::new(AtomicBool::new(false)),
@@ -14131,8 +14135,9 @@ mod tests {
                 .await
         });
 
-        // 값이 올라오면 즉시 멈춘다. 상한을 두는 이유는 실패를 5초 안에
-        // 알려 주기 위해서다 — 안 올라오면 영원히 갈아 봐야 소용없다.
+        // Stops the moment the value comes up. The cap exists to report
+        // failure within 5 seconds -- there's no point grinding forever if
+        // it never does.
         let mut recorded = 0u64;
         for _ in 0..50 {
             recorded = status::hashes_per_second();
@@ -14147,7 +14152,7 @@ mod tests {
 
         assert!(
             recorded > 0,
-            "grind 가 돌았는데 상태에 레이트가 안 올라왔다 — 헤드리스에서도 안 올라온다"
+            "the grind ran but the rate never reached status -- it won't reach headless either"
         );
     }
 

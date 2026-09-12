@@ -1,4 +1,4 @@
-//! 맨 아래 탭 띠. 키로도, 눌러서도 넘어간다.
+//! The bottom tab strip. Switches by key or by click.
 //!
 //! `command_bar` and `command` are ported from noid_gui (Apache-2.0,
 //! Copyright (C) 2026 Paranoid Zero): `view/mod.rs`'s `command_bar` and
@@ -11,10 +11,11 @@ use iced::{Alignment, Element, Length};
 use crate::app::{Message, Screen};
 use crate::theme;
 
-/// F 키 → 탭. 매핑되지 않은 키는 `None` 이고 화면을 바꾸지 않는다.
+/// F-key -> tab. An unmapped key is `None` and changes nothing.
 ///
-/// F10 (종료) 은 이 표에 없다 -- `Screen` 을 바꾸는 게 아니라 앱을 끝낸다.
-/// `TABS` 아래에 `Message::Quit` 을 직접 매핑하는 별도의 리스너가 있다.
+/// F10 (quit) is not in this table -- it doesn't change the `Screen`, it
+/// ends the app. A separate listener below `TABS` maps it directly to
+/// `Message::Quit`.
 pub fn shortcut(key: &Key) -> Option<Screen> {
     match key {
         Key::Named(Named::F1) => Some(Screen::Wallet),
@@ -132,11 +133,12 @@ mod tests {
         assert_eq!(shortcut(&Key::Named(Named::F7)), Some(Screen::Settings));
     }
 
-    /// F5·F8·F9 는 탭이 아니다. F5 는 채굴 탭이었다 -- 지갑 노드는 채굴하지 않아
-    /// 비워 두었고, 뒤의 번호를 당기지 않아 F6·F7 단축키가 그대로다.
-    /// F8·F9 도 탭이 아니다. 아무 F 키나 화면을 바꾸면 사용자가 어디로
-    /// 갔는지 모른다. F10 도 `shortcut` 의 몫이 아니다 -- `Screen` 이 아니라
-    /// 종료라서 `is_quit_shortcut` 이 따로 답한다.
+    /// F5, F8, and F9 are not tabs. F5 used to be the mining tab -- left
+    /// empty since the wallet node doesn't mine, without pulling the later
+    /// numbers forward, so the F6/F7 shortcuts stay put. F8 and F9 aren't
+    /// tabs either: if any F key changed the screen, the user wouldn't know
+    /// where they'd gone. F10 isn't `shortcut`'s job either -- it's not a
+    /// `Screen`, it's quit, so `is_quit_shortcut` answers that separately.
     #[test]
     fn an_unmapped_key_changes_nothing() {
         assert_eq!(shortcut(&Key::Named(Named::F5)), None);
@@ -145,15 +147,16 @@ mod tests {
         assert_eq!(shortcut(&Key::Named(Named::F10)), None);
     }
 
-    /// 화면의 다른 모든 글자가 영어인데 탭 띠만 한국어였다 (눈으로 보고
-    /// 잡았다 -- 라벨은 `Element` 안에 있어 diff 로는 섞인 게 안 보인다).
-    /// 라벨은 `TABS` 한 곳에만 있으므로, 여기서 ASCII 를 요구해 두면 다음에
-    /// 탭을 더하는 사람이 같은 실수를 하기 전에 테스트가 먼저 막는다.
+    /// Every other label on screen was English, but the tab strip alone was
+    /// Korean (caught by eye -- the label lives inside an `Element`, so a
+    /// diff doesn't show it mixed in). Labels live in exactly one place,
+    /// `TABS`, so requiring ASCII here lets this test catch the same
+    /// mistake before the next person who adds a tab makes it.
     #[test]
     fn every_tab_label_is_ascii_like_the_rest_of_the_ui() {
         for (key, label, _) in crate::view::tabs::TABS {
-            assert!(key.is_ascii(), "탭 키 {key} 가 ASCII 가 아니다");
-            assert!(label.is_ascii(), "탭 라벨 {label} 가 ASCII 가 아니다");
+            assert!(key.is_ascii(), "tab key {key} is not ASCII");
+            assert!(label.is_ascii(), "tab label {label} is not ASCII");
         }
     }
 
