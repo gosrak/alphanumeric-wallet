@@ -1,0 +1,5560 @@
+use crate::a9::store::Store;
+use indicatif::{ProgressBar, ProgressStyle};
+use inquire::{Password, PasswordDisplayMode};
+use log::{debug, info};
+use serde::{Deserialize, Serialize};
+use serde_json;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use tokio::fs;
+use tokio::sync::RwLock;
+use zeroize::Zeroizing;
+
+use crate::a9::blockchain::{
+    is_canonical_user_address, MIN_RELAY_FEE_UNITS, SYSTEM_ADDRESSES, WALLET_FEE_SAFETY_LIMIT_UNITS,
+};
+use crate::a9::ui::{
+    ui_address, ui_age, ui_grid_header, ui_grid_row, ui_money, ui_pad, ui_right, ui_seg, ui_text,
+    ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_FAINT, UI_GREEN, UI_HAIRLINE, UI_LABEL, UI_LAVENDER,
+    UI_MUTED, UI_ORANGE, UI_PINK, UI_RULE, UI_VALUE,
+};
+use crate::a9::whisper::max_non_whisper_fee_units;
+use crate::a9::{
+    blockchain::{
+        Block, Blockchain, BlockchainError, Transaction, TransactionPresence,
+        MINING_REWARD_MATURITY, TARGET_BLOCK_TIME,
+    },
+    ledger::{PaymentTuple, WalletLedger},
+    miner::{BlockHeader as ProgPowHeader, Miner, MiningManager},
+    mldsa,
+    node::{Node, NodeError},
+    wallet::Wallet,
+};
+
+const KEY_FILE_PATH: &str = "private.key";
+const MINING_NONCE_WINDOW: u64 = 67_108_864;
+/// Reference-wallet fee policy. Wallet POLICY, not consensus rules: externally
+/// signed transactions may choose their own fee subject to current relay
+/// admission and block-accounting policy. The wallet's default fee is no longer
+/// a fixed amount ratio — `create` without --fee resolves through the live
+/// mempool fee estimator (Blockchain::fee_estimate): the flat anchor
+/// (FEE_ESTIMATE_ANCHOR_UNITS, 2x the relay floor) on a quiet network, one
+/// unit above the marginal next-block fee under congestion, always clamped to
+/// the safety ceiling below.
+///
+/// Hard safety ceiling for ANY wallet fee (explicit --fee or auto). Anchored to
+/// the single source in blockchain.rs so the estimator and the --fee guard can
+/// never disagree.
+const EXPLICIT_FEE_SAFETY_LIMIT_UNITS: i128 = WALLET_FEE_SAFETY_LIMIT_UNITS; // 0.01 ALPHA
+const CREATE_TRANSACTION_USAGE: &str = "Usage: send <recipient> <amount>                     (spends from your default wallet)\n       send <sender> <recipient> <amount>  [--fee <ALPHA>]   (explicit sender)";
+
+/// The three counterparties worth printing in full: the most recent inbound, the most recent
+/// outbound, and the one appearing most often.
+///
+/// `recent` is newest-first — address_recent_txs scans the height-ordered index in reverse —
+/// so the first match in each direction IS the latest one.
+///
+/// Two judgement calls live here rather than in the renderer, so they can be tested:
+///
+/// * Coinbase rows are excluded. MINING_REWARDS is not somebody anyone deals with, and on a
+///   miner it would win `frequent` outright and crowd out the answer that was wanted.
+/// * `frequent` requires more than one appearance. A single transaction is not a pattern, and
+///   calling it one would make the row noise on an address with no repeat counterparty.
+///
+/// Ties break on the address so the row is stable across runs instead of following hash order.
+#[allow(clippy::type_complexity)]
+fn notable_counterparties(
+    recent: &[crate::a9::blockchain::AddressTxEntry],
+) -> (
+    Option<&crate::a9::blockchain::AddressTxEntry>,
+    Option<&crate::a9::blockchain::AddressTxEntry>,
+    Option<(&str, usize)>,
+) {
+    let real = |party: &str| !SYSTEM_ADDRESSES.contains(&party);
+    let last_in = recent
+        .iter()
+        .find(|e| e.is_recipient() && real(&e.counterparty));
+    let last_out = recent
+        .iter()
+        .find(|e| e.is_sender() && real(&e.counterparty));
+    let mut tally: HashMap<&str, usize> = HashMap::new();
+    for e in recent.iter().filter(|e| real(&e.counterparty)) {
+        *tally.entry(e.counterparty.as_str()).or_insert(0) += 1;
+    }
+    let frequent = tally
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .filter(|(_, n)| *n > 1);
+    (last_in, last_out, frequent)
+}
+
+/// Ranking reads one balances-tree entry per wallet — no block decodes — and is
+/// time-boxed, degrading to the name-ordered first wallet if the chain lock is
+/// busy rather than blocking the console.
+pub async fn resolve_default_wallet(
+    wallets: &std::collections::HashMap<String, crate::a9::wallet::Wallet>,
+    blockchain: &Arc<RwLock<Blockchain>>,
+) -> Option<(String, String)> {
+    if let Some((name, wallet)) = wallets.get_key_value("default_wallet") {
+        return Some((name.clone(), wallet.address.clone()));
+    }
+    if wallets.len() <= 1 {
+        return wallets
+            .iter()
+            .next()
+            .map(|(name, wallet)| (name.clone(), wallet.address.clone()));
+    }
+
+    let mut ordered: Vec<(&String, &crate::a9::wallet::Wallet)> = wallets.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+
+    if let Ok(guard) = tokio::time::timeout(Duration::from_secs(3), blockchain.read()).await {
+        let mut best: Option<(i128, String, String)> = None;
+        for (name, wallet) in &ordered {
+            let units = guard
+                .get_confirmed_balance_units(&wallet.address)
+                .await
+                .unwrap_or(0);
+            // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.89 MSRV (raised by redb).
+            #[allow(clippy::unnecessary_map_or)]
+            if best.as_ref().map_or(true, |(top, _, _)| units > *top) {
+                best = Some((units, (*name).clone(), wallet.address.clone()));
+            }
+        }
+        if let Some((_, name, address)) = best {
+            return Some((name, address));
+        }
+    }
+
+    ordered
+        .first()
+        .map(|(name, wallet)| ((*name).clone(), wallet.address.clone()))
+}
+
+/// Blocks until the coinbase mined at `reward_height` leaves the M06 immature set — i.e.
+/// until the wallet's spendable balance includes it. It drops out once the tip reaches
+/// reward_height + MINING_REWARD_MATURITY − 1 (the display's spend height is tip+1), which
+/// is where the `- 1` below comes from.
+/// Display-only; the enforced set comes from the breakdown itself.
+fn blocks_until_mature(reward_height: u32, as_of_height: u64) -> u64 {
+    (reward_height as u64)
+        .saturating_add(MINING_REWARD_MATURITY as u64 - 1)
+        .saturating_sub(as_of_height)
+}
+
+/// "≈3m55s" — just the wait, for the width-constrained `bal` grid where the note
+/// column has no room for the block count. Display-only.
+fn maturity_eta_short(blocks_left: u64) -> String {
+    let secs = blocks_left.saturating_mul(TARGET_BLOCK_TIME);
+    if secs >= 60 {
+        format!("≈{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("≈{}s", secs)
+    }
+}
+
+/// "47 blocks (≈3m55s)" — human ETA for a coinbase that becomes spendable `blocks_left`
+/// blocks from now, at the TARGET_BLOCK_TIME cadence. Display-only.
+fn format_maturity_eta(blocks_left: u64) -> String {
+    format!(
+        "{} block{} ({})",
+        blocks_left,
+        if blocks_left == 1 { "" } else { "s" },
+        maturity_eta_short(blocks_left)
+    )
+}
+
+pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+#[derive(Debug, Eq, PartialEq)]
+struct CreateTransactionArgs {
+    sender_address: String,
+    recipient_address: String,
+    amount_units: i128,
+    /// Some = explicit --fee (validated against floor and safety ceiling at
+    /// parse time). None = auto: the handler resolves it through the live
+    /// mempool fee estimator (Blockchain::fee_estimate) — parsing stays a pure
+    /// string function with no chain access.
+    fee_units: Option<i128>,
+}
+
+/// Parse a CLI coin amount without routing user input through `f64`. Transaction
+/// values have eight decimal places on the wire, so accepting exponent notation
+/// or silently rounding a ninth decimal would make the displayed fee differ from
+/// the value actually signed.
+fn parse_coin_units(value: &str, field: &str) -> std::result::Result<i128, String> {
+    let mut components = value.split('.');
+    let whole = components.next().unwrap_or_default();
+    let fractional = components.next();
+
+    if components.next().is_some()
+        || (whole.is_empty() && fractional.unwrap_or_default().is_empty())
+        || !whole.chars().all(|c| c.is_ascii_digit())
+        || fractional
+            .map(|part| !part.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false)
+    {
+        return Err(format!(
+            "{} must be a plain non-negative decimal number",
+            field
+        ));
+    }
+
+    let fractional = fractional.unwrap_or_default();
+    if fractional.len() > 8 {
+        return Err(format!("{} may have at most 8 decimal places", field));
+    }
+
+    let whole_units = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<i128>()
+            .map_err(|_| format!("{} is too large", field))?
+            .checked_mul(100_000_000)
+            .ok_or_else(|| format!("{} is too large", field))?
+    };
+
+    let mut fractional_units = if fractional.is_empty() {
+        0
+    } else {
+        fractional
+            .parse::<i128>()
+            .map_err(|_| format!("{} is invalid", field))?
+    };
+    for _ in fractional.len()..8 {
+        fractional_units = fractional_units
+            .checked_mul(10)
+            .ok_or_else(|| format!("{} is too large", field))?;
+    }
+
+    whole_units
+        .checked_add(fractional_units)
+        .ok_or_else(|| format!("{} is too large", field))
+}
+
+fn ensure_wire_exact(units: i128, field: &str) -> std::result::Result<(), String> {
+    if Transaction::to_units(Transaction::from_units(units)) != units {
+        return Err(format!(
+            "{} is outside the transaction format's exact numeric range",
+            field
+        ));
+    }
+    Ok(())
+}
+
+fn parse_create_transaction_command(
+    command: &str,
+) -> std::result::Result<CreateTransactionArgs, String> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.len() < 4 {
+        return Err("invalid command format".to_string());
+    }
+
+    let amount_units = parse_coin_units(parts[3], "amount")?;
+    if amount_units <= 0 {
+        return Err("amount must be greater than zero".to_string());
+    }
+    ensure_wire_exact(amount_units, "amount")?;
+
+    let mut explicit_fee_units = None;
+    let mut index = 4;
+    while index < parts.len() {
+        match parts[index] {
+            "--fee" => {
+                if explicit_fee_units.is_some() {
+                    return Err("--fee may only be specified once".to_string());
+                }
+                index += 1;
+                let value = parts
+                    .get(index)
+                    .ok_or_else(|| "--fee requires a decimal ALPHA value".to_string())?;
+                explicit_fee_units = Some(parse_coin_units(value, "fee")?);
+            }
+            option if option.starts_with("--fee=") => {
+                if explicit_fee_units.is_some() {
+                    return Err("--fee may only be specified once".to_string());
+                }
+                // The match arm above guarantees the prefix; bind rather than expect so a
+                // future arm edit cannot turn a CLI typo into a panic.
+                let Some(value) = option.strip_prefix("--fee=") else {
+                    return Err("--fee requires a decimal ALPHA value".to_string());
+                };
+                if value.is_empty() {
+                    return Err("--fee requires a decimal ALPHA value".to_string());
+                }
+                explicit_fee_units = Some(parse_coin_units(value, "fee")?);
+            }
+            unknown => {
+                return Err(format!("unrecognized transaction option: {}", unknown));
+            }
+        }
+        index += 1;
+    }
+
+    // Explicit --fee is fully validated here at parse time; the auto default is
+    // deliberately NOT resolved here — parsing stays a pure string function, and
+    // the handler prices the fee off the live mempool (Blockchain::fee_estimate)
+    // at send time. The estimator's output is clamped to the same
+    // [relay floor, safety ceiling] band by construction, so both paths obey
+    // the identical policy bounds.
+    if let Some(fee_units) = explicit_fee_units {
+        ensure_wire_exact(fee_units, "fee")?;
+        if fee_units < MIN_RELAY_FEE_UNITS {
+            return Err(format!(
+                "fee is below the relay floor of {:.8} ALPHA",
+                Transaction::from_units(MIN_RELAY_FEE_UNITS)
+            ));
+        }
+        if fee_units > EXPLICIT_FEE_SAFETY_LIMIT_UNITS {
+            return Err(format!(
+                "fee exceeds the reference wallet safety limit of {:.8} ALPHA",
+                Transaction::from_units(EXPLICIT_FEE_SAFETY_LIMIT_UNITS)
+            ));
+        }
+        amount_units
+            .checked_add(fee_units)
+            .ok_or_else(|| "amount plus fee is too large".to_string())?;
+    }
+
+    Ok(CreateTransactionArgs {
+        sender_address: parts[1].to_string(),
+        recipient_address: parts[2].to_string(),
+        amount_units,
+        fee_units: explicit_fee_units,
+    })
+}
+
+fn validate_wallet_transaction_addresses(
+    sender: &str,
+    recipient: &str,
+) -> std::result::Result<(), String> {
+    if !is_canonical_user_address(sender) {
+        return Err(
+            "sender address must be exactly 40 lowercase hexadecimal characters".to_string(),
+        );
+    }
+    if !is_canonical_user_address(recipient) {
+        return Err(
+            "recipient address must be exactly 40 lowercase hexadecimal characters".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WalletKeyData {
+    pub wallet_name: String,
+    pub wallet_address: String,
+    /// Key material as persisted. When `is_encrypted` is false this is the RAW
+    /// combined ML-DSA key, not ciphertext -- the field name describes the
+    /// encrypted case only. Zeroized on drop so a freed allocation does not keep
+    /// a spendable key; `Zeroizing` is a transparent wrapper, so the serialized
+    /// form is a bare byte array exactly as before (pinned by the frozen-format
+    /// fixtures in this module's tests).
+    #[serde(with = "zeroizing_key_bytes")]
+    pub private_key: Option<Zeroizing<Vec<u8>>>,
+    pub last_sync_timestamp: u64,
+    pub is_encrypted: bool,
+    pub key_verification_hash: Vec<u8>,
+}
+
+/// Serde adapter keeping `Option<Zeroizing<Vec<u8>>>` on the wire EXACTLY as
+/// `Option<Vec<u8>>` was: a bare JSON array, or null. Written out rather than
+/// enabling zeroize's serde feature so the transparency is visible at the point
+/// it matters -- this is the field whose representation decides whether existing
+/// key files still load. Deserialization moves the buffer into `Zeroizing`
+/// instead of copying, so no unzeroized duplicate is left behind.
+pub mod zeroizing_key_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
+
+    pub fn serialize<S>(
+        value: &Option<Zeroizing<Vec<u8>>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(bytes) => serializer.serialize_some(bytes.as_slice()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Zeroizing<Vec<u8>>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Option::<Vec<u8>>::deserialize(deserializer)?.map(Zeroizing::new))
+    }
+}
+
+// Hand-written so key material can never reach a log line, a panic backtrace or a
+// crash report. Derived Debug on a secret-bearing struct is a footgun that stays
+// dormant until someone adds a `{:?}` years later, which is precisely when it is
+// hardest to notice. Non-secret fields stay legible so the type is still useful
+// in diagnostics.
+impl std::fmt::Debug for WalletKeyData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let private_key = match &self.private_key {
+            Some(key) => format!("<redacted {} bytes>", key.len()),
+            None => "<none>".to_string(),
+        };
+        f.debug_struct("WalletKeyData")
+            .field("wallet_name", &self.wallet_name)
+            .field("wallet_address", &self.wallet_address)
+            .field("private_key", &private_key)
+            .field("last_sync_timestamp", &self.last_sync_timestamp)
+            .field("is_encrypted", &self.is_encrypted)
+            .field(
+                "key_verification_hash",
+                &format_args!("{} bytes", self.key_verification_hash.len()),
+            )
+            .finish()
+    }
+}
+
+impl WalletKeyData {
+    pub fn new(
+        wallet_name: String,
+        wallet_address: String,
+        private_key: Option<Zeroizing<Vec<u8>>>,
+        is_encrypted: bool,
+    ) -> Self {
+        // Keep existing hash verification - it works with any key bytes
+        let key_verification_hash = if let Some(key) = &private_key {
+            let mut hasher = Sha256::new();
+            hasher.update(key);
+            hasher.update([is_encrypted as u8]);
+            hasher.finalize().to_vec()
+        } else {
+            vec![0u8; 32]
+        };
+
+        Self {
+            wallet_name,
+            wallet_address,
+            private_key,
+            last_sync_timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            is_encrypted,
+            key_verification_hash,
+        }
+    }
+}
+
+/// A wallet name is the durable identity the CLI uses to select a private key. Two records with
+/// the same name cannot be represented faithfully in the in-memory `HashMap`: the later insert
+/// shadows the earlier key. Validate the file BEFORE decryption/loading and BEFORE every write so
+/// an ambiguous file is never silently accepted or made worse.
+fn validate_unique_wallet_names(wallets: &[WalletKeyData]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(wallets.len());
+    let mut duplicates = Vec::new();
+
+    for wallet in wallets {
+        if !seen.insert(wallet.wallet_name.as_str()) {
+            duplicates.push(wallet.wallet_name.as_str());
+        }
+    }
+
+    if duplicates.is_empty() {
+        return Ok(());
+    }
+
+    duplicates.sort_unstable();
+    duplicates.dedup();
+    Err(format!(
+        "{} contains duplicate wallet name(s) {:?}. Refusing to load or modify an ambiguous wallet file; restore a backup or repair the duplicate records before retrying.",
+        KEY_FILE_PATH, duplicates
+    )
+    .into())
+}
+
+/// Two records sharing an address make it depend on file order which key signs for that
+/// address. Blocked at the durable boundary -- but, unlike name uniqueness, ONLY there:
+/// `persist_wallet_keys` calls this and `load_wallets` does not. So a `private.key` that
+/// already contains a duplicate address keeps loading and keeps spending, and it is every
+/// MUTATION that refuses until the operator removes the redundant record -- `new`, `rename`
+/// and `import-seed`, which are the three commands an operator can reach, plus
+/// `create_default_wallet`, which only runs when there is no key file to be ambiguous. That is fail-closed and deliberate -- rewriting such a file is what
+/// makes the ambiguity permanent -- and the message says the narrower thing this actually
+/// does rather than claiming a load-time check that is not wired.
+fn validate_unique_wallet_addresses(wallets: &[WalletKeyData]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(wallets.len());
+    let mut duplicates = Vec::new();
+
+    for wallet in wallets {
+        if !seen.insert(wallet.wallet_address.as_str()) {
+            duplicates.push(wallet.wallet_address.as_str());
+        }
+    }
+
+    if duplicates.is_empty() {
+        return Ok(());
+    }
+
+    duplicates.sort_unstable();
+    duplicates.dedup();
+    Err(format!(
+        "{} contains duplicate wallet address(es) {:?}. Refusing to MODIFY an ambiguous wallet file; \
+         the file still loads and its wallets still spend, but `new`, `rename` and `import-seed` \
+         are blocked until the redundant record is removed.",
+        KEY_FILE_PATH, duplicates
+    )
+    .into())
+}
+
+/// Prefix of the GUI's master-seed encoding. Its shape has to differ from an address seed so
+/// the two cannot be pasted into each other's slot (design doc 3.2). The node does not handle
+/// master seeds, so all it does here is refuse them.
+const GUI_MASTER_SEED_PREFIX: &str = "a9m1";
+
+/// Turn the address-seed string `import-seed` accepts into 32 bytes.
+///
+/// Error messages never echo the input -- the input IS a spendable key.
+fn parse_address_seed_hex(input: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let trimmed = input.trim();
+
+    // Compare the prefix WITHOUT copying the input. `to_ascii_lowercase()` would heap-allocate a
+    // full String copy of what is, on the happy path, a real spendable seed -- and that copy is
+    // never wrapped in Zeroizing, so it survives in freed memory.
+    let prefix = GUI_MASTER_SEED_PREFIX.as_bytes();
+    if trimmed.len() >= prefix.len()
+        && trimmed.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix)
+    {
+        return Err(format!(
+            "That looks like a GUI master seed ({}...). A master seed is the root of a \
+             derivation tree, not a single address key, and importing it here would give you \
+             one unrelated address while the rest of your funds stay in the GUI wallet. \
+             Export the individual address seed from the GUI instead.",
+            GUI_MASTER_SEED_PREFIX
+        )
+        .into());
+    }
+
+    if trimmed.len() != mldsa::SECRET_KEY_BYTES * 2 {
+        return Err(format!(
+            "A wallet seed is {} hexadecimal characters ({} bytes); got {} characters.",
+            mldsa::SECRET_KEY_BYTES * 2,
+            mldsa::SECRET_KEY_BYTES,
+            trimmed.len()
+        )
+        .into());
+    }
+
+    // `hex::decode` collects through an iterator whose lower size bound is 0, so the Vec it
+    // builds grows 8 -> 16 -> 32 -> 64 and the orphaned cap-32 intermediate holds the WHOLE
+    // spendable seed in a freed allocation that nothing wipes. Wrapping the finished Vec in
+    // Zeroizing wipes only the last of those buffers. `decode_to_slice` writes straight into a
+    // buffer that is pre-sized and already wrapped, so there is never a second copy --
+    // `gui/src/seed.rs::decode` closed exactly this hole and the node's import path must not
+    // reopen it. The length was checked above, so `InvalidStringLength` cannot occur here and
+    // every remaining error is a non-hex character.
+    let mut seed: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; mldsa::SECRET_KEY_BYTES]);
+    hex::decode_to_slice(trimmed, &mut seed[..])
+        .map_err(|_| "The seed must be hexadecimal characters only (0-9, a-f).".to_string())?;
+    // Defence in depth. For ML-DSA-87 the length check above already decides this -- the seed is
+    // a raw 32-byte value with no invalid encodings -- so this cannot currently fail here. It
+    // stays so a future key scheme with a narrower valid set is caught rather than assumed.
+    mldsa::validate_secret_key(&seed)
+        .map_err(|_| "The seed is not a valid ML-DSA key.".to_string())?;
+
+    Ok(seed)
+}
+
+/// Resolve an explicit or automatic wallet name against BOTH views of wallet state. `loaded_names`
+/// contains only keys that decrypted successfully; `durable_wallets` also contains encrypted or
+/// otherwise unloadable records. Checking only the former allowed `new X` to append a second `X`
+/// while the original encrypted wallet was skipped for lack of a passphrase.
+fn select_new_wallet_name(
+    requested: Option<String>,
+    loaded_names: &HashSet<&str>,
+    durable_wallets: &[WalletKeyData],
+) -> Result<String> {
+    let name_is_taken = |name: &str| {
+        loaded_names.contains(name)
+            || durable_wallets
+                .iter()
+                .any(|wallet| wallet.wallet_name == name)
+    };
+
+    if let Some(name) = requested {
+        if name_is_taken(&name) {
+            return Err("Duplicate wallet name".into());
+        }
+        return Ok(name);
+    }
+
+    // Preserve the existing numbering convention (loaded count + 1), but advance past names held
+    // only on disk instead of failing or colliding with them.
+    let mut index = loaded_names
+        .len()
+        .checked_add(1)
+        .ok_or("Unable to allocate an automatic wallet name")?;
+    loop {
+        let candidate = format!("wallet_{}", index);
+        if !name_is_taken(&candidate) {
+            return Ok(candidate);
+        }
+        index = index
+            .checked_add(1)
+            .ok_or("Unable to allocate an automatic wallet name")?;
+    }
+}
+
+pub struct Mgmt {
+    pub blockchain: Arc<RwLock<Blockchain>>, // Just store the reference
+    /// Durable operator-side payment ledger for collision-free timestamps and honest retries.
+    /// `None` only if the ledger file could not be opened, in which case signing fails closed.
+    ledger: Option<Arc<WalletLedger>>,
+}
+
+/// User-facing transaction creation result. Only `Submitted` authorizes gossip;
+/// duplicate outcomes are successful idempotent requests, not newly created payments.
+pub enum CreateTransactionOutcome {
+    Submitted(Transaction),
+    AlreadyPending,
+    AlreadyConfirmed(u32),
+}
+
+/// What a mining session tells whoever started it, while it runs.
+///
+/// The session loop does not know how to talk to a person: it emits these and
+/// the caller renders them. The REPL prints what it always printed; a headless
+/// run logs. Every variant here stands for a line the loop used to print
+/// itself.
+#[derive(Debug)]
+pub enum MiningProgress {
+    /// A prep round is beginning.
+    PreparingStarted,
+    /// Prep liveness tick, once every 5s. `height` is our tip; `target` is the
+    /// network's, and is `None` when the network is not ahead of us. Prep is
+    /// time-bounded but a churning network can use the whole budget, which
+    /// reads as "it's stuck, restart the client" — this is how silence is kept
+    /// from looking like a hang.
+    Preparing {
+        height: Option<u64>,
+        target: Option<u64>,
+        elapsed: Duration,
+    },
+    /// Prep is over. A caller that drew an in-place status line for `Preparing`
+    /// gets to erase it before anything else prints.
+    PreparingEnded,
+    /// Prep refused outright (a divergence that retrying cannot heal). The
+    /// session stops.
+    Unminable { reason: String },
+    /// Prep spent its budget without reaching the tip. `retry_in` is `Some`
+    /// only in continuous mode, where the session waits that long and tries
+    /// again.
+    NotSynced { retry_in: Option<Duration> },
+    /// A block was mined and finalized. The reward summary is the miner's own;
+    /// this is the event, not the report.
+    Mined { index: u64, elapsed: Duration },
+    /// Pacing wait after a mined block: up to ~25s of otherwise-silent pause
+    /// right after the reward summary, the one spot a healthy miner looked
+    /// hung.
+    Absorbing { index: u64 },
+    /// We solved a height, but another miner's block for it was adopted first.
+    /// Routine under heavy racing, and not a fault. `retrying` in continuous
+    /// mode, where the session retargets the new tip.
+    LostRace { retrying: bool },
+    /// A mining round failed. `backoff` is `Some` when the session will wait
+    /// that long and try the round again.
+    Failed {
+        error: String,
+        backoff: Option<Duration>,
+    },
+    /// Consecutive failures reached the ceiling: an error that repeats
+    /// back-to-back will never heal by retrying, so continuous mining stops.
+    GaveUp { errors: u32 },
+    /// The session is over, having mined `blocks` this run.
+    Stopped { blocks: u64 },
+}
+
+/// One mining run's inputs.
+///
+/// `stop` and `shutdown` are separate on purpose. `stop` is the operator asking
+/// THIS run to end (Enter, in the REPL) and only continuous mode honours it at
+/// the top of a round; `shutdown` is the process going down, and prep and every
+/// sleep honour it whether or not the run is continuous.
+pub struct MiningSession<'a> {
+    pub wallet: String,
+    pub use_gpu: bool,
+    pub continuous: bool,
+    pub stop: Arc<AtomicBool>,
+    pub shutdown: Arc<AtomicBool>,
+    /// Blocks mined this run (height, hash, reward), appended as they land, for
+    /// a caller that watches for one of them being reorged out. `None` when
+    /// nobody is watching.
+    #[allow(clippy::type_complexity)] // Session telemetry: height, exact hash, reward.
+    pub mined_log: Option<Arc<tokio::sync::Mutex<Vec<(u32, [u8; 32], f64)>>>>,
+    pub announce: &'a dyn Fn(&Block),
+    /// An owned handle rather than a borrow: the prep heartbeat reports from a
+    /// spawned task, which needs `Send + Sync + 'static`.
+    pub report: Arc<dyn Fn(MiningProgress) + Send + Sync>,
+}
+
+/// Sleep in short slices so a stop is seen promptly — and so Ctrl-C/SIGTERM is
+/// too: shutdown used to be ignored for the whole backoff (up to 60s), absorb
+/// wait and jitter phases.
+async fn sleep_interruptible(total: Duration, stop: &AtomicBool, shutdown: &AtomicBool) {
+    let mut remaining = total;
+    while remaining > Duration::ZERO
+        && !stop.load(Ordering::SeqCst)
+        && !shutdown.load(Ordering::Acquire)
+    {
+        let slice = remaining.min(Duration::from_millis(250));
+        tokio::time::sleep(slice).await;
+        remaining = remaining.saturating_sub(slice);
+    }
+}
+
+fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(windows)]
+    {
+        // Restricting NTFS READ access needs ACLs (winapi); `set_readonly` only affects
+        // WRITE, so the old code was a security no-op. Warn instead of pretending.
+        let _ = path;
+        eprintln!(
+            "WARNING: wallet key file {} cannot be permission-restricted on Windows without \
+             ACLs; protect it manually.",
+            path
+        );
+    }
+    Ok(())
+}
+
+/// Write secret bytes to `path` at 0600 from creation (no world-readable TOCTOU window),
+/// re-asserting perms for a pre-existing file. Mirrors main.rs::write_secret_file.
+async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
+    // Atomic replace: write to a sibling temp file, fsync it, then rename over the
+    // target. A crash / power loss / ENOSPC mid-write leaves either the intact old
+    // file or the complete new one — never a truncated key that fails to parse and
+    // bricks the wallet on next launch.
+    use tokio::io::AsyncWriteExt;
+    let tmp = format!("{}.tmp", path);
+    #[cfg(unix)]
+    {
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .await?;
+        f.write_all(data).await?;
+        f.flush().await?;
+        f.sync_all().await?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        f.write_all(data).await?;
+        f.flush().await?;
+        f.sync_all().await?;
+    }
+    tokio::fs::rename(&tmp, path).await?;
+    // Best-effort: fsync the parent directory so the rename itself survives power loss.
+    #[cfg(unix)]
+    {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if let Ok(dir) = tokio::fs::File::open(&parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+    let _ = set_restrictive_file_permissions(path);
+    Ok(())
+}
+
+// ─── wallet-creation checklist UI ──────────────────────────────────────────
+// The staged checklist the `new` command and the first-run default wallet
+// share. Each step is an indicatif spinner that resolves to a ✓ line whose
+// annotation states what ACTUALLY happened (sizes, algorithms, durability) —
+// the old flow printed a fake percent bar with invented "network propagation"
+// stages. Colors are the ui.rs palette; every effect degrades cleanly when
+// stdout is not a terminal (spinners hide, the address prints plainly).
+
+fn wc_rule(stdout: &mut StandardStream) -> Result<()> {
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_HAIRLINE)))?;
+    writeln!(stdout, "{}", crate::a9::ui::UI_RULE)?;
+    stdout.reset()?;
+    Ok(())
+}
+
+fn wc_step(stdout: &mut StandardStream, label: &str, annotation: &str) -> Result<()> {
+    // The spinner runs for a beat so the step is perceivable; the annotation is
+    // written only when the step is truly done, so a crash mid-flow never shows
+    // a ✓ for work that did not complete. Steps call this AFTER the real work.
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb.set_message(format!("{:<26} {}", label, annotation));
+    pb.enable_steady_tick(Duration::from_millis(60));
+    std::thread::sleep(Duration::from_millis(280));
+    pb.finish_and_clear();
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_GREEN)))?;
+    write!(stdout, "  ✓ ")?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_LABEL)))?;
+    write!(stdout, "{:<26}", label)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+    writeln!(stdout, " {}", annotation)?;
+    stdout.reset()?;
+    Ok(())
+}
+
+/// Reveal the address by locking hex left-to-right out of noise. Pure display:
+/// the wallet exists and is persisted before this runs. Skipped when stdout is
+/// not a TTY (piped/captured output gets one plain line).
+fn wc_reveal_address(stdout: &mut StandardStream, address: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+    writeln!(stdout, "\n  address")?;
+    stdout.reset()?;
+    if std::io::stdout().is_terminal() {
+        const HEX: &[u8] = b"0123456789abcdef";
+        // Deterministic tiny LCG — no rand dependency, no security relevance.
+        let mut seed: u32 = 0x9e37_79b9;
+        let frames = address.len() + 8;
+        for f in 0..=frames {
+            let locked = (address.len() * f / frames).min(address.len());
+            let mut line = String::with_capacity(address.len());
+            line.push_str(&address[..locked]);
+            for _ in locked..address.len() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                line.push(HEX[(seed >> 24) as usize & 0xf] as char);
+            }
+            stdout.set_color(ColorSpec::new().set_fg(Some(if locked == address.len() {
+                crate::a9::ui::UI_CYAN
+            } else {
+                crate::a9::ui::UI_FAINT
+            })))?;
+            write!(stdout, "\r  {}", line)?;
+            stdout.flush()?;
+            std::thread::sleep(Duration::from_millis(26));
+        }
+        writeln!(stdout)?;
+        stdout.reset()?;
+    } else {
+        stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_CYAN)))?;
+        writeln!(stdout, "  {}", address)?;
+        stdout.reset()?;
+    }
+    Ok(())
+}
+
+fn wc_header(stdout: &mut StandardStream, title: &str) -> Result<()> {
+    writeln!(stdout)?;
+    wc_rule(stdout)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_CYAN)))?;
+    write!(stdout, "  {}", title)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+    writeln!(stdout, "  ·  ml-dsa-87 · post-quantum")?;
+    stdout.reset()?;
+    wc_rule(stdout)?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+fn wc_footer(stdout: &mut StandardStream, name: &str, is_encrypted: bool) -> Result<()> {
+    writeln!(stdout)?;
+    wc_rule(stdout)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_GREEN)))?;
+    write!(stdout, "  ✓ {} is ready", name)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+    writeln!(stdout, "   ·   balance 0   ·   mine or receive to fund it")?;
+    stdout.reset()?;
+    wc_rule(stdout)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+    if is_encrypted {
+        writeln!(
+            stdout,
+            "  private.key + passphrase = your funds. lose both, lose the wallet — back them up now."
+        )?;
+    } else {
+        writeln!(
+            stdout,
+            "  private.key IS your funds — it is not encrypted. anyone who reads it can spend; back it up now."
+        )?;
+    }
+    stdout.reset()?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+/// Persist the serialized wallet key set to `key_file_path`, returning Err on either an I/O
+/// failure or the 5s timeout. Persisting the key is a PRECONDITION for treating a wallet as
+/// created: the ML-DSA seed lives only in RAM until this write, and `save_wallets` was removed,
+/// so a swallowed write failure would lose the key on the next launch and permanently strand any
+/// funds sent to the address. The read side (`load_wallets`) was already hardened to fail loudly
+/// on this class; this closes the corresponding write side.
+async fn persist_wallet_keys(key_file_path: &str, key_data_vec: &[WalletKeyData]) -> Result<()> {
+    // Last-line invariant at the durable boundary: even if a future wallet-mutation path forgets
+    // its own preflight check, it cannot persist a file in which one name aliases multiple keys.
+    validate_unique_wallet_names(key_data_vec)?;
+    // The second invariant for the same reason: different names with a colliding address still
+    // leave the file ambiguous.
+    validate_unique_wallet_addresses(key_data_vec)?;
+
+    // The serialized buffer contains every wallet's key material in the clear for
+    // passphrase-less wallets, so it is wiped on drop rather than left in a freed
+    // allocation. Zeroizing<String> derefs to str, so the write path is unchanged.
+    let serialized = Zeroizing::new(serde_json::to_string(key_data_vec)?);
+    match tokio::time::timeout(Duration::from_secs(5), async {
+        write_secret_file(key_file_path, serialized.as_ref()).await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            Err(format!("failed to persist wallet key to {}: {}", key_file_path, e).into())
+        }
+        Err(_) => Err(format!("timed out persisting wallet key to {}", key_file_path).into()),
+    }
+}
+
+/// Rebuild a wallet from a 32-byte seed and merge it into the durable key file at
+/// `key_file_path`. The actual logic behind `Mgmt::import_wallet_from_seed`; kept as a free
+/// function (rather than a `Mgmt` method) because it uses neither the blockchain nor the store
+/// that `Mgmt::new` requires, so tests need only a temporary key file, not a full `Mgmt`.
+async fn import_wallet_from_seed_into(
+    key_file_path: &str,
+    wallets: &mut HashMap<String, Wallet>,
+    seed_hex: &str,
+    passphrase: Option<&[u8]>,
+    wallet_name: Option<String>,
+) -> Result<Wallet> {
+    // Validate the input before touching the file.
+    let seed = parse_address_seed_hex(seed_hex)?;
+
+    // Zeroizing: this string is the ENTIRE key file, and for passphrase-less wallets that is
+    // every wallet's raw combined ML-DSA key in the clear. persist_wallet_keys already wipes the
+    // matching buffer on the write side; the read side must not reopen the gap.
+    let existing_data = Zeroizing::new(fs::read_to_string(key_file_path).await?);
+    let existing_keys = serde_json::from_str::<Vec<WalletKeyData>>(&existing_data)?;
+    validate_unique_wallet_names(&existing_keys)?;
+
+    let is_encrypted = passphrase.map(|p| !p.is_empty()).unwrap_or(false);
+    let wallet = Wallet::from_seed(&seed, passphrase)?;
+
+    if existing_keys
+        .iter()
+        .any(|record| record.wallet_address == wallet.address)
+    {
+        return Err(format!(
+            "Address {} is already in {}; that seed has already been imported.",
+            wallet.address, key_file_path
+        )
+        .into());
+    }
+
+    let name = {
+        let loaded_names: HashSet<&str> = wallets.keys().map(String::as_str).collect();
+        select_new_wallet_name(wallet_name, &loaded_names, &existing_keys)?
+    };
+
+    let key_data = WalletKeyData::new(
+        name.clone(),
+        wallet.address.clone(),
+        wallet.encrypted_private_key.clone(),
+        is_encrypted,
+    );
+    let mut key_data_vec = existing_keys;
+    key_data_vec.push(key_data);
+
+    // Register in memory only once the key is durable -- same order as create_new_wallet.
+    persist_wallet_keys(key_file_path, &key_data_vec).await?;
+    wallets.insert(name, wallet.clone());
+
+    Ok(wallet)
+}
+
+/// The wallet's 32-byte seed as hex, gated the way the design doc requires an encrypted node
+/// wallet's export to be: kept as a free function (rather than a `Mgmt` method) for the same
+/// reason as `import_wallet_from_seed_into` -- tests construct no `Mgmt`.
+async fn export_wallet_seed_from(
+    wallets: &HashMap<String, Wallet>,
+    wallet_name: &str,
+    passphrase: Option<&[u8]>,
+) -> Result<Zeroizing<String>> {
+    let wallet = wallets
+        .get(wallet_name)
+        .ok_or_else(|| format!("No wallet named {wallet_name} is loaded."))?;
+
+    // Re-check the passphrase for an encrypted wallet. The in-memory wallet is already
+    // unlocked, so this is not a cryptographic necessity -- it is a gate in front of printing a
+    // value that spends funds.
+    if wallet.is_encrypted {
+        let pass = passphrase.ok_or_else(|| {
+            format!(
+                "Wallet {wallet_name} is encrypted; its passphrase is required to export the seed."
+            )
+        })?;
+        let envelope = wallet
+            .encrypted_private_key
+            .clone()
+            .ok_or_else(|| format!("Wallet {wallet_name} has no key material loaded."))?;
+        // Proceed only if decryption succeeds. Failure means a wrong passphrase.
+        Wallet::from_key_bytes(
+            wallet_name.to_string(),
+            wallet.address.clone(),
+            envelope,
+            Some(pass),
+            true,
+        )
+        .map_err(|_| "Incorrect passphrase.".to_string())?;
+    }
+
+    wallet.export_seed_hex().await.ok_or_else(|| {
+        format!("Wallet {wallet_name} has no key material loaded; it cannot be exported.").into()
+    })
+}
+
+/// Classify a `private.key` read error. ONLY `NotFound` is a genuine first run (safe to create a
+/// default wallet). Any other error — permissions (EACCES), a Windows AV share-lock, non-UTF-8
+/// corruption (`InvalidData`), or a transient I/O error — means the key file EXISTS but is
+/// currently unreadable; treating that as first-run would overwrite it with a fresh wallet and
+/// permanently destroy funds. Those must fail loudly instead.
+fn load_error_is_first_run(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
+/// One counterparty in the `contacts` address book, folded from every index row
+/// your wallets share with that address. `in`/`out` are amounts only (see
+/// `aggregate_contacts`), so `in - out` is the net position with that party.
+#[derive(Debug, Clone, PartialEq)]
+struct Contact {
+    address: String,
+    txs: u64,
+    in_units: i128,
+    out_units: i128,
+    last_seen: u64,
+}
+
+impl Mgmt {
+    pub fn new(
+        _db: Store,
+        blockchain: Arc<RwLock<Blockchain>>, // Take blockchain directly
+        ledger: Option<Arc<WalletLedger>>,
+    ) -> Self {
+        Mgmt { blockchain, ledger }
+    }
+
+    pub fn get_current_timestamp() -> Result<u64> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .map_err(|e| format!("Failed to get current timestamp: {}", e).into())
+    }
+
+    async fn update_wallet_ledger_state(
+        &self,
+        tx_id: String,
+        state: crate::a9::ledger::EntryState,
+        now: u64,
+    ) -> bool {
+        let Some(ledger) = self.ledger.as_ref().cloned() else {
+            return false;
+        };
+        match tokio::task::spawn_blocking(move || ledger.update_state(&tx_id, state, now)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                log::error!("wallet payment ledger state update failed: {error}");
+                false
+            }
+            Err(error) => {
+                log::error!("wallet payment ledger state task failed: {error}");
+                false
+            }
+        }
+    }
+
+    pub async fn create_new_wallet(
+        &self,
+        wallets: &mut HashMap<String, Wallet>,
+        passphrase: Option<&[u8]>,
+        wallet_name: Option<String>,
+    ) -> Result<Wallet> {
+        let mut stdout = StandardStream::stdout(ColorChoice::Always);
+
+        // Read the key file - we know it exists because create_default_wallet must have run
+        let existing_data = fs::read_to_string(KEY_FILE_PATH).await?;
+        let existing_keys = serde_json::from_str::<Vec<WalletKeyData>>(&existing_data)?;
+        validate_unique_wallet_names(&existing_keys)?;
+
+        let is_encrypted = passphrase.map(|p| !p.is_empty()).unwrap_or(false);
+
+        // Resolve against the durable file, not only the successfully decrypted in-memory subset.
+        // Keep the borrowed name set scoped here so it cannot overlap the later mutable insert.
+        let name = {
+            let loaded_names: HashSet<&str> = wallets.keys().map(String::as_str).collect();
+            match select_new_wallet_name(wallet_name, &loaded_names, &existing_keys) {
+                Ok(name) => name,
+                Err(error) => {
+                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
+                    writeln!(stdout, "\nError: {}", error)?;
+                    stdout.reset()?;
+                    return Err(error);
+                }
+            }
+        };
+
+        wc_header(&mut stdout, "NEW WALLET")?;
+
+        // Key generation is synchronous and local; the old 5s "network" timeout
+        // around it guarded nothing and is gone with the fake progress stages.
+        let wallet = if is_encrypted {
+            Wallet::new(passphrase)?
+        } else {
+            Wallet::new(None)?
+        };
+        wc_step(
+            &mut stdout,
+            "key pair generated",
+            "ml-dsa-87 · 2592-byte public key",
+        )?;
+        wc_step(
+            &mut stdout,
+            "address derived",
+            "sha256(public key) · 20 bytes",
+        )?;
+
+        let key_data = WalletKeyData::new(
+            name.clone(),
+            wallet.address.clone(),
+            wallet.encrypted_private_key.clone(),
+            is_encrypted,
+        );
+
+        let mut key_data_vec = existing_keys;
+        key_data_vec.push(key_data);
+
+        // Persist the key BEFORE registering the wallet: a write failure or timeout returns Err
+        // here rather than handing back a wallet whose ML-DSA seed exists only in RAM (which the
+        // next launch would not find, permanently stranding any funds sent to the address).
+        persist_wallet_keys(KEY_FILE_PATH, &key_data_vec).await?;
+        wc_step(
+            &mut stdout,
+            "private.key written",
+            "fsync'd — the key survives power loss",
+        )?;
+        if is_encrypted {
+            wc_step(
+                &mut stdout,
+                "encrypted",
+                "argon2id — with the session passphrase",
+            )?;
+        }
+
+        wc_reveal_address(&mut stdout, &wallet.address)?;
+        wc_footer(&mut stdout, &name, is_encrypted)?;
+
+        // Register the wallet only after its key is durably persisted.
+        wallets.insert(name, wallet.clone());
+
+        Ok(wallet)
+    }
+
+    /// Rebuild a wallet from a 32-byte seed and add it to `private.key`.
+    ///
+    /// Follows the same read -> merge -> persist sequence as `create_new_wallet`. Without
+    /// reading the file first and appending to what is already there, every other wallet's key
+    /// is lost permanently -- including wallets that failed to load this session, e.g. because
+    /// the passphrase was wrong.
+    pub async fn import_wallet_from_seed(
+        &self,
+        wallets: &mut HashMap<String, Wallet>,
+        seed_hex: &str,
+        passphrase: Option<&[u8]>,
+        wallet_name: Option<String>,
+    ) -> Result<Wallet> {
+        import_wallet_from_seed_into(KEY_FILE_PATH, wallets, seed_hex, passphrase, wallet_name)
+            .await
+    }
+
+    /// The wallet's 32-byte seed as hex. Callers keep it for nothing but display and never put
+    /// it in a log -- the value restores the entire wallet.
+    pub async fn export_wallet_seed(
+        &self,
+        wallets: &HashMap<String, Wallet>,
+        wallet_name: &str,
+        passphrase: Option<&[u8]>,
+    ) -> Result<Zeroizing<String>> {
+        export_wallet_seed_from(wallets, wallet_name, passphrase).await
+    }
+
+    pub async fn create_default_wallet(
+        &self,
+        _passphrase: Option<&[u8]>,
+    ) -> Result<HashMap<String, Wallet>> {
+        let mut stdout = StandardStream::stdout(ColorChoice::Always);
+        let mut wallets = HashMap::new();
+        let default_wallet_name = "default_wallet".to_string();
+
+        wc_header(&mut stdout, "FIRST WALLET")?;
+
+        stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_DIM)))?;
+        write!(stdout, "  encrypt with a passphrase?  ")?;
+        stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_LABEL)))?;
+        write!(stdout, "[y/n]")?;
+        stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+        writeln!(stdout, "  — recommended; protects private.key at rest")?;
+        stdout.reset()?;
+        write!(stdout, "  > ")?;
+        stdout.flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+
+        let (wallet_pass, is_encrypted) = if input.trim().to_lowercase() == "y" {
+            let pass = zeroize::Zeroizing::new(
+                match Password::new("Enter passphrase (or press Enter for no encryption):")
+                    .with_display_mode(PasswordDisplayMode::Masked)
+                    .prompt()
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // The user asked to encrypt (typed "y"); a prompt failure (non-TTY, EOF,
+                        // terminal error) must NOT silently fall through to an unencrypted,
+                        // plaintext-on-disk wallet. Abort so they can retry.
+                        return Err(format!(
+                            "passphrase prompt failed ({}); aborting so the wallet is not created \
+                             unencrypted by mistake",
+                            e
+                        )
+                        .into());
+                    }
+                },
+            );
+
+            if !pass.trim().is_empty() {
+                let pass_bytes = zeroize::Zeroizing::new(pass.trim().as_bytes().to_vec());
+                (Some(pass_bytes), true)
+            } else {
+                (None, false)
+            }
+        } else {
+            (None, false)
+        };
+        writeln!(stdout)?;
+
+        // Key generation is synchronous and local; the old 5s "network" timeout
+        // around it guarded nothing and is gone with the fake progress stages.
+        let wallet = {
+            let pass_slice = wallet_pass.as_deref();
+            Wallet::new(pass_slice.map(Vec::as_slice))?
+        };
+        wc_step(
+            &mut stdout,
+            "key pair generated",
+            "ml-dsa-87 · 2592-byte public key",
+        )?;
+        wc_step(
+            &mut stdout,
+            "address derived",
+            "sha256(public key) · 20 bytes",
+        )?;
+
+        let key_data = WalletKeyData::new(
+            default_wallet_name.clone(),
+            wallet.address.clone(),
+            wallet.encrypted_private_key.clone(),
+            is_encrypted,
+        );
+
+        let key_data_vec = vec![key_data];
+
+        // Persist the key BEFORE registering the wallet (see persist_wallet_keys). On first run no
+        // key file exists yet, so a swallowed write failure here would make the NEXT launch treat
+        // it as a fresh first run and generate a DIFFERENT default wallet — orphaning this one's
+        // address and any funds it received. Fail loudly instead.
+        persist_wallet_keys(KEY_FILE_PATH, &key_data_vec).await?;
+
+        wc_step(
+            &mut stdout,
+            "private.key written",
+            "fsync'd — the key survives power loss",
+        )?;
+        if is_encrypted {
+            wc_step(&mut stdout, "encrypted", "argon2id")?;
+        }
+
+        wc_reveal_address(&mut stdout, &wallet.address)?;
+        wc_footer(&mut stdout, &default_wallet_name, is_encrypted)?;
+
+        // Register the wallet only after its key is durably persisted.
+        wallets.insert(default_wallet_name, wallet);
+
+        Ok(wallets)
+    }
+
+    pub async fn load_wallets(
+        &self,
+        _db_arc: &Arc<RwLock<Store>>,
+        passphrase: Option<&[u8]>,
+    ) -> Result<HashMap<String, Wallet>> {
+        let mut wallets = HashMap::new();
+
+        match fs::read_to_string(KEY_FILE_PATH).await {
+            Ok(key_data) => {
+                let wallet_key_data: Vec<WalletKeyData> = serde_json::from_str(&key_data)?;
+                // Validate before attempting any decryption. Otherwise two loadable records with the
+                // same name are inserted sequentially and the latter silently hides the former.
+                validate_unique_wallet_names(&wallet_key_data)?;
+                let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true))?;
+                writeln!(stdout, "\nFound {} wallets to load", wallet_key_data.len())?;
+                stdout.reset()?;
+
+                for wallet_data in wallet_key_data {
+                    let wallet_name = wallet_data.wallet_name.clone();
+
+                    if let Some(private_key) = wallet_data.private_key {
+                        if wallet_data.is_encrypted && passphrase.is_none() {
+                            println!(
+                                "Failed to load encrypted wallet {}: passphrase required",
+                                wallet_name
+                            );
+                            continue;
+                        }
+
+                        match Wallet::from_key_bytes(
+                            wallet_name.clone(),
+                            wallet_data.wallet_address.clone(),
+                            private_key,
+                            passphrase,
+                            wallet_data.is_encrypted,
+                        ) {
+                            Ok(wallet) => {
+                                // Defensive fail-closed guard at the representation boundary. The
+                                // durable preflight above makes this unreachable for a valid file.
+                                if wallets.contains_key(&wallet_name) {
+                                    return Err(format!(
+                                        "Duplicate wallet name {:?} encountered while loading {}",
+                                        wallet_name, KEY_FILE_PATH
+                                    )
+                                    .into());
+                                }
+                                wallets.insert(wallet_name.clone(), wallet);
+                            }
+                            Err(e) => {
+                                println!("Failed to load wallet {}: {}", wallet_name, e);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                println!("Loaded {} wallets successfully\n", wallets.len());
+                Ok(wallets)
+            }
+            Err(e) if load_error_is_first_run(&e) => {
+                // No key file yet: genuine first run.
+                self.create_default_wallet(passphrase).await
+            }
+            Err(e) => {
+                // The key file exists but could not be read. Do NOT fall through to
+                // create_default_wallet — that would overwrite the existing key with a fresh
+                // wallet and destroy funds. Fail loudly so the operator can fix perms / restore.
+                Err(format!(
+                    "{} exists but could not be read ({:?}: {}). Refusing to start so the \
+                     existing wallet is not overwritten — fix permissions or restore from backup.",
+                    KEY_FILE_PATH,
+                    e.kind(),
+                    e
+                )
+                .into())
+            }
+        }
+    }
+
+    // NOTE: `save_wallets` was removed. It rewrote private.key from the
+    // in-memory wallet map, which erased wallets that had failed to load (e.g. wrong passphrase),
+    // and additionally persisted plaintext keys into the shared chain DB's `wallets` tree (never
+    // read on load). Every wallet-mutation path (create_new_wallet / create_default_wallet /
+    // rename_wallet / import_wallet_from_seed_into) already persists private.key by merging
+    // with the on-disk contents, so the function was both redundant and destructive.
+
+    pub async fn rename_wallet(
+        &self,
+        wallets: &mut HashMap<String, Wallet>,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        if old_name == new_name {
+            return Err("Wallet name is unchanged".into());
+        }
+        if new_name.trim().is_empty() {
+            return Err("New wallet name cannot be empty".into());
+        }
+        if !wallets.contains_key(old_name) {
+            return Err(Box::new(BlockchainError::WalletNotFound));
+        }
+        if wallets.contains_key(new_name) {
+            return Err("Duplicate wallet name".into());
+        }
+
+        let mut wallet_key_data = match fs::read_to_string(KEY_FILE_PATH).await {
+            Ok(data) => serde_json::from_str::<Vec<WalletKeyData>>(&data)?,
+            Err(_) => {
+                return Err(Box::new(BlockchainError::InvalidCommand(
+                    "No wallet file found".into(),
+                )))
+            }
+        };
+        // Do not mutate a pre-existing ambiguous file. `old_name` cannot identify which duplicate
+        // key the operator intended to rename, so automatic repair here would risk renaming the
+        // wrong wallet.
+        validate_unique_wallet_names(&wallet_key_data)?;
+
+        if wallet_key_data.iter().any(|w| w.wallet_name == new_name) {
+            return Err("Duplicate wallet name".into());
+        }
+
+        // Find the wallet by old name and update it
+        if let Some(wallet) = wallet_key_data
+            .iter_mut()
+            .find(|w| w.wallet_name == old_name)
+        {
+            wallet.wallet_name = new_name.to_string();
+
+            // Write the updated wallet key data back to the file
+            persist_wallet_keys(KEY_FILE_PATH, &wallet_key_data).await?;
+
+            if let Some(mut wallet) = wallets.remove(old_name) {
+                wallet.name = new_name.to_string();
+                wallets.insert(new_name.to_string(), wallet);
+            }
+
+            info!("Wallet renamed from '{}' to '{}'", old_name, new_name);
+            Ok(())
+        } else {
+            Err(Box::new(BlockchainError::WalletNotFound))
+        }
+    }
+
+    /// Run a mining session: prepare, grind, pace, back off, and repeat for as
+    /// long as `continuous` says to.
+    ///
+    /// This is the loop that used to live inside the REPL's `mine` arm. It is
+    /// here so the headless runner shares it rather than growing a second one:
+    /// the failure backoff, the consecutive-error ceiling and the prep
+    /// heartbeat are all load-bearing, and two copies of them would drift.
+    /// Returns the number of blocks mined this run.
+    pub async fn run_mining_session(
+        &self,
+        session: MiningSession<'_>,
+        wallets: &mut HashMap<String, Wallet>,
+        blockchain: &Arc<RwLock<Blockchain>>,
+        db_arc: &Arc<RwLock<Store>>,
+        node: &Arc<Node>,
+    ) -> u64 {
+        // The status this publishes is "the wallet this session is mining
+        // FOR" — NOT "where the rewards go". Those differ whenever
+        // ALPHANUMERIC_COINBASE_PAYOUTS names a rotation: mine_block then pays
+        // the coinbase to `PayoutSchedule::recipient_for(height)` and this
+        // address receives nothing. `/explorer/status` says so through
+        // `mining_payout_rotation`. Resolve the wallet to an ADDRESS first:
+        // `wallet` may be either a name or an address — the caller accepts
+        // both — and an unresolvable one is left as-is rather than reported as
+        // empty; handle_mine_command is the thing that rejects it, one line
+        // further down.
+        let mining_address = wallets
+            .get(&session.wallet)
+            .or_else(|| wallets.values().find(|w| w.address == session.wallet))
+            .map(|w| w.address.clone())
+            .unwrap_or_else(|| session.wallet.clone());
+        crate::a9::miner::status::session_started(&mining_address, session.use_gpu);
+
+        // handle_mine_command reads the command as typed, and only argv[1]
+        // means anything to it.
+        let mine_parts: Vec<&str> = vec!["mine", session.wallet.as_str()];
+
+        // Failure backoff: doubles on trouble (5s -> 60s cap), resets on a
+        // mined block. Keeps a struggling client patient instead of letting
+        // it hammer the relay, and keeps N continuous miners from
+        // synchronizing their retries.
+        let mut backoff = Duration::from_secs(5);
+        let mut mined_count: u64 = 0;
+        // Permanent-error guard for continuous mode: a mining error that
+        // repeats back-to-back (bad wallet name, corrupt state) will never
+        // heal by retrying — stop with a clear message instead of backing
+        // off forever. Network-side prep trouble does NOT count here.
+        const MAX_CONSECUTIVE_MINE_ERRORS: u32 = 5;
+        let mut consecutive_mine_errors: u32 = 0;
+
+        // Peer discovery, backgrounded once per command: prep used to burn
+        // up to ~3s inline on NAT'd dials before convergence even started,
+        // and convergence uses the relay, not p2p peers.
+        node.clone().spawn_prep_discovery();
+
+        'mining: loop {
+            if session.continuous && session.stop.load(Ordering::SeqCst) {
+                break 'mining;
+            }
+
+            if !session.continuous || mined_count == 0 {
+                (session.report)(MiningProgress::PreparingStarted);
+            }
+            // Liveness heartbeat: prep is time-bounded, but a churning
+            // network can use the whole budget, which USERS read as "it's
+            // stuck, restart the client". Report progress every 5s — with
+            // actual heights when we know them — so silence never looks
+            // like a hang.
+            let hb_blockchain = Arc::clone(blockchain);
+            let hb_node = node.clone();
+            let hb_report = Arc::clone(&session.report);
+            let prep_heartbeat = tokio::spawn(async move {
+                let started = Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Copy the height out, then DROP the guard before
+                    // reporting: a renderer can block on stdout, and holding
+                    // a read guard across it starves the write-preferring
+                    // chain lock.
+                    let local_tip = { hb_blockchain.read().await.get_latest_block_index() };
+                    let known_tip = hb_node.beacon_high_water_height() as u64;
+                    hb_report(MiningProgress::Preparing {
+                        height: Some(local_tip),
+                        target: (known_tip > local_tip).then_some(known_tip),
+                        elapsed: started.elapsed(),
+                    });
+                }
+            });
+            // ONE continuous prep budget (was 3 fixed 8s attempts with 2s
+            // sleeps between): deadline-gated converge paths get to work
+            // the whole budget in a single call — no mid-progress
+            // truncation, no per-attempt beacon/ancestor rework — while
+            // the immediate-refusal guards (ghost-block, beacon
+            // unreachable) still return fast and are re-invoked after a
+            // short pause, preserving the caller re-invoke contract the
+            // 2026-07-11 ghost-guard comment codifies. Only a genuine
+            // below-finality divergence (needs re-bootstrap) is a hard stop.
+            const MINE_PREP_BUDGET: Duration = Duration::from_secs(24);
+            let prep_deadline = Instant::now() + MINE_PREP_BUDGET;
+            let mut prep_ok = false;
+            let mut prep_stop: Option<String> = None;
+            loop {
+                // A stop must work during prep too, not only once mining
+                // starts.
+                if (session.continuous && session.stop.load(Ordering::SeqCst))
+                    || session.shutdown.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                let remaining = prep_deadline.saturating_duration_since(Instant::now());
+                // Sub-2s remainders can't do useful converge work —
+                // re-invoking just spun the beacon fetch and blew the
+                // declared budget (the callee floors its round cap at
+                // 2s, so give it at least that).
+                if remaining < Duration::from_secs(2) {
+                    break;
+                }
+                match node.prepare_local_mining(remaining).await {
+                    Ok(()) => {
+                        prep_ok = true;
+                        break;
+                    }
+                    Err(NodeError::Retryable(reason)) => {
+                        let left = prep_deadline.saturating_duration_since(Instant::now());
+                        if left >= Duration::from_secs(2) {
+                            // The Retryable reason carries the actual
+                            // heights ("network has reached X but we are
+                            // at Y…").
+                            // The heartbeat above already owns the
+                            // status line; keep the detailed reason for
+                            // the log rather than scrolling the screen.
+                            debug!("mine-prep still catching up: {}", reason);
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(NodeError::ConsensusFailure(reason)) => {
+                        prep_stop = Some(reason);
+                        break;
+                    }
+                    Err(other) => {
+                        prep_stop = Some(other.to_string());
+                        break;
+                    }
+                }
+            }
+            prep_heartbeat.abort();
+            (session.report)(MiningProgress::PreparingEnded);
+            if let Some(reason) = prep_stop {
+                (session.report)(MiningProgress::Unminable { reason });
+                break 'mining;
+            }
+            if !prep_ok {
+                if session.continuous {
+                    (session.report)(MiningProgress::NotSynced {
+                        retry_in: Some(backoff),
+                    });
+                    sleep_interruptible(backoff, &session.stop, &session.shutdown).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                    continue 'mining;
+                }
+                (session.report)(MiningProgress::NotSynced { retry_in: None });
+                break 'mining;
+            }
+
+            // 8.0.1 부터 취소 플래그가 매니저 안에 산다 -- handle_mine_command 가
+            // stop 을 따로 받지 않는 것도 같은 이유다.
+            let mining_manager = MiningManager::new(
+                Arc::clone(blockchain),
+                Arc::clone(&session.shutdown),
+                Arc::clone(&session.stop),
+            );
+            let miner = Miner::new(blockchain.clone(), mining_manager);
+            let round_started = Instant::now();
+            let round = self
+                .handle_mine_command(
+                    &mine_parts,
+                    &miner,
+                    wallets,
+                    blockchain,
+                    db_arc,
+                    session.use_gpu,
+                    session.announce,
+                )
+                .await;
+            // The grind for this round is over — nothing is hashing until the
+            // next one starts. Zero the published rate here rather than
+            // leaving the last successful round's figure standing through the
+            // backoff (up to 60s) and the absorb/jitter/prep gap (~45s), where
+            // a monitor watching `mining_hps` would read a busy miner that
+            // isn't.
+            crate::a9::miner::status::record_rate(0);
+            match round {
+                Ok(mined_block) => {
+                    backoff = Duration::from_secs(5);
+                    consecutive_mine_errors = 0;
+                    mined_count += 1;
+                    crate::a9::miner::status::record_block();
+                    let mined_height = mined_block.index;
+                    if let Some(mined_log) = session.mined_log.as_ref() {
+                        // Track for the reorged-out notifier (the
+                        // tip-signal task re-checks these per block).
+                        let reward = mined_block
+                            .transactions
+                            .iter()
+                            .find(|t| t.sender == "MINING_REWARDS")
+                            .map(|t| t.amount())
+                            .unwrap_or(0.0);
+                        mined_log
+                            .lock()
+                            .await
+                            .push((mined_height, mined_block.hash, reward));
+                    }
+                    (session.report)(MiningProgress::Mined {
+                        index: u64::from(mined_height),
+                        elapsed: round_started.elapsed(),
+                    });
+                    if !session.continuous {
+                        break 'mining;
+                    }
+
+                    // NETWORK-CITIZEN PACING between rounds:
+                    // 1) Absorption wait — poll the signed beacon
+                    //    (edge-cached)
+                    //    until the network reflects a block at our height
+                    //    (ours or a competitor's), so we never stack new
+                    //    blocks faster than the network can propagate
+                    //    them. Bounded at 20s and fail-open: a beacon
+                    //    hiccup falls through to the next prep, which
+                    //    re-converges anyway.
+                    // 2) Jittered courtesy delay — desynchronizes multiple
+                    //    continuous miners so their prep/poll cycles never
+                    //    line up into synchronized bursts against the
+                    //    free-tier gateway.
+                    // Say so first: this wait + jitter is up to ~25s
+                    // of otherwise-silent pause right after the
+                    // reward summary — the one spot a healthy miner
+                    // looked hung. No bar is alive here, so plain
+                    // output is safe.
+                    (session.report)(MiningProgress::Absorbing {
+                        index: u64::from(mined_height),
+                    });
+                    // 500ms poll slice (was 2s): the FIRST poll fires
+                    // milliseconds after local finalize — before our
+                    // publish can possibly have round-tripped — so the
+                    // old 2s slice was a near-guaranteed 2s floor on
+                    // every won block, and overshot the beacon's actual
+                    // refresh by up to 2s more. The 20s DEADLINE is the
+                    // safety property (anti-block-stacking) and stays;
+                    // the slice is only how fast we notice absorption.
+                    // Cost: a few extra edge-cached GETs per block.
+                    let absorb_deadline = Instant::now() + Duration::from_secs(20);
+                    loop {
+                        if session.stop.load(Ordering::SeqCst)
+                            || session.shutdown.load(Ordering::Acquire)
+                            || Instant::now() >= absorb_deadline
+                        {
+                            break;
+                        }
+                        match node.network_beacon_height().await {
+                            Some(h) if h >= mined_height => break,
+                            _ => {
+                                sleep_interruptible(
+                                    Duration::from_millis(500),
+                                    &session.stop,
+                                    &session.shutdown,
+                                )
+                                .await
+                            }
+                        }
+                    }
+                    let jitter_ms = 2_000
+                        + (SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos() as u64
+                            % 3_000);
+                    sleep_interruptible(
+                        Duration::from_millis(jitter_ms),
+                        &session.stop,
+                        &session.shutdown,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    // USER STOP (Enter): a clean exit, not a fault.
+                    // handle_mine_command already printed "Mining
+                    // stopped."; just leave the loop without the
+                    // error path or backoff.
+                    // Match the TYPE, not the message. This used to test
+                    // `e.to_string().contains("stopped by user")`, which
+                    // couples clean-exit detection to the #[error(...)]
+                    // text on MiningError::Stopped — so rewording a
+                    // user-facing string, the most innocuous edit there
+                    // is, would silently send a deliberate stop down the
+                    // fault path with backoff and error counting toward
+                    // the permanent-error stop. mgmt.rs boxes the real
+                    // variant, so it survives the Box<dyn Error>.
+                    let user_stopped = e
+                        .downcast_ref::<crate::a9::miner::MiningError>()
+                        .is_some_and(|err| matches!(err, crate::a9::miner::MiningError::Cancelled));
+                    if session.stop.load(Ordering::SeqCst) || user_stopped {
+                        break 'mining;
+                    }
+                    // LOST RACE, not a fault: we solved a height, but the
+                    // network's block for it arrived first and the background
+                    // sync adopted it, so finalization correctly rejects our
+                    // now-stale header ("Block header is invalid"). Routine
+                    // under heavy racing (difficulty climbing = more miners) —
+                    // it must NOT count toward the permanent-error stop, or 5
+                    // straight photo-finish losses would kill the mining loop
+                    // exactly when competition is most interesting. Retarget
+                    // the new tip immediately with only the small jitter.
+                    let lost_race = e.to_string().contains("Block header is invalid");
+                    if lost_race && session.continuous {
+                        consecutive_mine_errors = 0;
+                        (session.report)(MiningProgress::LostRace { retrying: true });
+                        let jitter_ms = 1_000
+                            + (SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .subsec_nanos() as u64
+                                % 2_000);
+                        sleep_interruptible(
+                            Duration::from_millis(jitter_ms),
+                            &session.stop,
+                            &session.shutdown,
+                        )
+                        .await;
+                        continue 'mining;
+                    }
+                    if lost_race {
+                        // Single-shot mine: same lost race, but the loop exits.
+                        // Say what actually happened — "Mining error: Block
+                        // header is invalid" reads as a fault when it's a
+                        // photo-finish loss to another miner.
+                        (session.report)(MiningProgress::LostRace { retrying: false });
+                        break 'mining;
+                    }
+                    if !session.continuous {
+                        (session.report)(MiningProgress::Failed {
+                            error: e.to_string(),
+                            backoff: None,
+                        });
+                        break 'mining;
+                    }
+                    consecutive_mine_errors += 1;
+                    if consecutive_mine_errors >= MAX_CONSECUTIVE_MINE_ERRORS {
+                        (session.report)(MiningProgress::Failed {
+                            error: e.to_string(),
+                            backoff: None,
+                        });
+                        (session.report)(MiningProgress::GaveUp {
+                            errors: consecutive_mine_errors,
+                        });
+                        break 'mining;
+                    }
+                    (session.report)(MiningProgress::Failed {
+                        error: e.to_string(),
+                        backoff: Some(backoff),
+                    });
+                    sleep_interruptible(backoff, &session.stop, &session.shutdown).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                }
+            }
+        }
+
+        crate::a9::miner::status::session_ended();
+        (session.report)(MiningProgress::Stopped {
+            blocks: mined_count,
+        });
+        mined_count
+    }
+    /// Mine one block.
+    ///
+    /// `announce` is called the moment the block is finalized, before any of the reporting
+    /// that follows. It exists so the network hears about a block as early as this code can
+    /// possibly say it — see the call site for why that ordering matters. It must only hand
+    /// the block off (spawn, queue); anything that blocks or awaits inside it is stalling a
+    /// freshly-mined block against the clock that decides whether it orphans.
+    // The arguments are explicit capabilities/state owned by the caller. Bundling them would create
+    // a second mining context whose lifetime and synchronization invariants could drift.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_mine_command(
+        &self,
+        command: &[&str],
+        miner: &Miner,
+        wallets: &mut HashMap<String, Wallet>,
+        blockchain: &Arc<RwLock<Blockchain>>,
+        _db_arc: &Arc<RwLock<Store>>,
+        use_gpu: bool,
+        announce: &dyn Fn(&Block),
+    ) -> Result<Block> {
+        if command.len() < 2 {
+            return Err("Usage: mine <wallet_name_or_address>".into());
+        }
+
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true))?;
+        writeln!(stdout, "\nStarting mining operation")?;
+        stdout.reset()?;
+
+        let prep_bar = ProgressBar::new_spinner();
+        let style = ProgressStyle::with_template("{prefix} {spinner:.cyan/blue} {msg}")
+            .map_err(|e| format!("Progress style error: {}", e))?;
+        prep_bar.set_style(style);
+        prep_bar.set_prefix("Mining");
+        prep_bar.set_message("Preparing block template...");
+        prep_bar.enable_steady_tick(Duration::from_millis(100));
+
+        let wallet_input = command[1].to_string();
+        let miner_wallet = if let Some(w) = wallets.get(&wallet_input) {
+            w
+        } else {
+            wallets
+                .values()
+                .find(|w| w.address == wallet_input)
+                .ok_or_else(|| format!("No wallet found with name or address: {}", wallet_input))?
+        };
+
+        // Tip snapshot ONLY — no mempool selection here. mine_block rebuilds its
+        // template from the LIVE mempool on every pass (with its own
+        // drop_confirmed sweep, confirmed/amount/age/signature filters, fee
+        // ordering, and per-sender affordability), and discards the command-time
+        // transaction list outright. The old code still swept and filtered the
+        // mempool, computed the reward, and built the merkle root TWICE right
+        // here — pure dead work that also queued behind block-ingest writers on
+        // the chain read lock before the first hash could be ground.
+        let (last_hash, next_block_index, difficulty) = {
+            prep_bar.set_message("Reading chain tip...");
+            let blockchain_guard = blockchain.read().await;
+            let tip = blockchain_guard
+                .get_last_block()
+                .ok_or_else(|| "No tip block found".to_string())?;
+            let last_hash = tip.hash;
+            let next_block_index = tip.index.saturating_add(1);
+            let difficulty = blockchain_guard.get_current_difficulty().await;
+            (last_hash, next_block_index, difficulty)
+        };
+
+        prep_bar.set_message("Starting hash search...");
+        prep_bar.finish_and_clear();
+
+        // Placeholder header: number/parent seed the tip-change guards inside
+        // mine_block; merkle root, timestamp, and difficulty are recomputed per
+        // template rebuild / per dispatch from live state.
+        let mut header = ProgPowHeader {
+            number: next_block_index,
+            parent_hash: last_hash,
+            timestamp: Self::get_current_timestamp()?,
+            merkle_root: Blockchain::calculate_merkle_root(&[])?,
+            difficulty,
+        };
+
+        match miner
+            .mine_block(
+                &mut header,
+                &[],
+                MINING_NONCE_WINDOW,
+                miner_wallet.address.clone(),
+                use_gpu,
+            )
+            .await
+        {
+            Ok((_nonce, _hash, mined_block)) => {
+                // ANNOUNCE FIRST. mine_block has returned, so the block is validated and
+                // durably committed — there is nothing left to learn about it, and every
+                // instant it stays on this machine is time a competitor's block spends
+                // propagating instead. What follows is display work, and the balance
+                // breakdown below takes a fresh chain READ guard: tokio's RwLock is
+                // write-preferring, so right after finalize releases the write guard that
+                // read queues behind any block already waiting to be applied. Under load —
+                // exactly when blocks are contested — that is tens of milliseconds of
+                // silence bought for a console line.
+                //
+                // The hook only hands the block off (it spawns, it does not send), so this
+                // holds no lock and cannot block the miner.
+                announce(&mined_block);
+
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))?;
+                writeln!(stdout, "\n Mining successful")?;
+                stdout.reset()?;
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(167, 165, 198))))?;
+                writeln!(stdout, "───────────────────")?;
+                stdout.reset()?;
+
+                // The reward actually minted, from the mined block's coinbase.
+                // mine_block's template builder always inserts the coinbase first,
+                // so the fallback is unreachable in practice (kept only so a
+                // malformed block can't panic the display path).
+                let coinbase = mined_block
+                    .transactions
+                    .first()
+                    .filter(|tx| tx.sender == "MINING_REWARDS");
+                let mining_reward = coinbase.map(|tx| tx.amount()).unwrap_or_default();
+                // Under coinbase payout rotation the reward went to the schedule
+                // address, not this wallet — say so, or the unchanged balance below
+                // reads as a lost reward. The chain ledger is authoritative either way.
+                let rotated_recipient = coinbase
+                    .map(|tx| tx.recipient.as_str())
+                    .filter(|r| !r.eq_ignore_ascii_case(&miner_wallet.address))
+                    .map(str::to_owned);
+                if let Some(recipient) = &rotated_recipient {
+                    writeln!(
+                        stdout,
+                        "Mining reward: {:.8} ♦ → {} (payout rotation)",
+                        mining_reward, recipient
+                    )?;
+                }
+
+                let breakdown = {
+                    let blockchain_guard = blockchain.read().await;
+                    blockchain_guard
+                        .get_wallet_balance_breakdown(&miner_wallet.address)
+                        .await?
+                };
+
+                if rotated_recipient.is_some() {
+                    // Reward lines already printed above with the schedule recipient;
+                    // the maturity countdown belongs to that address, not this wallet.
+                    writeln!(stdout, "Operator balance: {:.8} ♦", breakdown.spendable)?;
+                } else if breakdown.maturing.is_empty() {
+                    // Below the M06 activation height the reward is spendable at once.
+                    writeln!(stdout, "Mining reward: {:.8} ♦", mining_reward)?;
+                    writeln!(stdout, "New balance: {:.8} ♦", breakdown.spendable)?;
+                } else {
+                    // M06: the coinbase is credited on-chain immediately but withheld from
+                    // the spendable balance until buried MINING_REWARD_MATURITY deep.
+                    // Say so explicitly — an unchanged "New balance" right after "Mining
+                    // successful" reads as a lost reward, not a maturing one.
+                    let eta = format_maturity_eta(blocks_until_mature(
+                        mined_block.index,
+                        breakdown.as_of_height,
+                    ));
+                    let maturing_total: f64 =
+                        breakdown.maturing.iter().map(|(_, amount)| amount).sum();
+                    writeln!(
+                        stdout,
+                        "Mining reward: {:.8} ♦ — credited, spendable in {}",
+                        mining_reward, eta
+                    )?;
+                    writeln!(stdout, "Spendable balance: {:.8} ♦", breakdown.spendable)?;
+                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))))?;
+                    writeln!(
+                        stdout,
+                        "Maturing: {:.8} ♦ ({} reward{} on the way)",
+                        maturing_total,
+                        breakdown.maturing.len(),
+                        if breakdown.maturing.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    )?;
+                    stdout.reset()?;
+                }
+                writeln!(stdout)?;
+
+                Ok(mined_block)
+            }
+            Err(e) => {
+                // Deliberately silent: the CALLER classifies this error and prints the
+                // right thing. Printing a red "error:" here meant a routine lost block
+                // race showed a fault line and THEN "Lost the race for this block…",
+                // and pressing Enter to stop printed "error: Mining failed: Mining
+                // cancelled". Neither is an error; both are normal outcomes.
+                Err(Box::new(e))
+            }
+        }
+    }
+
+    /// Create, sign, and atomically classify a transaction against canonical and
+    /// durable pending state. Only `Submitted` may be announced to the network.
+    pub async fn handle_create_transaction(
+        &self,
+        command: &str,
+        wallets: &mut HashMap<String, Wallet>,
+        blockchain: &Arc<RwLock<Blockchain>>,
+        _db_arc: &Arc<RwLock<Store>>,
+    ) -> Result<CreateTransactionOutcome> {
+        let mut stdout = StandardStream::stdout(ColorChoice::Always);
+
+        let parsed = match parse_create_transaction_command(command) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                write!(stdout, "error")?;
+                stdout.reset()?;
+                writeln!(stdout, ": {}", error)?;
+                writeln!(stdout, "{}", CREATE_TRANSACTION_USAGE)?;
+                return Err(error.into());
+            }
+        };
+
+        let sender_address = parsed.sender_address;
+        let recipient_address = parsed.recipient_address;
+        let amount_units = parsed.amount_units;
+        // Auto fee (no --fee given): price next-block inclusion off the live
+        // mempool (Blockchain::fee_estimate) at send time — the flat anchor on
+        // a quiet network, one unit above the marginal next-block fee under
+        // congestion, clamped to the wallet safety ceiling by construction. The
+        // brief chain read guard here only reaches the mempool and is released
+        // before the send flow's own guard below.
+        // Live fee quote, priced off this node's mempool at send time
+        // (Blockchain::fee_estimate) and shown before signing for both automatic and explicit
+        // fees, so the operator sees exactly what the network is charging and where their fee sits
+        // against the relay floor and the automatic/explicit safety caps.
+        let estimate = blockchain.read().await.fee_estimate().await;
+        writeln!(
+            stdout,
+            "  Fee quote (live): recommended {:.8}, relay floor {:.8}, auto-cap {:.8}, explicit-cap {:.8}",
+            Transaction::from_units(estimate.recommended_units),
+            Transaction::from_units(estimate.floor_units),
+            Transaction::from_units(estimate.auto_cap_units),
+            Transaction::from_units(estimate.explicit_cap_units),
+        )?;
+        writeln!(
+            stdout,
+            "                    mempool {} ({} eligible, {} fit the next block)",
+            estimate.basis(),
+            estimate.pending_candidates,
+            estimate.next_block_fits,
+        )?;
+        let fee_units = match parsed.fee_units {
+            Some(units) => {
+                // Explicit fee. It was already bounded to the relay floor and the explicit safety
+                // cap at parse time. State the honest fee-retry contract plainly: changing the fee
+                // does NOT replace a pending payment. A different fee produces a different
+                // transaction id and a different signed message, so both the original and the
+                // re-fee transaction can confirm. Alphanumeric has no replace-by-fee; there is
+                // nothing to cancel, and a genuine bump belongs to a new payment only after the
+                // original is rejected or has expired.
+                writeln!(
+                    stdout,
+                    "  Fee: {:.8} (explicit). A different fee to the same recipient and amount is a \
+                     separate, independently valid transaction, not a replacement.",
+                    Transaction::from_units(units)
+                )?;
+                units
+            }
+            None => {
+                // Never emit a fee that would be READ as a whisper. Classification
+                // is a fee-band test and the code space saturates the band, so this
+                // cannot be fixed when decoding — an ordinary payment whose fee
+                // lands in the band is announced to the recipient as a whisper
+                // carrying a meaningless code, and its amount is not shown at all.
+                // The estimator is amount-independent, so the clamp belongs here,
+                // where the amount is known. Lowering a fee is always safe: the
+                // relay floor is the only hard requirement, and the band opens
+                // strictly above it for any positive amount.
+                let ceiling = max_non_whisper_fee_units(amount_units);
+                let recommended = estimate
+                    .recommended_units
+                    .min(ceiling)
+                    .max(MIN_RELAY_FEE_UNITS);
+                // Show the auto fee BEFORE signing and submitting: the user
+                // never typed this number, so it must not first appear in the
+                // success summary (and never at all on the error path).
+                writeln!(
+                    stdout,
+                    "  Auto fee: {:.8} ({})",
+                    Transaction::from_units(recommended),
+                    if recommended < estimate.recommended_units {
+                        "capped below the whisper band"
+                    } else if estimate.congested {
+                        "next-block price, network contended"
+                    } else {
+                        "network quiet"
+                    }
+                )?;
+                recommended
+            }
+        };
+        let amount = Transaction::from_units(amount_units);
+        let fee = Transaction::from_units(fee_units);
+
+        if let Err(error) =
+            validate_wallet_transaction_addresses(&sender_address, &recipient_address)
+        {
+            stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+            write!(stdout, "error")?;
+            stdout.reset()?;
+            writeln!(stdout, ": {}", error)?;
+            return Err(error.into());
+        }
+
+        // Prevent self-transfers
+        if sender_address == recipient_address {
+            stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+            write!(stdout, "error")?;
+            stdout.reset()?;
+            writeln!(stdout, ": cannot transfer to the same address")?;
+            return Err("Self-transfer not allowed".into());
+        }
+
+        // Progress bar header
+        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true))?;
+        writeln!(stdout, "    Creating Transaction")?;
+        stdout.reset()?;
+
+        // Progress bar uses the exact cargo yellow
+        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
+        write!(stdout, "    Checking")?;
+        stdout.reset()?;
+        write!(stdout, " wallet state...")?;
+        stdout.flush()?;
+
+        // Wallets are already loaded and available for transaction creation
+
+        // Get sender wallet
+        let sender_wallet = match wallets
+            .values()
+            .find(|wallet| wallet.address == sender_address)
+        {
+            Some(wallet) => {
+                writeln!(stdout, "Done")?;
+                wallet
+            }
+            None => {
+                writeln!(stdout)?;
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                write!(stdout, "error")?;
+                stdout.reset()?;
+                writeln!(stdout, ": sender wallet not found")?;
+                writeln!(stdout, "\nAvailable wallets:")?;
+                for wallet in wallets.values() {
+                    writeln!(stdout, "  {}", wallet.address)?;
+                }
+                return Err("Sender wallet not found".into());
+            }
+        };
+
+        // Balance check
+        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
+        write!(stdout, "    Verifying")?;
+        stdout.reset()?;
+        write!(stdout, " balance...")?;
+        stdout.flush()?;
+
+        let blockchain_guard = blockchain.read().await;
+        // Keep affordability entirely in exact atomic units. Conversions below
+        // are presentation-only and never influence admission.
+        let total_cost_units = amount_units
+            .checked_add(fee_units)
+            .ok_or("amount plus fee is too large")?;
+        let total_cost = Transaction::from_units(total_cost_units);
+        let sender_balance_units = blockchain_guard
+            .get_spendable_balance_units(&sender_address)
+            .await?;
+
+        if sender_balance_units < total_cost_units {
+            writeln!(stdout)?;
+            stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+            write!(stdout, "error")?;
+            stdout.reset()?;
+            writeln!(stdout, ": insufficient balance")?;
+            writeln!(stdout, "required: {}", total_cost)?;
+            writeln!(
+                stdout,
+                "available: {}",
+                Transaction::from_units(sender_balance_units)
+            )?;
+            return Err("Insufficient balance".into());
+        }
+        writeln!(stdout, "Done")?;
+        drop(blockchain_guard);
+
+        // Collision-free timestamp allocation. The chain's transaction identity is
+        // sender:recipient:amount:fee:timestamp, which is also the signed message, so two
+        // intended-distinct payments that share the first four fields are the SAME transaction —
+        // identical id, identical signed bytes — if signed in the same second. The second would be
+        // silently absorbed as a duplicate and never paid. The ledger advances the timestamp so an
+        // identical-looking second payment becomes a genuinely distinct transaction instead.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "Failed to get timestamp")?
+            .as_secs();
+        let payment_tuple = PaymentTuple::new(
+            sender_address.clone(),
+            recipient_address.clone(),
+            amount_units,
+            fee_units,
+        );
+        let timestamp = match self.ledger.as_ref() {
+            Some(ledger) => match ledger.allocate_timestamp(&payment_tuple, now) {
+                Ok(allocated) => {
+                    if allocated != now {
+                        writeln!(
+                            stdout,
+                            "  Identical payment (same recipient, amount and fee) already prepared \
+                             this second; using timestamp {allocated} so this is a distinct \
+                             transaction, not a silently-merged duplicate."
+                        )?;
+                    }
+                    allocated
+                }
+                Err(_) => {
+                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                    write!(stdout, "error")?;
+                    stdout.reset()?;
+                    writeln!(
+                        stdout,
+                        ": too many identical payments (same recipient, amount and fee) in a short \
+                         window to schedule a distinct one; vary the amount or fee to make it a \
+                         separate payment"
+                    )?;
+                    return Err(
+                        "cannot allocate a distinct timestamp for an identical payment burst"
+                            .into(),
+                    );
+                }
+            },
+            // Fail closed: the whole point of the ledger is that a payment is never silently
+            // dropped to a same-second collision. Falling back to a raw timestamp would reintroduce
+            // exactly that risk, so refuse to sign instead.
+            None => {
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                write!(stdout, "error")?;
+                stdout.reset()?;
+                writeln!(
+                    stdout,
+                    ": payment ledger unavailable; refusing to sign without collision-safe timestamp \
+                     allocation (a raw timestamp could silently merge two distinct payments)"
+                )?;
+                return Err(
+                    "wallet payment ledger unavailable; cannot reserve a collision-safe timestamp"
+                        .into(),
+                );
+            }
+        };
+
+        // Signing phase
+        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
+        write!(stdout, "    Signing")?;
+        stdout.reset()?;
+        write!(stdout, " transaction...")?;
+        stdout.flush()?;
+
+        let message = format!(
+            "{}:{}:{:.8}:{:.8}:{}",
+            sender_address, recipient_address, amount, fee, timestamp
+        );
+
+        let signature = match sender_wallet.sign_transaction(message.as_bytes()).await {
+            Some(sig) => {
+                writeln!(stdout, "Done")?;
+                sig
+            }
+            None => {
+                writeln!(stdout)?;
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                write!(stdout, "error")?;
+                stdout.reset()?;
+                writeln!(stdout, ": failed to sign transaction")?;
+                return Err("Failed to sign transaction".into());
+            }
+        };
+
+        // Submit phase
+        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
+        write!(stdout, "    Submitting")?;
+        stdout.reset()?;
+        writeln!(stdout, " to blockchain...")?;
+        stdout.flush()?;
+
+        let mut transaction = Transaction {
+            sender: sender_address.clone(),
+            recipient: recipient_address.clone(),
+            amount_units,
+            fee_units,
+            timestamp,
+            signature: Some(signature),
+            pub_key: None,
+            sig_hash: None,
+        };
+        transaction.pub_key = sender_wallet.get_public_key_hex().await;
+        if transaction.pub_key.is_none() {
+            writeln!(stdout)?;
+            stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+            write!(stdout, "error")?;
+            stdout.reset()?;
+            writeln!(
+                stdout,
+                ": wallet key material is missing a ML-DSA public key"
+            )?;
+            writeln!(
+                stdout,
+                "wallet data appears incomplete; restore a full key backup or recreate this wallet"
+            )?;
+            return Err("Wallet key data missing ML-DSA public key".into());
+        }
+
+        // No wallet registry needed - transactions are self-contained with public keys
+
+        // Persist the reservation durably BEFORE submitting (persist-before-expose). If we crash
+        // after this, the payment is recoverable and its timestamp allocation survives restart; if
+        // we crash before it, nothing was ever admitted. Fail closed: never submit a payment we
+        // could not first record, or a crash could destroy the only evidence it was sent. The
+        // fsync runs on a blocking thread so it never stalls the shared node runtime.
+        if let Some(ledger) = self.ledger.as_ref() {
+            let ledger = Arc::clone(ledger);
+            let tuple = payment_tuple.clone();
+            let tx_id = transaction.get_tx_id();
+            let signed_tx = serde_json::to_string(&transaction).map_err(|error| {
+                format!("could not serialize signed transaction for recovery: {error}")
+            })?;
+            match tokio::task::spawn_blocking(move || {
+                ledger.record(None, tuple, timestamp, tx_id, Some(signed_tx), now)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    writeln!(stdout)?;
+                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                    write!(stdout, "error")?;
+                    stdout.reset()?;
+                    writeln!(
+                        stdout,
+                        ": could not record the payment before submitting: {error}"
+                    )?;
+                    return Err(format!("wallet ledger record failed: {error}").into());
+                }
+                Err(join_error) => {
+                    return Err(format!("wallet ledger task failed: {join_error}").into());
+                }
+            }
+        }
+
+        // M2: a read guard suffices — add_transaction self-serializes on its internal
+        // state_mutation_lock and runs the ML-DSA verify before taking it, so an exclusive
+        // outer guard here only blocked concurrent block-ingest for no gain (matches the
+        // network callers). Still scoped to the submit alone: the Ok arm re-reads the chain
+        // for the balance (get_wallet_balance), which under a held guard self-deadlocked
+        // right after "Done".
+        let submit_result = {
+            let chain = blockchain.read().await;
+            chain.admit_transaction(transaction.clone()).await
+        };
+        let tx_id = transaction.get_tx_id();
+        match submit_result {
+            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
+                let state_persisted = self
+                    .update_wallet_ledger_state(tx_id, crate::a9::ledger::EntryState::Pending, now)
+                    .await;
+                writeln!(stdout, "Done")?;
+                if !state_persisted {
+                    writeln!(
+                        stdout,
+                        "warning: transaction is pending, but its ledger lifecycle update failed; do not create a replacement — reconcile this exact transaction"
+                    )?;
+                }
+
+                // Get final balances
+                let new_sender_balance = blockchain
+                    .read()
+                    .await
+                    .get_wallet_balance(&sender_address)
+                    .await?;
+
+                // Completion message
+                stdout.set_color(
+                    ColorSpec::new()
+                        .set_fg(Some(Color::Rgb(59, 242, 173)))
+                        .set_bold(true),
+                )?;
+                writeln!(stdout, "\nTransaction submitted — pending confirmation")?;
+                stdout.reset()?;
+
+                // Transaction summary
+                writeln!(stdout, "\n  From:     {}", sender_address)?;
+                writeln!(stdout, "  To:       {}", recipient_address)?;
+                writeln!(stdout, "  Amount:   {}", amount)?;
+                writeln!(stdout, "  Fee:      {}", fee)?;
+                writeln!(stdout, "  Balance:  {}\n", new_sender_balance)?;
+
+                Ok(CreateTransactionOutcome::Submitted(transaction))
+            }
+            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending) => {
+                let _ = self
+                    .update_wallet_ledger_state(
+                        tx_id,
+                        crate::a9::ledger::EntryState::AmbiguousExisting,
+                        now,
+                    )
+                    .await;
+                writeln!(
+                    stdout,
+                    "Not submitted: an identical transaction is already pending."
+                )?;
+                writeln!(
+                    stdout,
+                    "Do not create a replacement until you reconcile whether this pending transaction is the payment you intended."
+                )?;
+                Ok(CreateTransactionOutcome::AlreadyPending)
+            }
+            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(height)) => {
+                let _ = self
+                    .update_wallet_ledger_state(
+                        tx_id,
+                        crate::a9::ledger::EntryState::AmbiguousExisting,
+                        now,
+                    )
+                    .await;
+                writeln!(
+                    stdout,
+                    "Not submitted: an identical transaction is already confirmed at block {}.",
+                    height
+                )?;
+                writeln!(
+                    stdout,
+                    "Do not create a replacement; reconcile this confirmed transaction against the intended payment."
+                )?;
+                Ok(CreateTransactionOutcome::AlreadyConfirmed(height))
+            }
+            Err(e) => {
+                // Admission may touch an in-memory pending store before a later durable write
+                // fails. Reconcile before telling the operator it is safe to create a replacement.
+                let presence = {
+                    let chain = blockchain.read().await;
+                    chain.transaction_presence(&tx_id).await
+                };
+                match presence {
+                    Ok(TransactionPresence::Pending) => {
+                        let _ = self
+                            .update_wallet_ledger_state(
+                                tx_id,
+                                crate::a9::ledger::EntryState::AmbiguousExisting,
+                                now,
+                            )
+                            .await;
+                        writeln!(stdout)?;
+                        stdout
+                            .set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                        write!(stdout, "warning")?;
+                        stdout.reset()?;
+                        writeln!(
+                            stdout,
+                            ": submission returned an error, but the transaction is present in pending state; do not re-sign or retry as a new payment: {e}"
+                        )?;
+                        return Ok(CreateTransactionOutcome::AlreadyPending);
+                    }
+                    Ok(TransactionPresence::Confirmed(height)) => {
+                        let _ = self
+                            .update_wallet_ledger_state(
+                                tx_id,
+                                crate::a9::ledger::EntryState::Confirmed { height },
+                                now,
+                            )
+                            .await;
+                        writeln!(
+                            stdout,
+                            "Submission returned an error, but the exact transaction is confirmed at block {height}; do not retry."
+                        )?;
+                        return Ok(CreateTransactionOutcome::AlreadyConfirmed(height));
+                    }
+                    Ok(TransactionPresence::Absent) => {
+                        let _ = self
+                            .update_wallet_ledger_state(
+                                tx_id,
+                                crate::a9::ledger::EntryState::Rejected {
+                                    reason: e.to_string(),
+                                },
+                                now,
+                            )
+                            .await;
+                    }
+                    Err(state_error) => {
+                        writeln!(
+                            stdout,
+                            "warning: submission failed and canonical state could not be reconciled ({state_error}); do not create a replacement until the transaction is checked"
+                        )?;
+                    }
+                }
+                writeln!(stdout)?;
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                write!(stdout, "error")?;
+                stdout.reset()?;
+                writeln!(stdout, ": failed to submit transaction: {}", e)?;
+                Err(format!("Failed to create transaction: {}", e).into())
+            }
+        }
+    }
+
+    pub async fn handle_account_command(
+        &self,
+        args: &str,
+        blockchain: &Arc<RwLock<Blockchain>>,
+        wallets: &HashMap<String, Wallet>,
+    ) -> Result<()> {
+        // Auto, not Always: `account <addr> | grep` was receiving raw ANSI
+        // escapes. The sibling load_wallets already uses Auto.
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+        // `account` looks up ANY address — that is the point of it. Bare, it resolves the
+        // same default wallet `mine` and a bare send use, so the common case costs no typing;
+        // a wallet NAME resolves too, because a name is what the operator actually remembers.
+        // Anything else is passed through as a raw address.
+        let requested = args.split_whitespace().nth(1);
+        let extra: Vec<&str> = args.split_whitespace().skip(2).collect();
+        if !extra.is_empty() {
+            // `account a b` used to look up only `a` and drop `b` silently.
+            println!(
+                "(`account` takes one address — ignoring `{}`)",
+                extra.join(" ")
+            );
+        }
+        // A supplied argument must be a known wallet NAME or a canonical address.
+        // Anything else is a typo — say so, rather than rendering a full (empty)
+        // account page for the literal string, which read like a real but unused
+        // on-chain account.
+        if let Some(arg) = requested {
+            if wallets.get(arg).is_none() && !crate::a9::blockchain::is_canonical_user_address(arg)
+            {
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
+                writeln!(
+                    stdout,
+                    "No wallet named `{}`, and it is not an address (an address is 40 lowercase hexadecimal characters).",
+                    arg
+                )?;
+                stdout.reset()?;
+                return Ok(());
+            }
+        }
+        let resolved: Option<String> = match requested {
+            Some(arg) => Some(
+                wallets
+                    .get(arg)
+                    .map(|w| w.address.clone())
+                    .unwrap_or_else(|| arg.to_string()),
+            ),
+            None => match resolve_default_wallet(wallets, blockchain).await {
+                Some((name, addr)) => {
+                    ui_seg(&mut stdout, &mut ColorSpec::new(), UI_DIM, false, " ")?;
+                    writeln!(
+                        stdout,
+                        "showing {} — `account <address>` looks up any other",
+                        name
+                    )?;
+                    Some(addr)
+                }
+                None => None,
+            },
+        };
+
+        match resolved.as_deref() {
+            None => {
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
+                writeln!(stdout, "\nUsage: account <address>")?;
+                stdout.reset()?;
+                return Ok(());
+            }
+            Some(addr) => {
+                // Time-boxed like `balance`: after a re-bootstrap/deep sync the chain write
+                // lock can be held by block application for a long stretch, and an unbounded
+                // read here made `account` sit silently until it was released.
+                let Ok(blockchain_guard) =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), blockchain.read())
+                        .await
+                else {
+                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
+                    writeln!(
+                        stdout,
+                        "Chain busy (syncing/reorg in progress) — try `account` again shortly."
+                    )?;
+                    stdout.reset()?;
+                    return Ok(());
+                };
+
+                // Get balance atomically
+                let breakdown = match blockchain_guard.get_wallet_balance_breakdown(addr).await {
+                    Ok(breakdown) => breakdown,
+                    Err(e) => {
+                        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)))?;
+                        writeln!(stdout, "Error getting balance: {}", e)?;
+                        stdout.reset()?;
+                        return Ok(());
+                    }
+                };
+                let balance = breakdown.spendable;
+
+                // Get pending transactions
+                let mut pending_stats = (0, 0, 0.0, 0.0); // (out_count, in_count, out_amount, in_amount)
+                if let Ok(pending_txs) = blockchain_guard.get_pending_transactions().await {
+                    for tx in pending_txs {
+                        if tx.sender == addr {
+                            pending_stats.0 += 1;
+                            pending_stats.2 += tx.amount() + tx.fee();
+                        }
+                        if tx.recipient == addr {
+                            pending_stats.1 += 1;
+                            pending_stats.3 += tx.amount();
+                        }
+                    }
+                }
+
+                // Whole-chain history off the address index. The old code scanned
+                // only the newest 2000 blocks (a full decoded-chain load, twice),
+                // so any account whose activity predated that window showed a
+                // correct balance next to "Total Transactions: 0".
+                let history = blockchain_guard
+                    .address_history_summary(addr)
+                    .unwrap_or_default();
+
+                // Materialize EVERYTHING the display needs, then DROP the chain
+                // guard BEFORE the styled dump below (hundreds of sync console
+                // writes, incl. the 50-row recent list). A blocked console
+                // (Windows QuickEdit select / Ctrl-S) would otherwise park this
+                // read guard, and the write-preferring chain lock queue would
+                // halt block ingest and mining node-wide — the 2026-07-16
+                // publisher-park class. Every read below returns owned data.
+                const RECENT_TX_LIMIT: usize = 50;
+                let recent = blockchain_guard
+                    .address_recent_txs(addr, RECENT_TX_LIMIT, None)
+                    .unwrap_or_default();
+                let total_supply_units = blockchain_guard.total_confirmed_supply_units().ok();
+                drop(blockchain_guard);
+
+                // Print account information. All styled output goes THROUGH the termcolor
+                // `stdout` stream (writeln!/write!), never println!/print!: mixing the two puts
+                // the color/bold attribute on one handle and the text on another, so headers
+                // rendered bold only on Windows (Console API) and plain on Unix. Weight is set
+                // explicitly on every run (ui_seg) so nothing inherits a stale bold flag.
+                let spec = &mut ColorSpec::new();
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // ── banner: identity, then a balance that RECONCILES ───────────
+                // spendable + maturing + pending_debit = confirmed. The old screen
+                // printed spendable under a bare "Balance:" label and put the
+                // pending figure in its own section four lines away, so the two
+                // could not be related by eye.
+                let maturing_total: f64 = breakdown.maturing.iter().map(|(_, amount)| amount).sum();
+                writeln!(stdout)?;
+                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                ui_seg(&mut stdout, spec, UI_CYAN, true, "Account")?;
+                ui_seg(&mut stdout, spec, UI_LABEL, false, "   ")?;
+                ui_text(&mut stdout, spec, false, addr)?;
+                writeln!(stdout)?;
+
+                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                let seen = history.as_ref().is_some_and(|s| s.tx_count > 0);
+                if seen {
+                    ui_seg(&mut stdout, spec, UI_GREEN, false, "✓ ACTIVE")?;
+                } else {
+                    ui_seg(&mut stdout, spec, UI_DIM, false, "○ UNSEEN")?;
+                }
+                ui_pad(&mut stdout, spec, 9, 17)?;
+                // Local-wallet match against wallet ADDRESSES. The old check was
+                // `wallets.contains_key(addr)`, but the map is keyed by wallet
+                // NAME — so "Local Wallet" only ever fired for a wallet literally
+                // named after its own address.
+                let local = wallets
+                    .iter()
+                    .find(|(_, wallet)| wallet.address == addr)
+                    .map(|(name, _)| name.clone());
+                let mut col = 17usize;
+                if let Some(name) = local.as_ref() {
+                    ui_seg(&mut stdout, spec, UI_CYAN, false, "● local")?;
+                    ui_seg(&mut stdout, spec, UI_DIM, false, " · ")?;
+                    ui_seg(&mut stdout, spec, UI_CYAN, false, name)?;
+                    col += 10 + name.chars().count();
+                } else {
+                    ui_seg(&mut stdout, spec, UI_DIM, false, "○ not local")?;
+                    col += 11;
+                }
+                // A long wallet name (default_wallet) reaches the tx column and
+                // used to butt straight into it — "default_wallet16 txs". The
+                // next field always starts at least two spaces clear.
+                let tx_count = history.as_ref().map_or(0, |s| s.tx_count);
+                let tx_text = format!("{} txs", tx_count);
+                let tx_col = 41usize.max(col + 2);
+                ui_pad(&mut stdout, spec, col, tx_col)?;
+                ui_seg(&mut stdout, spec, UI_BLUE, false, &tx_text)?;
+                col = tx_col + tx_text.chars().count();
+                ui_pad(&mut stdout, spec, col, 57usize.max(col + 2))?;
+                ui_seg(&mut stdout, spec, UI_DIM, false, "tip ")?;
+                ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_BLUE,
+                    false,
+                    &ui_thousands(breakdown.as_of_height),
+                )?;
+                writeln!(stdout)?;
+
+                // MEASURE the money field, never assume its width. `ui_money(x, 4)`
+                // right-pads the whole part to 4 digits, so it is 15 columns up to
+                // 9999.99999999 and WIDER above it — the hardcoded 15 this replaces
+                // drifted the right-hand column one cell per extra digit (one at
+                // 10k, two at 100k, four at 33M). chars(), not len(): the ♦ is three
+                // bytes and one column.
+                let spendable_text = ui_money(balance, 4);
+                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                ui_seg(&mut stdout, spec, UI_CYAN, false, &spendable_text)?;
+                ui_seg(&mut stdout, spec, UI_DIM, false, " spendable")?;
+                ui_pad(
+                    &mut stdout,
+                    spec,
+                    1 + spendable_text.chars().count() + " spendable".chars().count(),
+                    41,
+                )?;
+                if maturing_total > 0.0 {
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_ORANGE,
+                        false,
+                        &ui_money(maturing_total, 4),
+                    )?;
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_DIM,
+                        false,
+                        &format!(" maturing · {}", breakdown.maturing.len()),
+                    )?;
+                } else {
+                    ui_seg(&mut stdout, spec, UI_DIM, false, "no maturing rewards")?;
+                }
+                writeln!(stdout)?;
+
+                if pending_stats.0 > 0 || pending_stats.1 > 0 {
+                    // Show whichever direction(s) are actually pending. The old line
+                    // always read "pending out · {out}", so incoming-only pending
+                    // rendered a misleading "0.0000 pending out · 0".
+                    let (pending_amount, pending_label) =
+                        if pending_stats.0 > 0 && pending_stats.1 > 0 {
+                            (
+                                pending_stats.2,
+                                format!(
+                                    " pending out · {} · in · {}",
+                                    pending_stats.0, pending_stats.1
+                                ),
+                            )
+                        } else if pending_stats.0 > 0 {
+                            (
+                                pending_stats.2,
+                                format!(" pending out · {}", pending_stats.0),
+                            )
+                        } else {
+                            (
+                                pending_stats.3,
+                                format!(" pending in · {}", pending_stats.1),
+                            )
+                        };
+                    let pending_text = ui_money(pending_amount, 4);
+                    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                    ui_seg(&mut stdout, spec, UI_ORANGE, false, &pending_text)?;
+                    ui_seg(&mut stdout, spec, UI_DIM, false, &pending_label)?;
+                    // Same measured form. The label carries a "·" (two bytes, one
+                    // column) as well as the money field's ♦, so byte length would
+                    // over-count both.
+                    ui_pad(
+                        &mut stdout,
+                        spec,
+                        1 + pending_text.chars().count() + pending_label.chars().count(),
+                        41,
+                    )?;
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_CYAN,
+                        false,
+                        &ui_money(breakdown.confirmed, 4),
+                    )?;
+                    ui_seg(&mut stdout, spec, UI_DIM, false, " = confirmed")?;
+                    writeln!(stdout)?;
+                }
+
+                ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+                writeln!(stdout)?;
+
+                // ── Maturing Rewards │ History ─────────────────────────────────
+                // The per-reward (height, amount) detail is already decoded by
+                // immature_coinbase_details; the old screen collapsed it to a sum
+                // and threw the rest away.
+                ui_grid_header(
+                    &mut stdout,
+                    spec,
+                    "Maturing Rewards",
+                    UI_CYAN,
+                    "History",
+                    UI_BLUE,
+                )?;
+                let stats = history.clone().unwrap_or_default();
+                let right_rows: Vec<(String, Vec<(Color, String)>)> = vec![
+                    (
+                        "Received:".to_string(),
+                        vec![(
+                            UI_BLUE,
+                            ui_money(Transaction::from_units(stats.received_units), 4),
+                        )],
+                    ),
+                    (
+                        "Sent:".to_string(),
+                        vec![(
+                            UI_BLUE,
+                            ui_money(Transaction::from_units(stats.sent_units), 4),
+                        )],
+                    ),
+                    (
+                        "Fees Paid:".to_string(),
+                        vec![(
+                            UI_BLUE,
+                            ui_money(Transaction::from_units(stats.fees_units), 4),
+                        )],
+                    ),
+                    (
+                        "First Activity:".to_string(),
+                        vec![(
+                            UI_BLUE,
+                            stats.first_height.map_or_else(
+                                || "—".to_string(),
+                                |h| format!("block {}", ui_thousands(h as u64)),
+                            ),
+                        )],
+                    ),
+                    (
+                        "Last Activity:".to_string(),
+                        vec![(
+                            UI_BLUE,
+                            stats.last_height.map_or_else(
+                                || "—".to_string(),
+                                |h| format!("block {}", ui_thousands(h as u64)),
+                            ),
+                        )],
+                    ),
+                ];
+                let mut left_rows: Vec<(String, Vec<(Color, String)>)> = breakdown
+                    .maturing
+                    .iter()
+                    .map(|(height, amount)| {
+                        (
+                            format!("block {}:", ui_thousands(*height as u64)),
+                            vec![
+                                (UI_CYAN, format!("{:.8} ♦", amount)),
+                                (
+                                    UI_ORANGE,
+                                    format!(
+                                        "  {} blk",
+                                        blocks_until_mature(*height, breakdown.as_of_height)
+                                    ),
+                                ),
+                            ],
+                        )
+                    })
+                    .collect();
+                if left_rows.is_empty() {
+                    left_rows.push(("Maturing:".to_string(), vec![(UI_DIM, "none".to_string())]));
+                } else {
+                    let next_left = breakdown
+                        .maturing
+                        .iter()
+                        .map(|(height, _)| blocks_until_mature(*height, breakdown.as_of_height))
+                        .min()
+                        .unwrap_or(0);
+                    left_rows.push((
+                        "Next spendable:".to_string(),
+                        vec![
+                            (UI_ORANGE, format!("{} blk", next_left)),
+                            (UI_DIM, format!(" · {}", format_maturity_eta(next_left))),
+                        ],
+                    ));
+                }
+                // Supply share rides the right pane rather than owning a section
+                // with a header, a rule and one number.
+                let mut right_rows = right_rows;
+                if let Some(total_supply_units) = total_supply_units {
+                    let total_supply = Transaction::from_units(total_supply_units);
+                    if total_supply > 0.0 {
+                        right_rows.push((
+                            "Supply Share:".to_string(),
+                            vec![(
+                                UI_BLUE,
+                                format!("{:.4}%", (breakdown.confirmed / total_supply) * 100.0),
+                            )],
+                        ));
+                    }
+                }
+                for index in 0..left_rows.len().max(right_rows.len()) {
+                    let left = left_rows
+                        .get(index)
+                        .map(|(label, runs)| (label.as_str(), runs.as_slice()));
+                    let right = right_rows
+                        .get(index)
+                        .map(|(label, runs)| (label.as_str(), runs.as_slice()));
+                    ui_grid_row(&mut stdout, spec, left, right)?;
+                }
+
+                ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+                writeln!(stdout)?;
+
+                // ── Recent Activity ───────────────────────────────────────────
+                const SHOWN: usize = 8;
+                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                ui_seg(&mut stdout, spec, UI_BLUE, true, "Recent Activity")?;
+                match &history {
+                    Some(stats) => {
+                        let shown = recent.len().min(SHOWN);
+                        let note = format!("last {} of {}", shown, stats.tx_count);
+                        ui_pad(&mut stdout, spec, 16, 78 - note.chars().count())?;
+                        ui_seg(&mut stdout, spec, UI_DIM, false, &note)?;
+                        writeln!(stdout)?;
+                        if recent.is_empty() {
+                            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                            ui_seg(
+                                &mut stdout,
+                                spec,
+                                UI_DIM,
+                                false,
+                                "no confirmed transactions — this address has never appeared in a block",
+                            )?;
+                            writeln!(stdout)?;
+                        } else {
+                            // Column right edges. Every cell is right-aligned to
+                            // one of these, so an over-wide value can never shove
+                            // the columns after it.
+                            const PARTY: usize = 9;
+                            const AMOUNT_END: usize = 46;
+                            const AGE_END: usize = 53;
+                            const HEIGHT_END: usize = 63;
+                            const CONF_END: usize = 71;
+
+                            ui_pad(&mut stdout, spec, 0, PARTY)?;
+                            ui_seg(&mut stdout, spec, UI_DIM, false, "counterparty")?;
+                            let mut col = PARTY + 12;
+                            col = ui_right(
+                                &mut stdout,
+                                spec,
+                                col,
+                                AMOUNT_END,
+                                UI_DIM,
+                                false,
+                                "amount",
+                            )?;
+                            col = ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, "age")?;
+                            col = ui_right(
+                                &mut stdout,
+                                spec,
+                                col,
+                                HEIGHT_END,
+                                UI_DIM,
+                                false,
+                                "height",
+                            )?;
+                            ui_right(&mut stdout, spec, col, CONF_END, UI_DIM, false, "conf")?;
+                            writeln!(stdout)?;
+
+                            for entry in recent.iter().take(SHOWN) {
+                                // A coinbase indexes with the system address as the
+                                // counterparty, so it used to render as an ordinary
+                                // "RECEIVED ... from MINING_REWARDS". It gets its own
+                                // token and hue.
+                                let coinbase = entry.is_recipient()
+                                    && SYSTEM_ADDRESSES.contains(&entry.counterparty.as_str());
+                                let (token, hue, sign) = if coinbase {
+                                    ("▾ mine", UI_LAVENDER, "+")
+                                } else if entry.is_sender() {
+                                    ("▴ out ", UI_PINK, "-")
+                                } else {
+                                    ("▾ in  ", UI_GREEN, "+")
+                                };
+                                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                                ui_seg(&mut stdout, spec, hue, false, token)?;
+                                ui_seg(&mut stdout, spec, UI_LABEL, false, "  ")?;
+                                let party = ui_address(&entry.counterparty);
+                                ui_text(&mut stdout, spec, false, &party)?;
+                                let mut col = PARTY + party.chars().count();
+                                // int_digits 5: the widest coin amount the column
+                                // must hold without eating the gap to `age`.
+                                let amount = format!(
+                                    "{}{}",
+                                    sign,
+                                    ui_money(Transaction::from_units(entry.amount_units), 5)
+                                );
+                                col = ui_right(
+                                    &mut stdout,
+                                    spec,
+                                    col,
+                                    AMOUNT_END,
+                                    hue,
+                                    false,
+                                    &amount,
+                                )?;
+                                let age = ui_age(now_secs.saturating_sub(entry.timestamp));
+                                col =
+                                    ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, &age)?;
+                                let height = ui_thousands(entry.height as u64);
+                                col = ui_right(
+                                    &mut stdout,
+                                    spec,
+                                    col,
+                                    HEIGHT_END,
+                                    UI_BLUE,
+                                    false,
+                                    &height,
+                                )?;
+                                // Depth from the SAME height the balance was read at,
+                                // so confirmations can never disagree with the figures
+                                // in the banner above.
+                                let conf = ui_thousands(
+                                    breakdown
+                                        .as_of_height
+                                        .saturating_sub(entry.height as u64)
+                                        .saturating_add(1),
+                                );
+                                ui_right(&mut stdout, spec, col, CONF_END, UI_DIM, false, &conf)?;
+                                // The locked marker is membership in the SAME Vec the
+                                // spendable figure was computed from, so the row and
+                                // the balance can never drift apart.
+                                if coinbase
+                                    && breakdown
+                                        .maturing
+                                        .iter()
+                                        .any(|(height, _)| *height == entry.height)
+                                {
+                                    ui_seg(&mut stdout, spec, UI_LABEL, false, "   ")?;
+                                    ui_seg(&mut stdout, spec, UI_ORANGE, false, "locked")?;
+                                }
+                                writeln!(stdout)?;
+                            }
+
+                            // ── Counterparties ────────────────────────────────
+                            // The table above truncates every address to stay in its
+                            // columns, which is exactly wrong for the addresses a reader
+                            // most likely wants to act on — pay again, check, paste
+                            // somewhere. These three are printed IN FULL for that reason.
+                            //
+                            // Free: derived from `recent`, already fetched and already in
+                            // memory. No extra chain query, no extra time under the guard.
+                            //
+                            // Scoped honestly. `frequent` is the most common counterparty
+                            // WITHIN the fetched window, not all time — the header says so
+                            // rather than letting the label overclaim. Coinbase rows are
+                            // excluded: MINING_REWARDS is not a counterparty anyone deals
+                            // with, and it would win `frequent` outright on a miner.
+                            let (last_in, last_out, frequent) = notable_counterparties(&recent);
+
+                            if last_in.is_some() || last_out.is_some() || frequent.is_some() {
+                                writeln!(stdout)?;
+                                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                                ui_seg(&mut stdout, spec, UI_BLUE, true, "Counterparties")?;
+                                let note = format!("within the last {} shown", recent.len());
+                                ui_pad(&mut stdout, spec, 16, 78 - note.chars().count())?;
+                                ui_seg(&mut stdout, spec, UI_DIM, false, &note)?;
+                                writeln!(stdout)?;
+
+                                const ADDR_AT: usize = 12;
+                                const VALUE_END: usize = 78;
+                                let mut row = |label: &str,
+                                               hue: Color,
+                                               party: &str,
+                                               value: String|
+                                 -> Result<()> {
+                                    ui_seg(&mut stdout, spec, UI_LABEL, false, "   ")?;
+                                    ui_seg(&mut stdout, spec, hue, false, label)?;
+                                    ui_pad(&mut stdout, spec, 3 + label.chars().count(), ADDR_AT)?;
+                                    // Terminal default foreground: an address must stay
+                                    // legible on any theme.
+                                    ui_text(&mut stdout, spec, false, party)?;
+                                    ui_right(
+                                        &mut stdout,
+                                        spec,
+                                        ADDR_AT + party.chars().count(),
+                                        VALUE_END,
+                                        UI_DIM,
+                                        false,
+                                        &value,
+                                    )?;
+                                    writeln!(stdout)?;
+                                    Ok(())
+                                };
+
+                                if let Some(e) = last_in {
+                                    row(
+                                        "last in",
+                                        UI_GREEN,
+                                        &e.counterparty,
+                                        format!(
+                                            "+{:.8} ♦",
+                                            Transaction::from_units(e.amount_units)
+                                        ),
+                                    )?;
+                                }
+                                if let Some(e) = last_out {
+                                    row(
+                                        "last out",
+                                        UI_PINK,
+                                        &e.counterparty,
+                                        format!(
+                                            "-{:.8} ♦",
+                                            Transaction::from_units(e.amount_units)
+                                        ),
+                                    )?;
+                                }
+                                if let Some((party, n)) = frequent {
+                                    row(
+                                        "frequent",
+                                        UI_LAVENDER,
+                                        party,
+                                        format!("{} of {}", n, recent.len()),
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                    // address_recent_txs returns an empty Vec for BOTH "no activity"
+                    // and "index not built yet" — only the index-backed summary
+                    // separates them, so the two cases finally say different things.
+                    None => {
+                        ui_pad(&mut stdout, spec, 16, 64)?;
+                        ui_seg(&mut stdout, spec, UI_ORANGE, false, "index building")?;
+                        writeln!(stdout)?;
+                        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                        ui_seg(
+                            &mut stdout,
+                            spec,
+                            UI_ORANGE,
+                            false,
+                            "history unavailable — the address index is still building; retry shortly",
+                        )?;
+                        writeln!(stdout)?;
+                    }
+                }
+                writeln!(stdout)?;
+                stdout.reset()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The wallet ledger: every wallet's spendable / locked / outbound split,
+    /// footed against a total that reconciles.
+    ///
+    /// Colour states spendability and nothing else — cyan is movable money,
+    /// warm hues are money you cannot spend yet (orange still maturing, pink
+    /// already leaving), green is the derived confirmed sum. A zero balance
+    /// renders dim, because a zero is not money.
+    ///
+    /// Recent activity across every loaded wallet, newest first.
+    ///
+    /// Reads the address index directly rather than going through the whisper
+    /// module: `whisper::get_recent_transactions` flattened `AddressTxEntry`
+    /// into a 5-field struct that discarded height, position and the
+    /// sender/recipient flag bits — so direction had to be re-inferred by
+    /// string comparison and confirmations could not be shown at all. Every
+    /// column here is already decoded by the index.
+    pub async fn handle_history_command(
+        &self,
+        args: &str,
+        blockchain: &Arc<RwLock<Blockchain>>,
+        wallets: &HashMap<String, Wallet>,
+    ) -> Result<()> {
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+        let spec = &mut ColorSpec::new();
+
+        // `history 200` and `history <addr>` used to be silently ignored.
+        let mut rows_wanted = 12usize;
+        if let Some(arg) = args.split_whitespace().nth(1) {
+            match arg.parse::<usize>() {
+                Ok(n) if (1..=50).contains(&n) => rows_wanted = n,
+                _ => {
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_DIM,
+                        false,
+                        " Usage: history [rows]   ",
+                    )?;
+                    ui_seg(&mut stdout, spec, UI_MUTED, false, "rows 1-50, default 12")?;
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_DIM,
+                        false,
+                        "   ·   one address: account <address>\n",
+                    )?;
+                    stdout.reset()?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let Ok(guard) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), blockchain.read()).await
+        else {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_ORANGE,
+                false,
+                " chain busy (syncing/reorg in progress) — try history again shortly\n",
+            )?;
+            stdout.reset()?;
+            return Ok(());
+        };
+
+        struct Entry {
+            wallet: String,
+            // The wallet ADDRESS, not the display name: dedup keys on this so one
+            // address loaded under two wallet names cannot double-count.
+            address: String,
+            counterparty: String,
+            amount_units: i128,
+            fee_units: i128,
+            is_out: bool,
+            is_self: bool,
+            coinbase: bool,
+            height: Option<u32>,
+            position: u32,
+            timestamp: u64,
+        }
+
+        // Per-wallet recent-activity window. history is a RECENT view, not a lifetime
+        // ledger — for lifetime-correct totals use `account <address>` (uncapped scan).
+        const HISTORY_WINDOW_PER_WALLET: usize = 50;
+
+        let tip = guard.get_latest_block_index();
+        let index_ready = guard.address_index_ready();
+        let mut entries: Vec<Entry> = Vec::new();
+        // True if any wallet filled its window — then the loaded set is a floor, not a
+        // lifetime count, and the header marks the total with a trailing `+`.
+        let mut window_capped = false;
+
+        if index_ready {
+            for (name, wallet) in wallets {
+                let recent = guard
+                    .address_recent_txs(&wallet.address, HISTORY_WINDOW_PER_WALLET, None)
+                    .unwrap_or_default();
+                if recent.len() >= HISTORY_WINDOW_PER_WALLET {
+                    window_capped = true;
+                }
+                for e in recent {
+                    // Read every flag BEFORE moving the counterparty string out.
+                    let (sender, recipient) = (e.is_sender(), e.is_recipient());
+                    let coinbase = recipient && SYSTEM_ADDRESSES.contains(&e.counterparty.as_str());
+                    entries.push(Entry {
+                        wallet: name.clone(),
+                        address: wallet.address.clone(),
+                        counterparty: e.counterparty,
+                        amount_units: e.amount_units,
+                        fee_units: e.fee_units,
+                        is_out: sender && !recipient,
+                        is_self: sender && recipient,
+                        coinbase,
+                        height: Some(e.height),
+                        position: e.position,
+                        timestamp: e.timestamp,
+                    });
+                }
+            }
+        }
+
+        // Mempool rows. get_mempool_transactions is a prune + clone; the old
+        // code called get_pending_transactions ONCE PER WALLET, and each call
+        // ran sync_mempool_with_store — state_mutation_lock, full signature
+        // re-verification of every pending tx, two store flushes and a
+        // pending-debits rebuild. A read-only screen was doing N mempool
+        // rebuilds under the chain guard.
+        let mempool = guard.get_mempool_transactions().await.unwrap_or_default();
+        for tx in mempool {
+            // A mempool row that is ALREADY confirmed — re-entered via gossip echo or a
+            // reorg, since get_mempool_transactions prunes by TTL only — would otherwise
+            // be counted a second time next to its confirmed row. Drop the pending copy.
+            if guard.is_tx_confirmed(&tx.get_tx_id()) {
+                continue;
+            }
+            for (name, wallet) in wallets {
+                let is_sender = tx.sender == wallet.address;
+                let is_recipient = tx.recipient == wallet.address;
+                if !is_sender && !is_recipient {
+                    continue;
+                }
+                entries.push(Entry {
+                    wallet: name.clone(),
+                    address: wallet.address.clone(),
+                    counterparty: if is_sender {
+                        tx.recipient.clone()
+                    } else {
+                        tx.sender.clone()
+                    },
+                    amount_units: tx.amount_units,
+                    fee_units: tx.fee_units,
+                    is_out: is_sender && !is_recipient,
+                    is_self: is_sender && is_recipient,
+                    coinbase: false,
+                    height: None,
+                    position: 0,
+                    timestamp: tx.timestamp,
+                });
+            }
+        }
+        drop(guard);
+
+        // Identity is (height, position) — the old dedup keyed on
+        // (timestamp, from, to, |Δamount| < f64::EPSILON), which cannot see
+        // identity because the exact units had already been discarded.
+        entries.sort_by(|a, b| {
+            b.height
+                .cmp(&a.height)
+                .then_with(|| b.position.cmp(&a.position))
+                .then_with(|| b.timestamp.cmp(&a.timestamp))
+        });
+        entries.dedup_by(|a, b| {
+            // Key on ADDRESS, not wallet name: one address loaded under two names must
+            // collapse to one row. `height.is_some()` keeps this to confirmed rows —
+            // two distinct pending txs both have (None, 0) and must NOT be merged.
+            a.address == b.address
+                && a.height == b.height
+                && a.position == b.position
+                && a.height.is_some()
+        });
+        // Pending first, then confirmed newest-first.
+        entries.sort_by(|a, b| {
+            a.height
+                .is_some()
+                .cmp(&b.height.is_some())
+                .then_with(|| b.height.cmp(&a.height))
+                .then_with(|| b.position.cmp(&a.position))
+                .then_with(|| b.timestamp.cmp(&a.timestamp))
+        });
+
+        let total = entries.len();
+        let pending = entries.iter().filter(|e| e.height.is_none()).count();
+        let shown = entries.len().min(rows_wanted);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        writeln!(stdout)?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_BLUE, true, "History")?;
+        let note = if !index_ready {
+            format!(
+                "{} wallets · tip {} · index building",
+                wallets.len(),
+                ui_thousands(tip)
+            )
+        } else if pending > 0 {
+            format!(
+                "{} wallets · {} pending · tip {}",
+                wallets.len(),
+                pending,
+                ui_thousands(tip)
+            )
+        } else {
+            format!("{} wallets · tip {}", wallets.len(), ui_thousands(tip))
+        };
+        ui_pad(
+            &mut stdout,
+            spec,
+            8,
+            78usize.saturating_sub(note.chars().count()),
+        )?;
+        ui_seg(
+            &mut stdout,
+            spec,
+            if index_ready { UI_DIM } else { UI_ORANGE },
+            false,
+            &note,
+        )?;
+        writeln!(stdout)?;
+
+        if index_ready && total > 0 {
+            // Sum over the SHOWN rows only, so every contributor to `net` is visible on
+            // screen — net can never fold in rows you cannot see. A self-transfer nets
+            // exactly its fee (it moves coins to yourself), never 0.
+            let net: i128 = entries
+                .iter()
+                .take(shown)
+                .map(|e| {
+                    if e.is_self {
+                        -e.fee_units
+                    } else if e.is_out {
+                        -(e.amount_units + e.fee_units)
+                    } else {
+                        e.amount_units
+                    }
+                })
+                .sum();
+            // "recent", not "confirmed": this window can include pending rows (marked
+            // as such per-row and counted in the sub-header). A trailing `+` on the
+            // total means a wallet filled its window, so more history exists than shown.
+            ui_seg(&mut stdout, spec, UI_DIM, false, " recent  ")?;
+            let count = format!(
+                "{} of {}{}",
+                shown,
+                total,
+                if window_capped { "+" } else { "" }
+            );
+            ui_seg(&mut stdout, spec, UI_BLUE, false, &count)?;
+            ui_pad(&mut stdout, spec, 9 + count.chars().count(), 30)?;
+            ui_seg(&mut stdout, spec, UI_DIM, false, "net  ")?;
+            ui_seg(
+                &mut stdout,
+                spec,
+                if net < 0 { UI_PINK } else { UI_GREEN },
+                false,
+                &format!(
+                    "{}{:.8} ♦",
+                    if net < 0 { "-" } else { "+" },
+                    Transaction::from_units(net.abs())
+                ),
+            )?;
+            writeln!(stdout)?;
+        }
+        ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+        writeln!(stdout)?;
+
+        if !index_ready {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_ORANGE,
+                false,
+                " history unavailable — the address index is still building; retry shortly",
+            )?;
+            writeln!(stdout)?;
+            writeln!(stdout)?;
+            stdout.reset()?;
+            return Ok(());
+        }
+        if total == 0 {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_DIM,
+                false,
+                &format!(
+                    " no activity — none of your {} wallet{} appears in a block or in the mempool",
+                    wallets.len(),
+                    if wallets.len() == 1 { "" } else { "s" }
+                ),
+            )?;
+            writeln!(stdout)?;
+            writeln!(stdout)?;
+            stdout.reset()?;
+            return Ok(());
+        }
+
+        // Column right edges, sharing the account table's geometry so the two
+        // screens read as one system.
+        const PARTY: usize = 9;
+        const AMOUNT_END: usize = 46;
+        const AGE_END: usize = 53;
+        const HEIGHT_END: usize = 62;
+        const CONF_END: usize = 70;
+        const WALLET_AT: usize = 72;
+
+        ui_pad(&mut stdout, spec, 0, PARTY)?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, "counterparty")?;
+        let mut col = PARTY + 12;
+        col = ui_right(&mut stdout, spec, col, AMOUNT_END, UI_DIM, false, "amount")?;
+        col = ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, "age")?;
+        col = ui_right(&mut stdout, spec, col, HEIGHT_END, UI_DIM, false, "height")?;
+        col = ui_right(&mut stdout, spec, col, CONF_END, UI_DIM, false, "conf")?;
+        ui_pad(&mut stdout, spec, col, WALLET_AT)?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, "wallet")?;
+        writeln!(stdout)?;
+
+        for e in entries.iter().take(shown) {
+            let (token, hue, sign) = if e.coinbase {
+                ("▾ mine", UI_LAVENDER, "+")
+            } else if e.is_self {
+                ("↔ self", UI_BLUE, " ")
+            } else if e.is_out {
+                ("▴ out ", UI_PINK, "-")
+            } else {
+                ("▾ in  ", UI_GREEN, "+")
+            };
+            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+            ui_seg(&mut stdout, spec, hue, false, token)?;
+            ui_seg(&mut stdout, spec, UI_LABEL, false, "  ")?;
+            let party = ui_address(&e.counterparty);
+            ui_text(&mut stdout, spec, false, &party)?;
+            let mut col = PARTY + party.chars().count();
+            let amount = format!("{}{:.8} ♦", sign, Transaction::from_units(e.amount_units));
+            col = ui_right(&mut stdout, spec, col, AMOUNT_END, hue, true, &amount)?;
+            let age = ui_age(now.saturating_sub(e.timestamp));
+            col = ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, &age)?;
+            match e.height {
+                Some(h) => {
+                    let height = ui_thousands(h as u64);
+                    col = ui_right(&mut stdout, spec, col, HEIGHT_END, UI_BLUE, false, &height)?;
+                    let conf = tip.saturating_sub(h as u64).saturating_add(1);
+                    // A coinbase inside the maturity window shows its progress
+                    // toward spendable instead of a bare depth.
+                    let conf_text = if e.coinbase && conf < MINING_REWARD_MATURITY as u64 {
+                        format!("{}/{}", conf, MINING_REWARD_MATURITY)
+                    } else {
+                        ui_thousands(conf)
+                    };
+                    let conf_hue = if e.coinbase && conf < MINING_REWARD_MATURITY as u64 {
+                        UI_ORANGE
+                    } else {
+                        UI_DIM
+                    };
+                    col = ui_right(
+                        &mut stdout,
+                        spec,
+                        col,
+                        CONF_END,
+                        conf_hue,
+                        false,
+                        &conf_text,
+                    )?;
+                }
+                None => {
+                    col = ui_right(&mut stdout, spec, col, HEIGHT_END, UI_DIM, false, "—")?;
+                    col = ui_right(
+                        &mut stdout,
+                        spec,
+                        col,
+                        CONF_END,
+                        UI_ORANGE,
+                        false,
+                        "pending",
+                    )?;
+                }
+            }
+            ui_pad(&mut stdout, spec, col, WALLET_AT)?;
+            let name: String = if e.wallet.chars().count() > 8 {
+                format!("{}…", e.wallet.chars().take(7).collect::<String>())
+            } else {
+                e.wallet.clone()
+            };
+            ui_seg(&mut stdout, spec, UI_LAVENDER, false, &name)?;
+            writeln!(stdout)?;
+        }
+
+        writeln!(stdout)?;
+        stdout.reset()?;
+        Ok(())
+    }
+
+    /// The set of addresses `contacts` scans: one entry per DISTINCT address across
+    /// every loaded wallet.
+    ///
+    /// `validate_unique_wallet_names` enforces unique NAMES, not unique addresses, so
+    /// the same address can appear under two wallet records. Scanning per record would
+    /// read that address's index twice and double every number in the book — the
+    /// double-count `history` had to fix by keying on address instead of name. The
+    /// same set doubles as the own-address exclusion, so both uses stay consistent by
+    /// construction.
+    fn wallet_addresses(wallets: &HashMap<String, Wallet>) -> HashSet<&str> {
+        wallets.values().map(|w| w.address.as_str()).collect()
+    }
+
+    /// Per-address ceiling on the contacts scan.
+    ///
+    /// The scan runs under the chain READ guard, and that lock is write-preferring:
+    /// a long read delays block application node-wide (the 2026-07-16 publisher-park
+    /// class that `balance` and `account` are both written to avoid). A miner's
+    /// address gains one index row per block mined, so an unbounded "read this
+    /// address's whole history" is exactly that pathology — six figures of rows.
+    /// 20k is far past any real counterparty count while keeping the guard hold in
+    /// the millisecond range, and reaching it is DISCLOSED (a trailing `+` on the
+    /// count) rather than silently shortening the book.
+    const CONTACTS_SCAN_CAP_PER_ADDRESS: usize = 20_000;
+
+    /// Read each address's rows exactly once, returning them with a flag for
+    /// "some address filled the cap".
+    ///
+    /// The fetch is a closure so this loop is testable without a chain: the bug this
+    /// exists to prevent is reading one address TWICE (it was iterating wallet
+    /// records, and two records can share an address), and a test can only catch a
+    /// regression there by observing what the loop actually asked for.
+    fn collect_contact_rows<F>(
+        addresses: &HashSet<&str>,
+        mut fetch: F,
+    ) -> (Vec<crate::a9::blockchain::AddressTxEntry>, bool)
+    where
+        F: FnMut(&str) -> Vec<crate::a9::blockchain::AddressTxEntry>,
+    {
+        let mut rows = Vec::new();
+        let mut capped = false;
+        for address in addresses {
+            let entries = fetch(address);
+            if entries.len() >= Self::CONTACTS_SCAN_CAP_PER_ADDRESS {
+                capped = true;
+            }
+            rows.extend(entries);
+        }
+        (rows, capped)
+    }
+
+    /// Fold raw address-index rows into one entry per counterparty, newest-activity
+    /// timestamp kept, ordered for display.
+    ///
+    /// Pure and separately tested: this is where every judgement call in the view
+    /// lives (which rows are not counterparties, what "net" means, how ties break),
+    /// and the rendering path around it has no seam a test could reach.
+    ///
+    /// `own` is every address the caller holds — a transfer between two of your own
+    /// wallets is bookkeeping, not a relationship, and appears in BOTH wallets'
+    /// scans, so excluding it also prevents a double count.
+    fn aggregate_contacts(
+        rows: &[crate::a9::blockchain::AddressTxEntry],
+        own: &HashSet<&str>,
+    ) -> Vec<Contact> {
+        let mut book: HashMap<String, Contact> = HashMap::new();
+        for e in rows {
+            let (sender, recipient) = (e.is_sender(), e.is_recipient());
+            // Coinbase: the "counterparty" is the reward system, not a peer.
+            if SYSTEM_ADDRESSES.contains(&e.counterparty.as_str()) {
+                continue;
+            }
+            // Self-send, or a transfer to another wallet you hold.
+            if (sender && recipient) || own.contains(e.counterparty.as_str()) {
+                continue;
+            }
+            let contact = book
+                .entry(e.counterparty.clone())
+                .or_insert_with(|| Contact {
+                    address: e.counterparty.clone(),
+                    txs: 0,
+                    in_units: 0,
+                    out_units: 0,
+                    last_seen: 0,
+                });
+            // Saturating throughout: release builds panic on overflow, and a
+            // display path must never be the thing that stops a node.
+            contact.txs = contact.txs.saturating_add(1);
+            // AMOUNT ONLY, no fee — deliberately different from history's net, and
+            // the two are not in conflict. history answers "what did my balance
+            // do", so an out row costs amount + fee. contacts answers "what moved
+            // between me and THIS party", and the fee went to a miner, not to them:
+            // folding it in would overstate every relationship by its costs.
+            if sender {
+                contact.out_units = contact.out_units.saturating_add(e.amount_units);
+            } else if recipient {
+                contact.in_units = contact.in_units.saturating_add(e.amount_units);
+            }
+            contact.last_seen = contact.last_seen.max(e.timestamp);
+        }
+        let mut contacts: Vec<Contact> = book.into_values().collect();
+        // Frequency first — the address book question is "who do I deal with", not
+        // "who was most recent" (that is history's job). Recency then address break
+        // ties, so the ordering is TOTAL: the same book renders identically twice,
+        // which a HashMap's iteration order alone would not guarantee.
+        contacts.sort_by(|a, b| {
+            b.txs
+                .cmp(&a.txs)
+                .then(b.last_seen.cmp(&a.last_seen))
+                .then(a.address.cmp(&b.address))
+        });
+        contacts
+    }
+
+    /// Column right edges for `contacts`. The address is a fixed 40 hex chars, so
+    /// unlike history's goal-width geometry these are absolute: 1 (indent) + 40
+    /// (address) + gap. Section subtotals right-align on CONTACTS_NET_END too, so
+    /// every number in the view shares one decimal column.
+    const CONTACTS_TXS_END: usize = 47;
+    const CONTACTS_NET_END: usize = 68;
+    const CONTACTS_AGE_END: usize = 75;
+
+    /// Address book: every counterparty your wallets have transacted with, grouped
+    /// by the direction of the NET position with them.
+    ///
+    /// Derived live from the address index — there is no contacts file and no
+    /// labels, because the address IS the identity. Deliberately different from
+    /// `history` in two ways: it aggregates over each address's indexed history up
+    /// to a generous per-address cap rather than a small recent window (an address
+    /// book that forgot last month's counterparty would be worse than none; a book
+    /// that pins the chain lock would be worse still, so the cap exists and is
+    /// disclosed), and it keys on the
+    /// counterparty ADDRESS, so one address reached from two of your wallets is
+    /// one contact, not two.
+    ///
+    /// Coinbase rows are excluded (MINING_REWARDS is not a counterparty) and so
+    /// are self-sends between your own loaded wallets, which would otherwise
+    /// appear as a contact that is really just you.
+    pub async fn handle_contacts_command(
+        &self,
+        args: &str,
+        blockchain: &Arc<RwLock<Blockchain>>,
+        wallets: &HashMap<String, Wallet>,
+    ) -> Result<()> {
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+        let spec = &mut ColorSpec::new();
+
+        // `contacts` -> top 10, `contacts all` -> the whole book. Anything else is
+        // a typo, and saying so beats silently showing the default (the whisper
+        // error-clarity rule).
+        const CONTACTS_DEFAULT_ROWS: usize = 10;
+        let mut show_all = false;
+        // Every token after the verb is checked, not just the first: `contacts all
+        // now` must not silently behave like `contacts all`, or the screen quietly
+        // teaches a syntax that does not exist.
+        let mut extra = args.split_whitespace().skip(1);
+        let arg = extra.next();
+        let trailing = extra.next().is_some();
+        if let Some(arg) = arg {
+            if arg.eq_ignore_ascii_case("all") && !trailing {
+                show_all = true;
+            } else {
+                ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_DIM,
+                    false,
+                    " Usage: contacts [all]   ",
+                )?;
+                ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_MUTED,
+                    false,
+                    "top 10 by default, all = every counterparty",
+                )?;
+                writeln!(stdout)?;
+                stdout.reset()?;
+                return Ok(());
+            }
+        }
+
+        // Same time-boxed acquisition as history/balance: an unbounded read here
+        // parks the write-preferring chain lock behind a blocked console.
+        let Ok(guard) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), blockchain.read()).await
+        else {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_ORANGE,
+                false,
+                " chain busy (syncing/reorg in progress) — try contacts again shortly\n",
+            )?;
+            stdout.reset()?;
+            return Ok(());
+        };
+
+        let index_ready = guard.address_index_ready();
+        // Your own addresses are not contacts: a transfer between two loaded
+        // wallets is bookkeeping, not a counterparty relationship.
+        //
+        // This set is ALSO the scan list, and that is load-bearing:
+        // `validate_unique_wallet_names` enforces unique NAMES, not unique
+        // addresses, so one address loaded under two names appears twice in
+        // `wallets`. Scanning per wallet would then read that address's index
+        // twice and double every number in the book — the same double-count
+        // `history` had to fix by keying on address instead of name. Scanning per
+        // distinct ADDRESS makes duplicate wallet records free.
+        let own = Self::wallet_addresses(wallets);
+        let (rows, scan_capped) = if index_ready {
+            Self::collect_contact_rows(&own, |address| {
+                // ONE scan per address, newest-first. An earlier version also called
+                // address_history_summary just to size this — a second full prefix
+                // scan per address, under the same guard, for a number the scan
+                // itself yields.
+                guard
+                    .address_recent_txs(address, Self::CONTACTS_SCAN_CAP_PER_ADDRESS, None)
+                    .unwrap_or_default()
+            })
+        } else {
+            (Vec::new(), false)
+        };
+        drop(guard);
+
+        let mut contacts = Self::aggregate_contacts(&rows, &own);
+        let total = contacts.len();
+        let shown = if show_all {
+            total
+        } else {
+            total.min(CONTACTS_DEFAULT_ROWS)
+        };
+        contacts.truncate(shown);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        writeln!(stdout)?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_CYAN, true, "contacts")?;
+        if index_ready && total > 0 {
+            ui_seg(&mut stdout, spec, UI_DIM, false, "   ")?;
+            // A trailing `+` means a wallet filled the per-address scan cap, so the
+            // book is a floor, not a lifetime count — the same honesty marker
+            // history puts on its own windowed total.
+            let more = if scan_capped { "+" } else { "" };
+            let count = if show_all || total <= CONTACTS_DEFAULT_ROWS {
+                format!("all {}{}, most active first", total, more)
+            } else {
+                format!("top {} of {}{}, most active first", shown, total, more)
+            };
+            ui_seg(&mut stdout, spec, UI_BLUE, false, &count)?;
+            if !show_all && total > CONTACTS_DEFAULT_ROWS {
+                ui_seg(&mut stdout, spec, UI_FAINT, false, "   contacts all")?;
+            }
+        }
+        writeln!(stdout)?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+        writeln!(stdout)?;
+
+        if !index_ready {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_ORANGE,
+                false,
+                " contacts unavailable — the address index is still building; retry shortly",
+            )?;
+            writeln!(stdout)?;
+            writeln!(stdout)?;
+            stdout.reset()?;
+            return Ok(());
+        }
+        if total == 0 {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_DIM,
+                false,
+                " no counterparties yet — rewards and moves between your own wallets do not count",
+            )?;
+            writeln!(stdout)?;
+            writeln!(stdout)?;
+            stdout.reset()?;
+            return Ok(());
+        }
+
+        // Three sections, ordered credits -> debits -> settled, each with the
+        // subtotal of the net positions it contains. `net` is per-contact, so a
+        // contact appears exactly once and the three subtotals sum to exactly the
+        // rows ON SCREEN — the same rule history's net follows: a total may never
+        // fold in rows you cannot see. Under the default top-10 that means the
+        // subtotals describe the shown contacts, not the whole book; the header
+        // says "top 10 of N" precisely so the scope is never ambiguous, and
+        // `contacts all` makes them whole-book totals.
+        let net_of = |c: &Contact| c.in_units.saturating_sub(c.out_units);
+        let sections: [(&str, &str, Color); 3] = [
+            ("▾ credits · received from", "credits", UI_GREEN),
+            ("▴ debits · paid to", "debits", UI_PINK),
+            ("↔ settled", "settled", UI_BLUE),
+        ];
+
+        for (index, (title, _key, hue)) in sections.iter().enumerate() {
+            let members: Vec<&Contact> = contacts
+                .iter()
+                .filter(|c| {
+                    let net = net_of(c);
+                    match index {
+                        0 => net > 0,
+                        1 => net < 0,
+                        _ => net == 0,
+                    }
+                })
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let subtotal = members
+                .iter()
+                .fold(0i128, |acc, c| acc.saturating_add(net_of(c)));
+
+            // Section rule: title in the section hue, the subtotal right-aligned
+            // on the same line so each group states its own position.
+            ui_seg(&mut stdout, spec, UI_HAIRLINE, false, " ── ")?;
+            ui_seg(&mut stdout, spec, *hue, true, title)?;
+            let used = 4 + title.chars().count();
+            let subtotal_text = format!(
+                "{}{:.8} ♦",
+                if subtotal < 0 { "−" } else { "+" },
+                Transaction::from_units(subtotal.saturating_abs())
+            );
+            let rule_end = Self::CONTACTS_NET_END.saturating_sub(subtotal_text.chars().count());
+            if rule_end > used + 1 {
+                let dashes: String = "─".repeat(rule_end.saturating_sub(used + 1));
+                ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_HAIRLINE,
+                    false,
+                    &format!(" {}", dashes),
+                )?;
+            }
+            ui_seg(
+                &mut stdout,
+                spec,
+                *hue,
+                false,
+                &format!(" {}", subtotal_text),
+            )?;
+            writeln!(stdout)?;
+
+            for c in members {
+                let net = net_of(c);
+                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                // FULL 40-hex address: this screen is the copy surface. A prefix
+                // would be the address-poisoning shape (see the whisper notice
+                // rule) and would defeat the point of the view.
+                ui_seg(&mut stdout, spec, UI_VALUE, false, &c.address)?;
+                let mut col = 1 + c.address.chars().count();
+                let count = format!("×{}", c.txs);
+                col = ui_right(
+                    &mut stdout,
+                    spec,
+                    col,
+                    Self::CONTACTS_TXS_END,
+                    UI_CYAN,
+                    false,
+                    &count,
+                )?;
+                let net_text = format!(
+                    "{}{:.8} ♦",
+                    if net < 0 { "−" } else { "+" },
+                    Transaction::from_units(net.saturating_abs())
+                );
+                col = ui_right(
+                    &mut stdout,
+                    spec,
+                    col,
+                    Self::CONTACTS_NET_END,
+                    *hue,
+                    false,
+                    &net_text,
+                )?;
+                let age = ui_age(now.saturating_sub(c.last_seen));
+                ui_right(
+                    &mut stdout,
+                    spec,
+                    col,
+                    Self::CONTACTS_AGE_END,
+                    UI_DIM,
+                    false,
+                    &age,
+                )?;
+                writeln!(stdout)?;
+            }
+            writeln!(stdout)?;
+        }
+
+        if !show_all && total > shown {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_FAINT,
+                false,
+                &format!(
+                    " …{} more · contacts all → all {}",
+                    total.saturating_sub(shown),
+                    total
+                ),
+            )?;
+            writeln!(stdout)?;
+            writeln!(stdout)?;
+        }
+        stdout.reset()?;
+        Ok(())
+    }
+
+    /// `network_tip` is the node's beacon high-water height — a local read, never a
+    /// network call. 0 means no beacon has been seen yet, in which case the header
+    /// makes no claim rather than guessing.
+    pub async fn show_balances(&self, wallets: &HashMap<String, Wallet>, network_tip: u32) {
+        // Auto, not Always: `balance | grep` was receiving raw ANSI escapes.
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+        let spec = &mut ColorSpec::new();
+
+        // Time-boxed: after a re-bootstrap/deep sync the chain lock can be held by
+        // block application for a long stretch, and an unbounded read here made
+        // `balance` sit silently forever ("client hangs, needs restart" reports).
+        let Ok(blockchain_guard) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), self.blockchain.read()).await
+        else {
+            let _ = ui_seg(
+                &mut stdout,
+                spec,
+                UI_ORANGE,
+                false,
+                "\nChain busy (syncing/reorg in progress) — try `balance` again shortly.\n",
+            );
+            let _ = stdout.reset();
+            return;
+        };
+
+        // Materialise EVERYTHING, then DROP the guard BEFORE the first styled
+        // write. The old code held this read across the whole render while
+        // paying ~100 uncached block decodes per wallet inside it; a blocked
+        // console (Windows QuickEdit / Ctrl-S) would park the guard and the
+        // write-preferring chain lock would halt block ingest node-wide — the
+        // 2026-07-16 publisher-park class that `account` already avoids.
+        struct Row {
+            name: String,
+            address: String,
+            spendable: f64,
+            maturing: f64,
+            next_unlock: u64,
+            pending: f64,
+            incoming: f64,
+            confirmed: f64,
+            error: Option<String>,
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(wallets.len());
+        let mut tip = 0u64;
+        for (name, wallet) in wallets {
+            match blockchain_guard
+                .get_wallet_balance_breakdown(&wallet.address)
+                .await
+            {
+                Ok(breakdown) => {
+                    tip = tip.max(breakdown.as_of_height);
+                    let maturing: f64 = breakdown.maturing.iter().map(|(_, a)| a).sum();
+                    let next_unlock = breakdown
+                        .maturing
+                        .iter()
+                        .map(|(h, _)| blocks_until_mature(*h, breakdown.as_of_height))
+                        .min()
+                        .unwrap_or(0);
+                    rows.push(Row {
+                        name: name.clone(),
+                        address: wallet.address.clone(),
+                        spendable: breakdown.spendable,
+                        maturing,
+                        next_unlock,
+                        pending: breakdown.pending_debit,
+                        incoming: breakdown.pending_credit,
+                        confirmed: breakdown.confirmed,
+                        error: None,
+                    });
+                }
+                Err(e) => rows.push(Row {
+                    name: name.clone(),
+                    address: wallet.address.clone(),
+                    spendable: 0.0,
+                    maturing: 0.0,
+                    next_unlock: 0,
+                    pending: 0.0,
+                    incoming: 0.0,
+                    confirmed: 0.0,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+        drop(blockchain_guard);
+
+        // Deterministic order. The old screen iterated the HashMap directly, so
+        // the wallet order changed between two runs of the same command.
+        rows.sort_by(|a, b| {
+            b.spendable
+                .partial_cmp(&a.spendable)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let total_spendable: f64 = rows.iter().map(|r| r.spendable).sum();
+        let total_maturing: f64 = rows.iter().map(|r| r.maturing).sum();
+        let total_pending: f64 = rows.iter().map(|r| r.pending).sum();
+        let total_incoming: f64 = rows.iter().map(|r| r.incoming).sum();
+        let total_confirmed: f64 = rows.iter().map(|r| r.confirmed).sum();
+        let funded = rows.iter().filter(|r| r.spendable > 0.0).count();
+
+        // Amount column: every figure right-aligned to one edge so the decimal
+        // points share a column across wallets AND the totals block.
+        // ── E4 "contrast" geometry ──────────────────────────────────────────
+        // Wallet name and its FULL 40-hex address own the wallet line (19 + 40 =
+        // 59 cells); State / Amount / Share are the columns beneath. They never
+        // needed to share a row — that requirement is the only thing that would
+        // force an address to be truncated, and an address you cannot copy or
+        // verify is worth less than the column it saves.
+        const NAME_COL: usize = 1;
+        const ADDR_COL: usize = 19;
+        const STATE_COL: usize = 21;
+        const AMOUNT_END: usize = 58;
+        const SHARE_END: usize = 71;
+        const SUBRULE_END: usize = 60;
+        const GAUGE: usize = 8;
+
+        // A macro, not a closure: a closure capturing `stdout` holds the only
+        // mutable borrow for its whole lifetime, which locks out every other
+        // write in this function.
+        //
+        // Colour names the CATEGORY, never the money: every settled figure is
+        // UI_VALUE white and the brightest thing on the row, while hue sits on
+        // the state label. Outbound and incoming keep their hue on the figure
+        // too, because those are the two states where the number itself is the
+        // exception worth seeing.
+        macro_rules! out {
+            ($label:expr, $lhue:expr, $amount:expr, $hue:expr, $bold:expr, $share:expr, $note:expr) => {{
+                let label: &str = $label;
+                let _ = ui_pad(&mut stdout, spec, 0, STATE_COL);
+                let _ = ui_seg(&mut stdout, spec, $lhue, false, label);
+                // ui_money bakes in the unit mark; the figure and the ♦ need
+                // different hues here, so the number is formatted alone.
+                let text = format!("{:.8}", $amount);
+                let mut col = ui_right(
+                    &mut stdout,
+                    spec,
+                    STATE_COL + label.chars().count(),
+                    AMOUNT_END,
+                    $hue,
+                    $bold,
+                    &text,
+                )
+                .unwrap_or(AMOUNT_END);
+                let _ = ui_seg(&mut stdout, spec, $hue, false, " ♦");
+                col += 2;
+                let share: Option<String> = $share;
+                if let Some(s) = share {
+                    col = ui_right(&mut stdout, spec, col, SHARE_END, UI_FAINT, false, &s)
+                        .unwrap_or(col);
+                }
+                let note: &str = $note;
+                if !note.is_empty() {
+                    let _ = ui_seg(&mut stdout, spec, UI_FAINT, false, "  ");
+                    let _ = ui_seg(&mut stdout, spec, UI_FAINT, false, note);
+                }
+                let _ = col;
+                let _ = writeln!(stdout);
+            }};
+        }
+
+        // Subtotal rule, sized and placed to sit under the amount column.
+        macro_rules! subrule {
+            () => {{
+                let _ = ui_pad(&mut stdout, spec, 0, SUBRULE_END - 15);
+                let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, "───────────────");
+                let _ = writeln!(stdout);
+            }};
+        }
+
+        let _ = writeln!(stdout);
+        let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
+        let _ = ui_seg(&mut stdout, spec, UI_VALUE, true, "Wallet Ledger");
+        let head = format!(
+            "{} wallet{} · {} funded · ",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+            funded
+        );
+        // A balance is only as current as the chain it was read from. A bare
+        // height is a number the reader cannot judge, so say whether it is up to
+        // date instead. Mirrors `info`'s rule: within one block counts as synced.
+        let behind = network_tip.saturating_sub(tip as u32);
+        let (status_text, status_hue) = if network_tip == 0 {
+            (format!("tip {}", ui_thousands(tip)), UI_BLUE)
+        } else if behind <= 1 {
+            (format!("synced · {}", ui_thousands(tip)), UI_GREEN)
+        } else {
+            (
+                format!(
+                    "{} behind · {}",
+                    ui_thousands(behind as u64),
+                    ui_thousands(tip)
+                ),
+                UI_ORANGE,
+            )
+        };
+        let _ = ui_pad(
+            &mut stdout,
+            spec,
+            14,
+            78usize
+                .saturating_sub(head.chars().count() + status_text.chars().count())
+                .max(15),
+        );
+        let _ = ui_seg(&mut stdout, spec, UI_DIM, false, &head);
+        let _ = ui_seg(&mut stdout, spec, status_hue, false, &status_text);
+        let _ = writeln!(stdout);
+        let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, UI_RULE);
+        let _ = writeln!(stdout);
+
+        // Column headers. Bold + faint rather than shouted capitals: the reader
+        // needs to know which column they are in, not to be addressed by it.
+        let _ = ui_pad(&mut stdout, spec, 0, NAME_COL);
+        let _ = ui_seg(&mut stdout, spec, UI_FAINT, true, "Wallet");
+        let _ = ui_pad(&mut stdout, spec, NAME_COL + 6, ADDR_COL);
+        let _ = ui_seg(&mut stdout, spec, UI_FAINT, true, "Address");
+        let col = ui_right(
+            &mut stdout,
+            spec,
+            ADDR_COL + 7,
+            AMOUNT_END,
+            UI_FAINT,
+            true,
+            "Amount",
+        )
+        .unwrap_or(AMOUNT_END);
+        let _ = ui_right(&mut stdout, spec, col, SHARE_END, UI_FAINT, true, "Share");
+        let _ = writeln!(stdout);
+        let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, UI_RULE);
+        let _ = writeln!(stdout);
+
+        for row in &rows {
+            let _ = ui_pad(&mut stdout, spec, 0, NAME_COL);
+            let _ = ui_seg(&mut stdout, spec, UI_DIM, false, &row.name);
+            let name_end = NAME_COL + row.name.chars().count();
+            let _ = ui_pad(&mut stdout, spec, name_end, ADDR_COL.max(name_end + 2));
+            let _ = ui_seg(&mut stdout, spec, UI_VALUE, false, &row.address);
+            let _ = writeln!(stdout);
+
+            // A wallet whose balance could not be read keeps the row shape
+            // instead of falling out of the layout, and is excluded from the
+            // totals — which then say how many wallets they cover.
+            if let Some(err) = &row.error {
+                let _ = ui_pad(&mut stdout, spec, 0, STATE_COL);
+                let _ = ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_ORANGE,
+                    false,
+                    &format!("unavailable — {}", err),
+                );
+                let _ = writeln!(stdout);
+                continue;
+            }
+
+            let share = if total_spendable > 0.0 {
+                row.spendable / total_spendable
+            } else {
+                0.0
+            };
+            out!(
+                "spendable",
+                UI_DIM,
+                row.spendable,
+                if row.spendable > 0.0 {
+                    UI_CYAN
+                } else {
+                    UI_FAINT
+                },
+                row.spendable > 0.0,
+                Some(if row.spendable > 0.0 {
+                    format!("{:>5.1}%", share * 100.0)
+                } else {
+                    "    —".to_string()
+                }),
+                ""
+            );
+            let _ = GAUGE;
+
+            if row.maturing > 0.0 {
+                out!(
+                    "locked",
+                    UI_DIM,
+                    row.maturing,
+                    UI_ORANGE,
+                    false,
+                    None,
+                    // Just the wait. The full form ("1 reward · next 47 blocks
+                    // (≈3m36s)") runs ~34 characters past the note column and wraps
+                    // the row — worst on an unsynced wallet, where next_unlock is
+                    // measured against a stale height. The count and the block
+                    // number are not what someone typing `bal` is asking.
+                    &maturity_eta_short(row.next_unlock)
+                );
+            }
+            if row.pending > 0.0 {
+                out!(
+                    "outbound",
+                    UI_DIM,
+                    row.pending,
+                    UI_PINK,
+                    false,
+                    None,
+                    "in mempool"
+                );
+            }
+            // The identity only earns a line when there is something to add up.
+            if row.maturing > 0.0 || row.pending > 0.0 {
+                subrule!();
+                out!(
+                    "= confirmed",
+                    UI_DIM,
+                    row.confirmed,
+                    UI_GREEN,
+                    true,
+                    None,
+                    ""
+                );
+            }
+            // Money on its way IN, placed BELOW the confirmed identity and marked
+            // three separate ways — outdented past every other component, behind a
+            // dashed tick, and tagged `excluded`. An unmined credit is not yours,
+            // so no reading of this row should suggest it is in the total.
+            if row.incoming > 0.0 {
+                let _ = ui_pad(&mut stdout, spec, 0, ADDR_COL);
+                let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, "╌ ");
+                let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "incoming");
+                let text = format!("{:.8}", row.incoming);
+                let col = ui_right(
+                    &mut stdout,
+                    spec,
+                    ADDR_COL + 10,
+                    AMOUNT_END,
+                    UI_ORANGE,
+                    false,
+                    &text,
+                )
+                .unwrap_or(AMOUNT_END);
+                let _ = ui_seg(&mut stdout, spec, UI_ORANGE, false, " ♦");
+                let _ = col;
+                let _ = ui_seg(&mut stdout, spec, UI_FAINT, false, "  excluded");
+                let _ = writeln!(stdout);
+            }
+        }
+
+        let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, UI_RULE);
+        let _ = writeln!(stdout);
+        let _ = ui_pad(&mut stdout, spec, 0, NAME_COL);
+        let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "Total");
+        let covered = rows.iter().filter(|r| r.error.is_none()).count();
+        // "Total" occupies the wallet-name column, so what follows it belongs in the
+        // ADDRESS column — the same slot a wallet's address takes on its own row.
+        // Bracketed because it qualifies the Total rather than being a value.
+        //
+        // The bracket HANGS one column into the gutter so the first letter, not the
+        // punctuation, lands on ADDR_COL. Starting the "(" itself at ADDR_COL is
+        // arithmetically aligned but reads as indented, because every address below
+        // begins with a glyph that fills its cell and "(" does not.
+        let _ = ui_pad(&mut stdout, spec, NAME_COL + 5, ADDR_COL.saturating_sub(1));
+        let _ = ui_seg(
+            &mut stdout,
+            spec,
+            UI_FAINT,
+            false,
+            &if covered == rows.len() {
+                format!(
+                    "(sum of {} wallet{})",
+                    rows.len(),
+                    if rows.len() == 1 { "" } else { "s" }
+                )
+            } else {
+                format!("(sum of {} of {} wallets)", covered, rows.len())
+            },
+        );
+        let _ = writeln!(stdout);
+
+        // One decimal place silently lied at both ends: a spendable total that is
+        // 99.983% of confirmed printed "100.0%" — indistinguishable from the
+        // confirmed line's true 100% — and an outbound of 0.017% printed "0.0%",
+        // which reads as nothing at all. Saturate instead of rounding through:
+        // a value that is not the whole never claims to be, and a value that is
+        // not zero never claims to be.
+        let pct = |v: f64| {
+            if total_confirmed <= 0.0 {
+                return "    —".to_string();
+            }
+            let p = v / total_confirmed * 100.0;
+            if p > 0.0 && p < 0.05 {
+                " <0.1%".to_string()
+            } else if (99.95..100.0).contains(&p) {
+                ">99.9%".to_string()
+            } else {
+                format!("{:>5.1}%", p)
+            }
+        };
+        out!(
+            "spendable",
+            UI_DIM,
+            total_spendable,
+            UI_CYAN,
+            true,
+            Some(pct(total_spendable)),
+            ""
+        );
+        if total_maturing > 0.0 {
+            out!(
+                "locked",
+                UI_DIM,
+                total_maturing,
+                UI_ORANGE,
+                false,
+                Some(pct(total_maturing)),
+                ""
+            );
+        }
+        if total_pending > 0.0 {
+            out!(
+                "outbound",
+                UI_DIM,
+                total_pending,
+                UI_PINK,
+                false,
+                Some(pct(total_pending)),
+                ""
+            );
+        }
+        // Only draw the identity when there is something to add up. With nothing
+        // locked, outbound or arriving, confirmed IS spendable, and printing it
+        // again under a rule reads as a mistake rather than a subtotal.
+        if total_maturing > 0.0 || total_pending > 0.0 {
+            subrule!();
+            out!(
+                "= confirmed",
+                UI_DIM,
+                total_confirmed,
+                UI_GREEN,
+                true,
+                Some(pct(total_confirmed)),
+                ""
+            );
+        }
+        // Below the identity on purpose: not yet confirmed, so it is reported but
+        // never summed into the total.
+        if total_incoming > 0.0 {
+            let _ = ui_pad(&mut stdout, spec, 0, ADDR_COL);
+            let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, "╌ ");
+            let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "incoming");
+            let text = format!("{:.8}", total_incoming);
+            let _ = ui_right(
+                &mut stdout,
+                spec,
+                ADDR_COL + 10,
+                AMOUNT_END,
+                UI_ORANGE,
+                false,
+                &text,
+            );
+            let _ = ui_seg(&mut stdout, spec, UI_ORANGE, false, " ♦");
+            let _ = ui_seg(&mut stdout, spec, UI_FAINT, false, "  excluded");
+            let _ = writeln!(stdout);
+        }
+
+        let _ = writeln!(stdout);
+        let _ = stdout.reset();
+        let _ = stdout.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a9::blockchain::AddressTxEntry;
+    use crate::a9::blockchain::{ADDRESS_TX_FLAG_RECIPIENT, ADDRESS_TX_FLAG_SENDER};
+    use crate::a9::codec;
+    use std::io::{Error, ErrorKind};
+
+    /// One address-index row as `contacts` receives it: `flags` says whether the
+    /// scanned wallet was the sender, the recipient, or (self-send) both.
+    fn contact_row(
+        counterparty: &str,
+        flags: u8,
+        amount_units: i128,
+        timestamp: u64,
+    ) -> AddressTxEntry {
+        AddressTxEntry {
+            height: 1,
+            position: 0,
+            flags,
+            amount_units,
+            fee_units: 1_000,
+            timestamp,
+            counterparty: counterparty.to_string(),
+        }
+    }
+
+    #[test]
+    fn contacts_fold_one_entry_per_address_with_net_position() {
+        let own: HashSet<&str> = HashSet::new();
+        // Same counterparty, three rows: two in, one out. One contact, netted.
+        let rows = vec![
+            contact_row("aa", ADDRESS_TX_FLAG_RECIPIENT, 300, 10),
+            contact_row("aa", ADDRESS_TX_FLAG_RECIPIENT, 200, 30),
+            contact_row("aa", ADDRESS_TX_FLAG_SENDER, 100, 20),
+            contact_row("bb", ADDRESS_TX_FLAG_SENDER, 50, 5),
+        ];
+        let out = Mgmt::aggregate_contacts(&rows, &own);
+        assert_eq!(out.len(), 2, "one row per counterparty address");
+        let aa = &out[0];
+        assert_eq!(aa.address, "aa");
+        assert_eq!(aa.txs, 3);
+        assert_eq!(aa.in_units, 500);
+        assert_eq!(aa.out_units, 100);
+        assert_eq!(
+            aa.in_units - aa.out_units,
+            400,
+            "net is in - out, amounts only"
+        );
+        assert_eq!(
+            aa.last_seen, 30,
+            "last_seen is the NEWEST row, not the last"
+        );
+        // Frequency first: aa (3 txs) outranks bb (1) even though bb is older.
+        assert_eq!(out[1].address, "bb");
+    }
+
+    #[test]
+    fn contacts_exclude_coinbase_self_sends_and_your_own_wallets() {
+        let mine = "1111111111111111111111111111111111111111";
+        let own: HashSet<&str> = [mine].into_iter().collect();
+        let rows = vec![
+            // Coinbase: the counterparty is the reward system, not a peer.
+            contact_row("MINING_REWARDS", ADDRESS_TX_FLAG_RECIPIENT, 1_000, 10),
+            // Self-send: one row carrying BOTH flags.
+            contact_row(
+                "cc",
+                ADDRESS_TX_FLAG_SENDER | ADDRESS_TX_FLAG_RECIPIENT,
+                10,
+                11,
+            ),
+            // A transfer to another wallet this node holds.
+            contact_row(mine, ADDRESS_TX_FLAG_SENDER, 20, 12),
+            // The only real counterparty.
+            contact_row("dd", ADDRESS_TX_FLAG_SENDER, 30, 13),
+        ];
+        let out = Mgmt::aggregate_contacts(&rows, &own);
+        assert_eq!(out.len(), 1, "only genuine counterparties survive");
+        assert_eq!(out[0].address, "dd");
+        assert_eq!(out[0].out_units, 30);
+    }
+
+    #[test]
+    fn contacts_ordering_is_total_so_the_book_renders_identically_twice() {
+        let own: HashSet<&str> = HashSet::new();
+        // Two contacts tie on txs AND on last_seen; only the address breaks it.
+        let rows = vec![
+            contact_row("bbbb", ADDRESS_TX_FLAG_RECIPIENT, 1, 100),
+            contact_row("aaaa", ADDRESS_TX_FLAG_RECIPIENT, 1, 100),
+        ];
+        let first = Mgmt::aggregate_contacts(&rows, &own);
+        let second = Mgmt::aggregate_contacts(&rows, &own);
+        assert_eq!(first, second, "HashMap order must not leak into the view");
+        assert_eq!(first[0].address, "aaaa");
+    }
+
+    #[test]
+    fn contacts_saturate_instead_of_panicking_on_absurd_amounts() {
+        // Release builds panic on overflow: a display path must never be the
+        // thing that stops a node, however impossible the row looks.
+        let own: HashSet<&str> = HashSet::new();
+        let rows = vec![
+            contact_row("ee", ADDRESS_TX_FLAG_RECIPIENT, i128::MAX, 1),
+            contact_row("ee", ADDRESS_TX_FLAG_RECIPIENT, i128::MAX, 2),
+        ];
+        let out = Mgmt::aggregate_contacts(&rows, &own);
+        assert_eq!(out[0].in_units, i128::MAX);
+        assert_eq!(out[0].txs, 2);
+    }
+
+    /// `validate_unique_wallet_names` enforces unique NAMES, not unique addresses,
+    /// so the same address can be loaded twice under different names. The scan must
+    /// walk distinct ADDRESSES — walking `wallets` would read that address's index
+    /// twice and double every number in the book. This pins the set the command
+    /// builds (`own`) as the deduplicating step.
+    #[test]
+    fn one_address_loaded_under_two_names_is_scanned_once() {
+        let addr = "9999999999999999999999999999999999999999";
+        let mut wallets: HashMap<String, Wallet> = HashMap::new();
+        for name in ["savings", "the same wallet again"] {
+            let mut w = Wallet::new(None).expect("test wallet");
+            w.address = addr.to_string();
+            wallets.insert(name.to_string(), w);
+        }
+        assert_eq!(wallets.len(), 2, "two records, one address");
+        // Calls the PRODUCTION helper the scan loop uses — rebuilding the set here
+        // would only re-test the test.
+        let scanned = Mgmt::wallet_addresses(&wallets);
+        assert_eq!(
+            scanned.len(),
+            1,
+            "the scan list must collapse duplicate addresses, or every total doubles"
+        );
+        assert!(scanned.contains(addr));
+    }
+
+    /// The double-count bug lived in the SCAN LOOP, not in the dedup set: it
+    /// iterated wallet records, and two records can carry one address. This drives
+    /// the real loop and asserts on what it asked for, so reverting the loop to
+    /// per-record iteration fails here even if the dedup helper is untouched.
+    #[test]
+    fn the_scan_loop_reads_each_address_exactly_once() {
+        let a = "1111111111111111111111111111111111111111";
+        let b = "2222222222222222222222222222222222222222";
+        let own: HashSet<&str> = [a, b].into_iter().collect();
+
+        let mut asked: Vec<String> = Vec::new();
+        let (rows, capped) = Mgmt::collect_contact_rows(&own, |address| {
+            asked.push(address.to_string());
+            vec![contact_row("cc", ADDRESS_TX_FLAG_RECIPIENT, 5, 1)]
+        });
+
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec![a.to_string(), b.to_string()],
+            "one fetch per address"
+        );
+        assert_eq!(rows.len(), 2, "every fetched row is kept");
+        assert!(!capped, "a one-row address is nowhere near the cap");
+    }
+
+    /// Reaching the per-address cap must be reported, not swallowed: the header
+    /// turns it into a trailing `+` so a truncated book never reads as complete.
+    #[test]
+    fn filling_the_scan_cap_is_reported_not_swallowed() {
+        let a = "3333333333333333333333333333333333333333";
+        let own: HashSet<&str> = [a].into_iter().collect();
+        let full = vec![
+            contact_row("dd", ADDRESS_TX_FLAG_RECIPIENT, 1, 1);
+            Mgmt::CONTACTS_SCAN_CAP_PER_ADDRESS
+        ];
+        let (rows, capped) = Mgmt::collect_contact_rows(&own, |_| full.clone());
+        assert_eq!(rows.len(), Mgmt::CONTACTS_SCAN_CAP_PER_ADDRESS);
+        assert!(capped, "a filled window must set the disclosure flag");
+    }
+
+    #[test]
+    fn contacts_on_an_empty_book_are_empty_not_a_panic() {
+        let own: HashSet<&str> = HashSet::new();
+        assert!(Mgmt::aggregate_contacts(&[], &own).is_empty());
+    }
+
+    /// ON-DISK WALLET KEY FORMAT — FROZEN.
+    ///
+    /// These bytes are what `persist_wallet_keys` writes and `load_wallets` reads.
+    /// A user's ability to spend depends on this file staying readable, so the
+    /// format is pinned literally rather than round-tripped through the same code
+    /// that produces it: a round-trip test passes even when both sides change
+    /// together, which is exactly the regression that would strand funds.
+    ///
+    /// Covers both branches, because they are structurally different on disk: an
+    /// encrypted wallet's `private_key` is ciphertext, an unencrypted wallet's is
+    /// the RAW combined key material. If a change to secret-holding types alters
+    /// either byte sequence, this fails before anyone's key file does.
+    const FROZEN_ENCRYPTED_WALLET_JSON: &str = r#"[{"wallet_name":"encrypted-fixture","wallet_address":"1111111111111111111111111111111111111111","private_key":[1,2,3,4,5,6,7,8],"last_sync_timestamp":1700000000,"is_encrypted":true,"key_verification_hash":[9,9,9,9]}]"#;
+    const FROZEN_PLAINTEXT_WALLET_JSON: &str = r#"[{"wallet_name":"plaintext-fixture","wallet_address":"2222222222222222222222222222222222222222","private_key":[254,253,252],"last_sync_timestamp":1700000001,"is_encrypted":false,"key_verification_hash":[7,7]}]"#;
+    const FROZEN_NO_KEY_WALLET_JSON: &str = r#"[{"wallet_name":"keyless-fixture","wallet_address":"3333333333333333333333333333333333333333","private_key":null,"last_sync_timestamp":1700000002,"is_encrypted":false,"key_verification_hash":[]}]"#;
+
+    fn wallet_key_record(name: &str, is_encrypted: bool) -> WalletKeyData {
+        WalletKeyData::new(
+            name.to_string(),
+            "1".repeat(40),
+            Some(Zeroizing::new(vec![1, 2, 3, 4])),
+            is_encrypted,
+        )
+    }
+
+    #[test]
+    fn wallet_name_preflight_rejects_ambiguous_durable_records() {
+        let records = vec![
+            wallet_key_record("vault", true),
+            wallet_key_record("ordinary", false),
+            wallet_key_record("vault", false),
+        ];
+
+        let error = validate_unique_wallet_names(&records)
+            .expect_err("two durable records must never share one CLI wallet name")
+            .to_string();
+        assert!(error.contains("duplicate wallet name"));
+        assert!(error.contains("vault"));
+        assert!(error.contains("Refusing to load or modify"));
+    }
+
+    #[test]
+    fn explicit_new_wallet_name_checks_records_skipped_from_memory() {
+        // This is the original failure shape: `cold_vault` is encrypted on disk but absent from the
+        // loaded-name set because the process started without its passphrase.
+        let records = vec![
+            wallet_key_record("default_wallet", false),
+            wallet_key_record("cold_vault", true),
+        ];
+        let loaded_names: HashSet<&str> = HashSet::from(["default_wallet"]);
+
+        let error = select_new_wallet_name(Some("cold_vault".to_string()), &loaded_names, &records)
+            .expect_err("an encrypted disk-only wallet still owns its name")
+            .to_string();
+        assert_eq!(error, "Duplicate wallet name");
+
+        assert_eq!(
+            select_new_wallet_name(Some("new_vault".to_string()), &loaded_names, &records)
+                .expect("an unused explicit name remains valid"),
+            "new_vault"
+        );
+    }
+
+    #[test]
+    fn automatic_wallet_name_advances_past_disk_only_collision() {
+        // One loaded wallet preserves the historical starting candidate `wallet_2`; a skipped
+        // durable `wallet_2` must make selection advance, not fail or append a duplicate.
+        let records = vec![
+            wallet_key_record("default_wallet", false),
+            wallet_key_record("wallet_2", true),
+        ];
+        let loaded_names: HashSet<&str> = HashSet::from(["default_wallet"]);
+
+        assert_eq!(
+            select_new_wallet_name(None, &loaded_names, &records)
+                .expect("automatic naming should find the next durable-free name"),
+            "wallet_3"
+        );
+    }
+
+    /// Serializing a `WalletKeyData` must reproduce the frozen bytes EXACTLY --
+    /// field names, field order, and the JSON representation of the key bytes.
+    /// `Zeroizing<Vec<u8>>` must serialize as a bare array, not as a wrapper
+    /// object, or every existing key file becomes unreadable.
+    #[test]
+    fn wallet_key_file_serialization_is_byte_identical_to_the_frozen_format() {
+        for frozen in [
+            FROZEN_ENCRYPTED_WALLET_JSON,
+            FROZEN_PLAINTEXT_WALLET_JSON,
+            FROZEN_NO_KEY_WALLET_JSON,
+        ] {
+            let parsed: Vec<WalletKeyData> =
+                serde_json::from_str(frozen).expect("frozen wallet fixture must parse");
+            let reserialized =
+                serde_json::to_string(&parsed).expect("wallet key data must serialize");
+            assert_eq!(
+                reserialized, frozen,
+                "on-disk wallet key format changed; existing key files would break"
+            );
+        }
+    }
+
+    /// The read side must recover the key material unchanged. Byte equality is
+    /// asserted against literals, not against a value derived from the same
+    /// deserialization, so a symmetric corruption cannot pass.
+    #[test]
+    fn frozen_wallet_fixtures_read_back_with_intact_key_material() {
+        let encrypted: Vec<WalletKeyData> =
+            serde_json::from_str(FROZEN_ENCRYPTED_WALLET_JSON).expect("encrypted fixture");
+        assert_eq!(encrypted.len(), 1);
+        assert_eq!(encrypted[0].wallet_name, "encrypted-fixture");
+        assert!(encrypted[0].is_encrypted);
+        assert_eq!(
+            encrypted[0].private_key.as_ref().map(|k| k.as_slice()),
+            Some([1u8, 2, 3, 4, 5, 6, 7, 8].as_slice()),
+            "ciphertext must survive the round trip byte for byte"
+        );
+        assert_eq!(encrypted[0].last_sync_timestamp, 1_700_000_000);
+        assert_eq!(encrypted[0].key_verification_hash, vec![9u8, 9, 9, 9]);
+
+        let plaintext: Vec<WalletKeyData> =
+            serde_json::from_str(FROZEN_PLAINTEXT_WALLET_JSON).expect("plaintext fixture");
+        assert!(!plaintext[0].is_encrypted);
+        assert_eq!(
+            plaintext[0].private_key.as_ref().map(|k| k.as_slice()),
+            Some([254u8, 253, 252].as_slice()),
+            "raw key material must survive the round trip byte for byte"
+        );
+
+        let keyless: Vec<WalletKeyData> =
+            serde_json::from_str(FROZEN_NO_KEY_WALLET_JSON).expect("keyless fixture");
+        assert!(keyless[0].private_key.is_none());
+        assert!(keyless[0].key_verification_hash.is_empty());
+    }
+
+    /// `key_verification_hash` gates whether a loaded key is trusted, so the way
+    /// it is derived is part of the file contract: SHA-256 over the key bytes
+    /// followed by the encryption flag. A change here would reject every stored
+    /// wallet as tampered.
+    #[test]
+    fn key_verification_hash_derivation_is_stable() {
+        let key = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let data = WalletKeyData::new(
+            "hash-fixture".to_string(),
+            "1".repeat(40),
+            Some(Zeroizing::new(key.clone())),
+            true,
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(&key);
+        hasher.update([1u8]);
+        assert_eq!(data.key_verification_hash, hasher.finalize().to_vec());
+
+        let empty = WalletKeyData::new("none".to_string(), "1".repeat(40), None, false);
+        assert_eq!(
+            empty.key_verification_hash,
+            vec![0u8; 32],
+            "the keyless sentinel hash is part of the format"
+        );
+    }
+
+    /// Secret-bearing wallet key data must never render its key material. This is
+    /// the type-level guarantee: a future `{:?}` in a log or a panic backtrace
+    /// cannot print the bytes.
+    #[test]
+    fn wallet_key_data_debug_redacts_key_material() {
+        let mut data = WalletKeyData::new(
+            "redaction-fixture".to_string(),
+            "4".repeat(40),
+            Some(Zeroizing::new(vec![0xAB, 0xCD, 0xEF])),
+            false,
+        );
+        // Freeze the only non-deterministic field. `new` stamps the live epoch
+        // second, and the substring assertions below scan the WHOLE rendering —
+        // an arbitrary timestamp can contain any decimal fragment, which made
+        // this test fail on unlucky seconds (first seen as a CI-only "flake").
+        data.last_sync_timestamp = 1_000_000_000;
+        let rendered = format!("{:?}", data);
+        assert!(
+            rendered.contains("<redacted 3 bytes>"),
+            "the redaction placeholder is the pinned Debug form: {rendered}"
+        );
+        assert!(
+            !rendered.contains("171") && !rendered.contains("205") && !rendered.contains("239"),
+            "key bytes must not appear in Debug output: {rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("abcdef"),
+            "key bytes must not appear in any encoding: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "redaction must be visible rather than silent: {rendered}"
+        );
+        assert!(
+            rendered.contains("redaction-fixture"),
+            "non-secret fields stay legible for diagnostics: {rendered}"
+        );
+    }
+
+    fn entry(counterparty: &str, height: u32, sender: bool) -> AddressTxEntry {
+        AddressTxEntry {
+            height,
+            position: 0,
+            // 1 = sender, 2 = recipient, mirroring the flag bits the index writes.
+            flags: if sender { 1 } else { 2 },
+            amount_units: 100_000_000,
+            fee_units: 50_000,
+            timestamp: 1_700_000_000 + height as u64,
+            counterparty: counterparty.to_string(),
+        }
+    }
+
+    // The account screen prints three counterparties in FULL, so which three it picks is
+    // worth pinning. `recent` arrives newest-first.
+    #[test]
+    fn counterparties_pick_the_latest_in_each_direction() {
+        let recent = vec![
+            entry("bbbb", 300, true),  // newest: outbound
+            entry("aaaa", 299, false), // inbound
+            entry("cccc", 298, true),  // older outbound — must lose to bbbb
+            entry("aaaa", 297, false),
+        ];
+        let (last_in, last_out, frequent) = notable_counterparties(&recent);
+        assert_eq!(last_in.unwrap().counterparty, "aaaa");
+        assert_eq!(
+            last_out.unwrap().counterparty,
+            "bbbb",
+            "the LATEST outbound, not the first seen"
+        );
+        assert_eq!(frequent.unwrap(), ("aaaa", 2));
+    }
+
+    // A miner's history is mostly coinbase. MINING_REWARDS is not a counterparty anyone
+    // deals with, and left in it wins `frequent` outright and hides the real answer.
+    #[test]
+    fn counterparties_ignore_the_coinbase() {
+        let mut recent: Vec<AddressTxEntry> = (0..20)
+            .map(|i| entry("MINING_REWARDS", 400 - i, false))
+            .collect();
+        recent.push(entry("dddd", 300, false));
+        recent.push(entry("dddd", 299, true));
+
+        let (last_in, last_out, frequent) = notable_counterparties(&recent);
+        assert_eq!(
+            last_in.unwrap().counterparty,
+            "dddd",
+            "coinbase is not an inbound counterparty"
+        );
+        assert_eq!(last_out.unwrap().counterparty, "dddd");
+        assert_eq!(
+            frequent.unwrap(),
+            ("dddd", 2),
+            "20 coinbase rows must not outvote the real counterparty"
+        );
+    }
+
+    // One transaction is not a pattern; calling it `frequent` would make the row noise.
+    #[test]
+    fn a_single_appearance_is_not_frequent() {
+        let recent = vec![entry("aaaa", 300, false), entry("bbbb", 299, true)];
+        let (last_in, last_out, frequent) = notable_counterparties(&recent);
+        assert!(last_in.is_some() && last_out.is_some());
+        assert!(
+            frequent.is_none(),
+            "no repeat counterparty means no frequent row"
+        );
+    }
+
+    // Ties must not follow hash order, or the row changes between runs on identical data.
+    #[test]
+    fn a_frequency_tie_breaks_deterministically() {
+        let recent = vec![
+            entry("bbbb", 300, false),
+            entry("aaaa", 299, false),
+            entry("bbbb", 298, false),
+            entry("aaaa", 297, false),
+        ];
+        let first = notable_counterparties(&recent).2.unwrap();
+        for _ in 0..40 {
+            assert_eq!(notable_counterparties(&recent).2.unwrap(), first);
+        }
+    }
+
+    // An address with no activity yet renders no section at all.
+    #[test]
+    fn an_empty_history_yields_nothing_to_show() {
+        let (a, b, c) = notable_counterparties(&[]);
+        assert!(a.is_none() && b.is_none() && c.is_none());
+    }
+
+    // `ui_money(x, 4)` is 15 columns only while the whole part fits 4 digits. The
+    // account screen used to pad with a hardcoded 15, so every extra digit shoved
+    // its right-hand column one cell — a real drift at 10,000 coins, which is
+    // ordinary mining territory. Pin the widths the layout now measures.
+    #[test]
+    fn ui_money_width_grows_past_four_whole_digits() {
+        // chars(), not len(): the ♦ is three bytes and one display column.
+        assert_eq!(ui_money(0.0, 4).chars().count(), 15);
+        assert_eq!(ui_money(9_999.999_999_99, 4).chars().count(), 15);
+        assert_eq!(
+            ui_money(10_000.0, 4).chars().count(),
+            16,
+            "10k adds a column"
+        );
+        assert_eq!(ui_money(123_456.789, 4).chars().count(), 17);
+        assert_eq!(ui_money(33_554_432.0, 4).chars().count(), 19);
+        // byte length would over-count the ♦ by two and mis-place every column.
+        assert_eq!(ui_money(0.0, 4).len(), 17);
+        assert_ne!(ui_money(0.0, 4).len(), ui_money(0.0, 4).chars().count());
+    }
+
+    #[test]
+    fn wallet_coin_parser_is_exact_and_never_silently_rounds() {
+        assert_eq!(parse_coin_units("1", "amount").unwrap(), 100_000_000);
+        assert_eq!(parse_coin_units("1.2", "amount").unwrap(), 120_000_000);
+        assert_eq!(
+            parse_coin_units("1.23456789", "amount").unwrap(),
+            123_456_789
+        );
+        assert_eq!(parse_coin_units(".0001", "fee").unwrap(), 10_000);
+
+        for invalid in ["", ".", "-1", "+1", "1e-4", "1.2.3", "0.000000001"] {
+            assert!(
+                parse_coin_units(invalid, "value").is_err(),
+                "{invalid:?} must not be silently rounded or reinterpreted"
+            );
+        }
+    }
+
+    #[test]
+    fn create_without_fee_defers_to_the_live_estimator() {
+        // No --fee no longer resolves to the historical amount/1776 ratio at
+        // parse time: the parser stays a pure string function and returns None,
+        // and the handler prices the fee off the live mempool at send time
+        // (Blockchain::fee_estimate — anchor on a quiet network, marginal+1
+        // under congestion, clamped to the safety ceiling by construction).
+        let auto = parse_create_transaction_command("create sender recipient 0.5").unwrap();
+        assert_eq!(auto.amount_units, 50_000_000);
+        assert_eq!(auto.fee_units, None, "auto fee is resolved by the handler");
+
+        let large = parse_create_transaction_command("create sender recipient 1000000").unwrap();
+        assert_eq!(
+            large.fee_units, None,
+            "no amount-proportional default remains"
+        );
+    }
+
+    #[test]
+    fn create_command_keeps_existing_syntax_and_accepts_exact_fee_override() {
+        let existing = parse_create_transaction_command("create sender recipient 0.5").unwrap();
+        assert_eq!(existing.amount_units, 50_000_000);
+        assert_eq!(existing.fee_units, None, "no --fee = auto (estimator)");
+
+        let explicit =
+            parse_create_transaction_command("create sender recipient 2 --fee 0.001").unwrap();
+        assert_eq!(explicit.amount_units, 200_000_000);
+        assert_eq!(explicit.fee_units, Some(100_000));
+
+        let equals =
+            parse_create_transaction_command("create sender recipient 2 --fee=0.0005").unwrap();
+        assert_eq!(equals.fee_units, Some(50_000));
+
+        for alias in ["send", "transfer"] {
+            let command = format!("{alias} sender recipient 2 --fee 0.001");
+            let parsed = parse_create_transaction_command(&command).unwrap();
+            assert_eq!(parsed.amount_units, 200_000_000);
+            assert_eq!(parsed.fee_units, Some(100_000));
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_wallet_values_survive_signed_json_and_codec_round_trips() {
+        let wallet = Wallet::new(None).expect("test wallet");
+        let mut tx = Transaction {
+            sender: wallet.address.clone(),
+            recipient: "22".repeat(20),
+            amount_units: 123_456_789,
+            fee_units: 28_153,
+            timestamp: 1_783_600_000,
+            signature: None,
+            pub_key: wallet.get_public_key_hex().await,
+            sig_hash: None,
+        };
+        let signed_message = format!(
+            "{}:{}:{:.8}:{:.8}:{}",
+            tx.sender,
+            tx.recipient,
+            tx.amount(),
+            tx.fee(),
+            tx.timestamp
+        );
+        tx.signature = wallet.sign_transaction(signed_message.as_bytes()).await;
+        let signature = hex::decode(tx.signature.as_deref().expect("signed")).expect("hex");
+        tx.sig_hash = Some(Transaction::signature_hash_hex(&signature));
+        assert!(
+            tx.is_valid(tx.pub_key.as_deref().expect("public key")),
+            "source transaction signature"
+        );
+
+        let json = serde_json::to_vec(&tx).expect("transaction JSON");
+        let from_json: Transaction =
+            serde_json::from_slice(&json).expect("transaction JSON round-trip");
+        assert_eq!(from_json.amount_units, tx.amount_units);
+        assert_eq!(from_json.fee_units, tx.fee_units);
+        assert!(from_json.is_valid(from_json.pub_key.as_deref().unwrap()));
+
+        let encoded = codec::serialize(&tx).expect("transaction codec");
+        let from_codec: Transaction =
+            codec::deserialize(&encoded).expect("transaction codec round-trip");
+        assert_eq!(from_codec.amount_units, tx.amount_units);
+        assert_eq!(from_codec.fee_units, tx.fee_units);
+        assert!(from_codec.is_valid(from_codec.pub_key.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn create_command_fee_guards_are_deterministic_for_automation() {
+        let floor =
+            parse_create_transaction_command("create sender recipient 1 --fee 0.0001").unwrap();
+        assert_eq!(floor.fee_units, Some(MIN_RELAY_FEE_UNITS));
+
+        let safety_limit =
+            parse_create_transaction_command("create sender recipient 1 --fee 0.01").unwrap();
+        assert_eq!(
+            safety_limit.fee_units,
+            Some(EXPLICIT_FEE_SAFETY_LIMIT_UNITS)
+        );
+
+        assert!(
+            parse_create_transaction_command("create sender recipient 1 --fee 0.00009999")
+                .unwrap_err()
+                .contains("relay floor")
+        );
+        assert!(
+            parse_create_transaction_command("create sender recipient 1 --fee 0.01000001")
+                .unwrap_err()
+                .contains("safety limit")
+        );
+
+        for malformed in [
+            "create sender recipient 1 --fee",
+            "create sender recipient 1 --fee 0.001 --fee 0.002",
+            "create sender recipient 1 --unknown",
+            "create sender recipient 1 --fee 1e-4",
+        ] {
+            assert!(
+                parse_create_transaction_command(malformed).is_err(),
+                "{malformed:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn wallet_rejects_noncanonical_addresses_before_signing() {
+        let sender = "ab".repeat(20);
+        let recipient = "cd".repeat(20);
+        assert!(validate_wallet_transaction_addresses(&sender, &recipient).is_ok());
+
+        assert!(
+            validate_wallet_transaction_addresses(&sender.to_uppercase(), &recipient)
+                .unwrap_err()
+                .contains("sender address")
+        );
+        assert!(
+            validate_wallet_transaction_addresses(&sender, &recipient.to_uppercase())
+                .unwrap_err()
+                .contains("recipient address")
+        );
+        assert!(
+            validate_wallet_transaction_addresses(&sender, "not-an-address")
+                .unwrap_err()
+                .contains("recipient address")
+        );
+    }
+
+    // H4: only a NotFound read error is a genuine first run. Every other read error must NOT be
+    // treated as first-run — doing so would overwrite an existing private.key and destroy funds.
+    #[test]
+    fn only_notfound_read_error_is_first_run() {
+        assert!(load_error_is_first_run(&Error::from(ErrorKind::NotFound)));
+
+        assert!(!load_error_is_first_run(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!load_error_is_first_run(&Error::new(
+            ErrorKind::InvalidData,
+            "non-utf8 key file"
+        )));
+        assert!(!load_error_is_first_run(&Error::from(ErrorKind::Other)));
+        assert!(!load_error_is_first_run(&Error::new(
+            ErrorKind::WouldBlock,
+            "AV share-lock"
+        )));
+    }
+
+    // H2: persisting the wallet key is a PRECONDITION for creating the wallet. A write failure or
+    // timeout must surface as Err (never be swallowed), so the caller never registers/returns a
+    // wallet whose ML-DSA seed exists only in RAM and would be lost on the next launch.
+    #[tokio::test]
+    async fn persist_wallet_keys_surfaces_write_failure_and_persists_on_success() {
+        // FAILURE (fault injection): a path whose parent directory does not exist makes
+        // write_secret_file's temp-file create fail, so persist_wallet_keys must return Err.
+        let bad_path = "/nonexistent-a9-wallet-test-dir-zzq/private.key";
+        assert!(
+            persist_wallet_keys(bad_path, &[]).await.is_err(),
+            "a wallet-key write failure must surface as Err, never be swallowed"
+        );
+        assert!(!std::path::Path::new(bad_path).exists());
+
+        // SUCCESS: a writable path persists the key set and returns Ok.
+        let ok_path =
+            std::env::temp_dir().join(format!("a9-persist-ok-{}.key", std::process::id()));
+        let ok_path_str = ok_path.to_str().expect("temp path is valid utf-8");
+        assert!(
+            persist_wallet_keys(ok_path_str, &[]).await.is_ok(),
+            "a writable path must persist the key set successfully"
+        );
+        assert!(ok_path.exists());
+        let _ = std::fs::remove_file(&ok_path);
+    }
+
+    #[tokio::test]
+    async fn persistence_rejects_duplicate_names_without_touching_the_existing_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "a9-persist-duplicate-{}-{}.key",
+            std::process::id(),
+            unique
+        ));
+        std::fs::write(&path, b"existing-wallet-file").expect("seed protected target");
+
+        let duplicate_records = vec![
+            wallet_key_record("same-name", false),
+            wallet_key_record("same-name", true),
+        ];
+        let error = persist_wallet_keys(
+            path.to_str().expect("temp path is valid utf-8"),
+            &duplicate_records,
+        )
+        .await
+        .expect_err("the durable write boundary must reject aliases")
+        .to_string();
+
+        assert!(error.contains("duplicate wallet name"));
+        assert_eq!(
+            std::fs::read(&path).expect("existing target remains readable"),
+            b"existing-wallet-file",
+            "validation must happen before the temporary file or target is written"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    // A record set with colliding addresses must not pass the durable boundary. The name check
+    // runs first, so this test uses records whose names differ and whose addresses collide.
+    #[tokio::test]
+    async fn persistence_rejects_duplicate_addresses() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "a9-persist-dup-address-{}-{}.key",
+            std::process::id(),
+            unique
+        ));
+        std::fs::write(&path, b"existing-wallet-file").expect("seed protected target");
+
+        let shared_address = "2".repeat(40);
+        let records = vec![
+            WalletKeyData::new(
+                "first".to_string(),
+                shared_address.clone(),
+                Some(Zeroizing::new(vec![1, 2, 3, 4])),
+                false,
+            ),
+            WalletKeyData::new(
+                "second".to_string(),
+                shared_address.clone(),
+                Some(Zeroizing::new(vec![5, 6, 7, 8])),
+                false,
+            ),
+        ];
+
+        let error = persist_wallet_keys(path.to_str().expect("temp path is valid utf-8"), &records)
+            .await
+            .expect_err("the durable write boundary must reject duplicate addresses")
+            .to_string();
+        assert!(error.contains("duplicate wallet address"), "got: {error}");
+
+        // The existing file must be left untouched.
+        assert_eq!(
+            std::fs::read(&path).expect("target still readable"),
+            b"existing-wallet-file"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Distinct addresses pass -- confirms the new invariant does not block the legitimate case.
+    #[tokio::test]
+    async fn persistence_accepts_distinct_addresses() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "a9-persist-ok-address-{}-{}.key",
+            std::process::id(),
+            unique
+        ));
+        let records = vec![
+            WalletKeyData::new("first".to_string(), "3".repeat(40), None, false),
+            WalletKeyData::new("second".to_string(), "4".repeat(40), None, false),
+        ];
+        assert!(
+            persist_wallet_keys(path.to_str().expect("temp path is valid utf-8"), &records)
+                .await
+                .is_ok()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Happy path: surrounding whitespace and uppercase are accepted. A human pastes this.
+    #[test]
+    fn seed_parser_accepts_a_64_character_hex_seed() {
+        let seed = "07".repeat(32);
+        let parsed = parse_address_seed_hex(&format!("  {}  ", seed.to_uppercase()))
+            .expect("a 64-char hex seed must parse");
+        assert_eq!(parsed.len(), 32);
+        assert_eq!(hex::encode(parsed.as_slice()), seed);
+    }
+
+    // The hazard from design doc 3.2. A GUI master seed is the root of a derivation tree, not
+    // an address seed. Accepting it silently leaves the user believing they moved the whole
+    // wallet while the rest of their addresses stay behind.
+    #[test]
+    fn seed_parser_rejects_a_gui_master_seed_with_an_explanation() {
+        let master = format!("a9m1{}{}", "07".repeat(32), "deadbeef");
+        let error = parse_address_seed_hex(&master)
+            .expect_err("a master seed must not be importable as one address")
+            .to_string();
+        assert!(error.contains("master seed"), "got: {error}");
+        assert!(error.contains("GUI"), "got: {error}");
+    }
+
+    // Length and character validation. Accepting a truncated value builds an address nobody
+    // can spend from.
+    #[test]
+    fn seed_parser_rejects_malformed_input() {
+        assert!(parse_address_seed_hex("").is_err());
+        assert!(parse_address_seed_hex(&"07".repeat(31)).is_err());
+        assert!(parse_address_seed_hex(&"07".repeat(33)).is_err());
+        assert!(parse_address_seed_hex(&"zz".repeat(32)).is_err());
+    }
+
+    // A seed in an error message leaves the key in logs and on screen. EVERY rejection path has
+    // to stay silent about the input, not just whichever one a single test happens to take, so a
+    // future edit that interpolates the input anywhere fails here. Checks 16-character windows
+    // rather than whole-string equality, because a partial echo leaks just as badly.
+    #[test]
+    fn seed_parser_errors_never_echo_the_input() {
+        let cases = [
+            ("master seed", format!("a9m1{}deadbeef", "ab".repeat(32))),
+            ("too short", "ab".repeat(31)),
+            ("too long", "ab".repeat(33)),
+            ("non-hex", "zz".repeat(32)),
+        ];
+
+        for (label, secret) in cases {
+            let error = parse_address_seed_hex(&secret)
+                .expect_err("every case here is invalid")
+                .to_string();
+            let leaked = secret.as_bytes().windows(16).any(|window| {
+                std::str::from_utf8(window)
+                    .map(|fragment| error.contains(fragment))
+                    .unwrap_or(false)
+            });
+            assert!(!leaked, "{label}: the error must not echo key material");
+        }
+    }
+
+    // The most important regression test here: an import must not erase the other wallets in
+    // the file. An implementation that calls persist_wallet_keys directly fails in exactly
+    // this way.
+    #[tokio::test]
+    async fn import_preserves_the_wallets_already_in_the_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "a9-import-merge-{}-{}.key",
+            std::process::id(),
+            unique
+        ));
+        let path_str = path.to_str().expect("temp path is valid utf-8").to_string();
+
+        let existing = vec![WalletKeyData::new(
+            "existing_wallet".to_string(),
+            "5".repeat(40),
+            Some(Zeroizing::new(vec![9, 9, 9])),
+            false,
+        )];
+        std::fs::write(
+            &path,
+            serde_json::to_string(&existing).expect("fixture serializes"),
+        )
+        .expect("fixture written");
+
+        let mut wallets = HashMap::new();
+        let seed_hex = "07".repeat(32);
+        let imported = import_wallet_from_seed_into(
+            &path_str,
+            &mut wallets,
+            &seed_hex,
+            None,
+            Some("imported".to_string()),
+        )
+        .await
+        .expect("import must succeed");
+
+        let after: Vec<WalletKeyData> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("file readable"))
+                .expect("file parses");
+        assert_eq!(
+            after.len(),
+            2,
+            "the existing wallet must survive the import"
+        );
+        let survivor = after
+            .iter()
+            .find(|w| w.wallet_name == "existing_wallet")
+            .expect("the pre-existing wallet must still be in the file");
+        // Its KEY BYTES have to survive, not just its name -- an implementation that kept the
+        // record but dropped or corrupted the key would pass a name-only assertion, and the funds
+        // would be just as gone.
+        assert_eq!(
+            survivor.private_key.as_ref().map(|k| k.to_vec()),
+            Some(vec![9, 9, 9]),
+            "the surviving wallet's key material must be unchanged"
+        );
+        assert!(after.iter().any(|w| w.wallet_address == imported.address));
+        assert!(wallets.contains_key("imported"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Importing the same seed twice would put one address in two records. Refuse.
+    #[tokio::test]
+    async fn import_rejects_a_seed_whose_address_is_already_present() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "a9-import-dup-{}-{}.key",
+            std::process::id(),
+            unique
+        ));
+        let path_str = path.to_str().expect("temp path is valid utf-8").to_string();
+        std::fs::write(&path, b"[]").expect("empty fixture");
+
+        let mut wallets = HashMap::new();
+        let seed_hex = "07".repeat(32);
+
+        import_wallet_from_seed_into(
+            &path_str,
+            &mut wallets,
+            &seed_hex,
+            None,
+            Some("one".to_string()),
+        )
+        .await
+        .expect("first import succeeds");
+        let before = std::fs::read(&path).expect("file readable after the first import");
+        let error = import_wallet_from_seed_into(
+            &path_str,
+            &mut wallets,
+            &seed_hex,
+            None,
+            Some("two".to_string()),
+        )
+        .await
+        .expect_err("the second import of the same seed must be refused")
+        .to_string();
+        assert!(error.contains("already"), "got: {error}");
+
+        // Compare the file's exact bytes, not just its record count: a count of 1 would also hold
+        // for an implementation that re-serialised and rewrote the file before refusing.
+        assert_eq!(
+            std::fs::read(&path).expect("file readable"),
+            before,
+            "the refused import must not write to the file at all"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A master seed must be refused before the file is touched at all.
+    #[tokio::test]
+    async fn import_rejects_a_gui_master_seed_before_touching_the_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "a9-import-master-{}-{}.key",
+            std::process::id(),
+            unique
+        ));
+        let path_str = path.to_str().expect("temp path is valid utf-8").to_string();
+        // "[ ]" rather than "[]": serde normalises the space away on any rewrite, so the byte
+        // comparison below actually discriminates. With "[]" an implementation that persisted the
+        // still-empty vector before refusing would serialise to exactly "[]" and pass.
+        std::fs::write(&path, b"[ ]").expect("empty fixture");
+
+        let mut wallets = HashMap::new();
+        let master = format!("a9m1{}{}", "07".repeat(32), "deadbeef");
+        assert!(
+            import_wallet_from_seed_into(&path_str, &mut wallets, &master, None, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("file readable"),
+            b"[ ]",
+            "a rejected import must not write"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Export and import must be inverses. This round trip is the whole bridge's contract.
+    #[tokio::test]
+    async fn export_then_import_reproduces_the_same_address() {
+        let mut wallets = HashMap::new();
+        let seed = vec![21u8; mldsa::SECRET_KEY_BYTES];
+        let wallet = Wallet::from_seed(&seed, None).expect("wallet from seed");
+        let address = wallet.address.clone();
+        wallets.insert("source".to_string(), wallet);
+
+        let exported = export_wallet_seed_from(&wallets, "source", None)
+            .await
+            .expect("an unencrypted wallet exports its seed");
+        assert_eq!(exported.as_str(), hex::encode(&seed));
+
+        let reimported = Wallet::from_seed(
+            &parse_address_seed_hex(&exported).expect("exported seed parses"),
+            None,
+        )
+        .expect("re-import");
+        assert_eq!(reimported.address, address);
+    }
+
+    // An unknown wallet name is an error. Returning something empty would let a user save an
+    // empty backup and believe they had one.
+    #[tokio::test]
+    async fn export_rejects_an_unknown_wallet_name() {
+        let wallets = HashMap::new();
+        assert!(export_wallet_seed_from(&wallets, "nope", None)
+            .await
+            .is_err());
+    }
+
+    // An encrypted wallet gives up its seed neither without a passphrase nor with a wrong one
+    // (design doc section 6).
+    #[tokio::test]
+    async fn export_of_an_encrypted_wallet_requires_the_correct_passphrase() {
+        let seed = vec![31u8; mldsa::SECRET_KEY_BYTES];
+        let passphrase = b"open sesame";
+        let wallet = Wallet::from_seed(&seed, Some(passphrase)).expect("encrypted wallet");
+        let mut wallets = HashMap::new();
+        wallets.insert("locked".to_string(), wallet);
+
+        assert!(
+            export_wallet_seed_from(&wallets, "locked", None)
+                .await
+                .is_err(),
+            "an encrypted wallet must not export without a passphrase"
+        );
+        assert!(
+            export_wallet_seed_from(&wallets, "locked", Some(b"wrong"))
+                .await
+                .is_err(),
+            "a wrong passphrase must not export"
+        );
+
+        let exported = export_wallet_seed_from(&wallets, "locked", Some(passphrase))
+            .await
+            .expect("the correct passphrase exports");
+        assert_eq!(exported.as_str(), hex::encode(&seed));
+    }
+}

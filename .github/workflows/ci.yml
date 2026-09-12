@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Clippy lint sets change between releases. Update only in a dedicated reviewed change.
+    env:
+      RUSTUP_TOOLCHAIN: "1.93.1"
+    steps:
+      # Pinned by commit digest, not tag: a tag can be moved, a digest cannot.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust quality toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Locked check
+        run: cargo check --locked --all-targets --all-features
+      - name: Locked tests
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --no-default-features --features bootstrap_publisher,webrtc_mesh --all-targets -- -D warnings
+
+  # The workspace's default-members scopes a bare `cargo test` / `cargo check` to the node only, so
+  # without this job the GUI crate would never be built or tested in CI at all.
+  gui-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: "1.93.1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust quality toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
+      - name: Test
+        run: cargo test --locked -p alphanumeric-gui
+      - name: Clippy
+        run: cargo clippy --locked -p alphanumeric-gui --all-targets -- -D warnings
+      # The crate has a binary now. Nothing above builds it, and a link failure
+      # against iced is invisible to a test run. Needs no extra system packages:
+      # the binary links only libc -- X11, Wayland and xkbcommon are all opened
+      # at runtime, so building it on a bare runner is enough.
+      - name: Build
+        run: cargo build --locked -p alphanumeric-gui
+
+  # The GPU backend needs a real graphics toolchain to lint. Keep it out of the Linux common
+  # job, but make the gate on the default branch equally mandatory.
+  gpu-clippy:
+    if: github.ref_name == 'main' || github.base_ref == 'main'
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: "1.93.1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust quality toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
+      - name: Clippy with the shipped GPU feature set
+        run: cargo clippy --locked --no-default-features --features bootstrap_publisher,webrtc_mesh,gpu_miner --all-targets -- -D warnings
+
+  # The locked test step above runs DEFAULT features, so the bootstrap_publisher code -- which the
+  # live publisher actually runs -- is compiled by `cargo check --all-features` but its
+  # tests never execute. This runs the SHIPPED feature set explicitly rather than
+  # --all-features: the two branches do not carry the same features (gpu-mining adds
+  # gpu_miner), so --all-features would silently mean different things per branch and
+  # would drag a GPU backend onto a runner with no GPU. Naming the set keeps this job
+  # identical everywhere and immune to whatever feature lands next.
+  release-features:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: "1.93.1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Tests with the shipped feature set
+        run: cargo test --locked --features bootstrap_publisher,webrtc_mesh
+
+  # MANDATORY, like formatting and Clippy above. RustSec advisories, licenses, and dependency
+  # sources are enforced here. GHSA/OSV-only records are enforced by osv.yml.
+  # Separate job so an advisory failure is legible on its own and does not mask a test
+  # regression (or get masked by one).
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Dependency advisories, licences and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses sources
+          arguments: --locked

@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Local data
+/blockchain.db/
+/blockchain.db.lock
+.alphanumeric.instance.lock
+/private.key
+/node_identity.key
+/wallet-ledger.log
+/wallet-ledger.log.lock
+/logs/
+/run/
+/dist/
+/path/
+/alphanumeric_serverless_plan.txt
+
+# Secrets
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local assistant state
+/.claude/

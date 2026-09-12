@@ -1,0 +1,10778 @@
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use inquire::{Confirm, Password, PasswordDisplayMode};
+use log::{debug, error, warn};
+use ring::rand::SystemRandom;
+use ring::signature::Ed25519KeyPair;
+use rustyline::{error::ReadlineError, ColorMode, Config, DefaultEditor};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
+use std::error::Error;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio::sync::{Mutex, RwLock};
+use zeroize::Zeroize;
+
+use std::collections::HashSet;
+use std::path::Path;
+
+#[cfg(feature = "bootstrap_publisher")]
+use alphanumeric::a9::codec;
+use alphanumeric::a9::mldsa;
+use alphanumeric::a9::store::{self, Store};
+use alphanumeric::a9::{
+    blockchain::{
+        Block, Blockchain, RateLimiter, Transaction, FEE_ESTIMATE_ANCHOR_UNITS,
+        MAX_BLOCK_FUTURE_TIME, MAX_TX_AGE_SECS, MIN_RELAY_FEE_UNITS,
+    },
+    bpos::{BPoSSentinel, ValidatorTier},
+    ledger::{EntryState, LedgerConfig, WalletLedger, DEFAULT_LEDGER_FILENAME},
+    mgmt::{CreateTransactionOutcome, Mgmt, WalletKeyData},
+    node::{
+        force_rebootstrap_marker_path, rebootstrap_cooldown_path, rebootstrap_hard_cooldown_active,
+        Converge, Node, NodeError, NodeRuntimeConfig,
+    },
+    oracle::DifficultyOracle,
+    ui::{
+        ui_address, ui_age, ui_grid_header, ui_grid_row, ui_pad, ui_right, ui_seg, ui_text,
+        ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_FAINT, UI_GREEN, UI_LABEL, UI_LAVENDER,
+        UI_MUTED, UI_ORANGE, UI_PINK, UI_RULE,
+    },
+    whisper::WhisperModule,
+};
+
+#[cfg(test)]
+use alphanumeric::a9::blockchain::{
+    CONSENSUS_HEADER_RULES_VERSION, FEE_ACCOUNTING_RULES_VERSION, FEE_SYSTEM_ACTIVATION_HEIGHT,
+    LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS, MAX_BLOCK_WEIGHT_BYTES, MINT_CLIP, NETWORK_FEE,
+    REWARD_CURVE_RULES_VERSION, REWARD_CURVE_V2_ACTIVATION_HEIGHT, REWARD_V2_MINER_FEE_DENOMINATOR,
+    REWARD_V2_MINER_FEE_NUMERATOR, TARGET_BLOCK_TIME,
+};
+use alphanumeric::config::AppConfig;
+
+const KEY_FILE_PATH: &str = "private.key";
+const NODE_IDENTITY_KEY_PATH: &str = "node_identity.key";
+// Use the canonical host directly (avoid 307 redirects that can strip Authorization headers).
+const BOOTSTRAP_MANIFEST_URL: &str = "https://alphanumeric.blue/api/bootstrap/manifest";
+// Same signed manifest, mirrored to R2 by the gateway every 15 minutes (wrapped under
+// `latest` in recovery.json). R2 is CDN-hosted storage with no self-hosted origin behind
+// it, so it stays reachable when the machine behind the apex is not — without it, a fresh
+// node fails closed on a 1KB pointer while the snapshot it points at sits fully available
+// on the same CDN. TRANSPORT fallback only: whichever source answers, the manifest passes
+// the same pinned-key signature verification, so a copy an attacker could place here
+// without the publisher's private key fails exactly as it would on the primary. Kept a
+// compile-time constant like the primary on purpose — a security-path URL must not be
+// steerable by whoever controls the environment.
+const BOOTSTRAP_MANIFEST_FALLBACK_URL: &str =
+    "https://cdn.alphanumeric.blue/bootstrap/recovery.json";
+// The DEFAULT/MIN/MAX bootstrap zip- and extract-limit constants were removed with the two env
+// vars they clamped (see the note above ensure_bootstrap_zip_size): every path that consumed them
+// sat behind a condition that became permanently false when the unverified bootstrap path was
+// deleted. Download and extraction are bounded by the manifest's SIGNED size fields instead.
+const BOOTSTRAP_MIN_DISK_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
+const PEERS_URL: &str = "https://alphanumeric.blue/api/peers?limit=50";
+const TIP_URL: &str = "https://alphanumeric.blue/api/tip";
+// Verified header-snapshot history: dense canonical (height, hash) anchors over
+// the last ~24h, used by the boot reconcile to tell FORKED from merely BEHIND.
+// limit=240 requests the gateway's full retention (the default response is a
+// shallow display-sized page).
+const SNAPSHOT_HISTORY_URL: &str = "https://alphanumeric.blue/api/snapshot-history?limit=240";
+const BOOTSTRAP_PUBLISHER_PUBKEY: &str =
+    "dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3";
+const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
+#[cfg(feature = "bootstrap_publisher")]
+const BOOTSTRAP_META_TREE: &str = "bootstrap_publish_meta";
+#[cfg(feature = "bootstrap_publisher")]
+const BOOTSTRAP_META_LAST_PUBLISH_AT: &[u8] = b"last_publish_at";
+#[cfg(feature = "bootstrap_publisher")]
+const BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT: &[u8] = b"last_published_height";
+#[cfg(feature = "bootstrap_publisher")]
+const BOOTSTRAP_META_LAST_PUBLISHED_NETWORK_ID: &[u8] = b"last_published_network_id";
+
+// Modify result to take only one type parameter
+pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+#[derive(serde::Deserialize)]
+struct BootstrapManifestResponse {
+    ok: bool,
+    /// Legacy (sled-format) manifest slot — read by pre-8.0 binaries.
+    #[serde(default)]
+    manifest: Option<BootstrapManifestPointer>,
+    /// redb-format manifest slot published by the upgraded explorer during the
+    /// engine-migration window. This binary generation prefers it; the legacy
+    /// slot remains for tip reconcile when the redb slot is not yet published.
+    #[serde(default)]
+    manifest_redb: Option<BootstrapManifestPointer>,
+}
+
+// Shape of the R2 recovery mirror (bootstrap/recovery.json): the gateway wraps the exact
+// signed manifest under `latest`, alongside advisory fields (seed peers, notes) that this
+// fetch deliberately ignores — the peer list is unsigned by design and must never ride in
+// on the manifest's trust.
+#[derive(serde::Deserialize)]
+struct RecoveryManifestFile {
+    latest: BootstrapManifestPointer,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct BootstrapManifestPointer {
+    url: String,
+    #[serde(default)]
+    network_id: Option<String>,
+    #[serde(default)]
+    height: Option<u64>,
+    #[serde(default)]
+    tip_hash: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    compressed_bytes: Option<u64>,
+    #[serde(default)]
+    extracted_bytes: Option<u64>,
+    #[serde(default)]
+    file_count: Option<u64>,
+    /// Artifact storage format: None/absent = legacy sled directory; "redb" =
+    /// single-file store artifact. Part of the signed fields when present.
+    #[serde(default)]
+    format: Option<String>,
+    publisher_pubkey: String,
+    manifest_sig: String,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GatewayOverview {
+    peers: Option<u64>,
+    height: Option<u64>,
+    /// Parsed from the beacon but no longer displayed. It was only ever
+    /// `height.map(|_| true)` — i.e. "the gateway's height field parsed", not
+    /// any cryptographic check — so a row labelled "Network Verified: yes" read
+    /// as a security assurance it never was. The sync verdict in the Overview
+    /// banner carries the real information. Kept so the field stays part of the
+    /// parsed shape if a genuine verification signal ever lands here.
+    #[allow(dead_code)]
+    verified: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+struct BootstrapManifestSignedFields {
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tip_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compressed_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extracted_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<String>,
+    updated_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BootstrapArchiveStats {
+    extracted_bytes: u64,
+    file_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BootstrapArchiveExpectations {
+    expected_extracted_bytes: Option<u64>,
+    expected_file_count: Option<u64>,
+    unverified_extract_limit: Option<u64>,
+}
+
+impl BootstrapManifestPointer {
+    fn signed_fields(&self) -> BootstrapManifestSignedFields {
+        BootstrapManifestSignedFields {
+            url: self.url.clone(),
+            network_id: self.network_id.clone(),
+            height: self.height,
+            tip_hash: self.tip_hash.clone(),
+            sha256: self.sha256.clone(),
+            compressed_bytes: self.compressed_bytes,
+            extracted_bytes: self.extracted_bytes,
+            file_count: self.file_count,
+            format: self.format.clone(),
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+fn is_hex_with_len(value: &str, len: usize) -> bool {
+    value.len() == len && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+}
+
+fn launch_network_id_hex() -> Result<String> {
+    let genesis = Blockchain::genesis_launch_block()?;
+    Ok(hex::encode(genesis.hash))
+}
+
+fn verify_bootstrap_manifest(manifest: &BootstrapManifestPointer) -> Result<()> {
+    verify_bootstrap_manifest_with_publisher(manifest, BOOTSTRAP_PUBLISHER_PUBKEY)
+}
+
+async fn fetch_gateway_overview() -> Option<GatewayOverview> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(2500))
+        .build()
+        .ok()?;
+
+    let manifest_request = async {
+        client
+            .get(BOOTSTRAP_MANIFEST_URL)
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+    };
+    let peers_request = async {
+        client
+            .get(PEERS_URL)
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+    };
+    // The live tip beacon is the freshest canonical height (~1-2s); the bootstrap
+    // manifest height lags by its publish cadence, so it is only a fallback.
+    let tip_request = async {
+        client
+            .get(TIP_URL)
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+    };
+    let (manifest_body, peers_body, tip_body) =
+        tokio::join!(manifest_request, peers_request, tip_request);
+
+    let beacon_height = tip_body
+        .as_ref()
+        .filter(|body| body.get("ok").and_then(|v| v.as_bool()) == Some(true))
+        .and_then(|body| body.get("height"))
+        .and_then(|v| v.as_u64());
+    let manifest_height = manifest_body
+        .as_ref()
+        .filter(|body| body.get("ok").and_then(|v| v.as_bool()) == Some(true))
+        .and_then(|body| body.get("manifest"))
+        .and_then(|manifest| manifest.get("height"))
+        .and_then(|v| v.as_u64());
+    let height = beacon_height.or(manifest_height);
+    let peers = peers_body
+        .as_ref()
+        .filter(|body| body.get("ok").and_then(|v| v.as_bool()) == Some(true))
+        .and_then(|body| body.get("count"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            peers_body
+                .as_ref()
+                .and_then(|body| body.get("peers"))
+                .and_then(|v| v.as_array())
+                .map(|peers| peers.len() as u64)
+        });
+
+    if height.is_none() && peers.is_none() {
+        return None;
+    }
+
+    Some(GatewayOverview {
+        peers,
+        height,
+        verified: height.map(|_| true),
+    })
+}
+
+fn verify_bootstrap_manifest_with_publisher(
+    manifest: &BootstrapManifestPointer,
+    pinned_publisher_pubkey: &str,
+) -> Result<()> {
+    if manifest.url.trim().is_empty() {
+        return Err("Bootstrap manifest URL is empty".into());
+    }
+    if !manifest.url.starts_with("https://") {
+        return Err("Bootstrap manifest URL must use https".into());
+    }
+
+    let publisher_pubkey = manifest.publisher_pubkey.trim().to_ascii_lowercase();
+    if publisher_pubkey != pinned_publisher_pubkey.trim().to_ascii_lowercase() {
+        return Err("Bootstrap manifest publisher key is not pinned".into());
+    }
+    if !is_hex_with_len(&publisher_pubkey, 64) {
+        return Err("Bootstrap manifest publisher key is malformed".into());
+    }
+
+    let Some(network_id) = manifest.network_id.as_deref() else {
+        return Err("Bootstrap manifest is missing network id".into());
+    };
+    let network_id = network_id.trim().to_ascii_lowercase();
+    if !is_hex_with_len(&network_id, 64) {
+        return Err("Bootstrap manifest network id is malformed".into());
+    }
+    let expected_network_id = launch_network_id_hex()?;
+    if network_id != expected_network_id {
+        return Err(format!(
+            "Bootstrap manifest network id mismatch: expected {}, got {}",
+            expected_network_id, network_id
+        )
+        .into());
+    }
+
+    if manifest.height.is_none() {
+        return Err("Bootstrap manifest is missing height".into());
+    };
+    let Some(tip_hash) = manifest.tip_hash.as_deref() else {
+        return Err("Bootstrap manifest is missing tip hash".into());
+    };
+    if !is_hex_with_len(tip_hash.trim(), 64) {
+        return Err("Bootstrap manifest tip hash is malformed".into());
+    }
+
+    let Some(sha256) = manifest.sha256.as_deref() else {
+        return Err("Bootstrap manifest is missing SHA-256".into());
+    };
+    if !is_hex_with_len(sha256.trim(), 64) {
+        return Err("Bootstrap manifest SHA-256 is malformed".into());
+    }
+
+    validate_bootstrap_manifest_size_fields(manifest)?;
+
+    let sig_hex = manifest.manifest_sig.trim();
+    if !is_hex_with_len(sig_hex, 128) {
+        return Err("Bootstrap manifest signature is malformed".into());
+    }
+
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let pubkey_bytes: [u8; 32] = hex::decode(&publisher_pubkey)?
+        .try_into()
+        .map_err(|_| "Bootstrap publisher key must be 32 bytes")?;
+    let sig_bytes: [u8; 64] = hex::decode(sig_hex)?
+        .try_into()
+        .map_err(|_| "Bootstrap manifest signature must be 64 bytes")?;
+    let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes)
+        .map_err(|e| format!("Bootstrap publisher key rejected: {}", e))?;
+    let signature = Signature::from_bytes(&sig_bytes);
+    let signed_payload = serde_json::to_vec(&manifest.signed_fields())?;
+
+    verifying_key
+        .verify(&signed_payload, &signature)
+        .map_err(|e| format!("Bootstrap manifest signature verification failed: {}", e))?;
+
+    Ok(())
+}
+
+fn validate_bootstrap_manifest_size_fields(manifest: &BootstrapManifestPointer) -> Result<()> {
+    if matches!(manifest.compressed_bytes, Some(0)) {
+        return Err("Bootstrap manifest compressed byte count must be nonzero".into());
+    }
+    if matches!(manifest.extracted_bytes, Some(0)) {
+        return Err("Bootstrap manifest extracted byte count must be nonzero".into());
+    }
+    if matches!(manifest.file_count, Some(0)) {
+        return Err("Bootstrap manifest file count must be nonzero".into());
+    }
+    Ok(())
+}
+
+fn bootstrap_block_index_from_key(key: &[u8]) -> Option<u32> {
+    let key_str = std::str::from_utf8(key).ok()?;
+    let index_str = key_str.strip_prefix("block_")?;
+    index_str.parse::<u32>().ok()
+}
+
+fn verify_bootstrap_snapshot_tip(
+    db_path: &str,
+    expected_height: Option<u64>,
+    expected_tip_hash: Option<&str>,
+) -> Result<()> {
+    let db = open_chain_db_aux(db_path)?;
+
+    let tip_index = db
+        .scan_prefix("block_")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .and_then(|(k, _)| bootstrap_block_index_from_key(&k))
+        })
+        .max()
+        .ok_or("Bootstrap snapshot does not contain block data")?;
+
+    // The downloaded zip is already SHA-256-bound to the signed manifest (checked
+    // before this runs), so its content is authentic canonical data no matter what.
+    // The manifest's DECLARED height/tip_hash, though, can legitimately differ from
+    // the blob's actual tip by a block or two: the publisher reads the height and
+    // exports the DB at slightly different instants, and the manifest we read for
+    // the reconcile decision may be one publish behind the blob we downloaded (the
+    // "expected 12832, got 12833" abort that stranded catching-up clients). So these
+    // checks tolerate a small skew — they still catch a truncated / wrong snapshot
+    // (a large discrepancy) while never rejecting authentic, slightly-fresher data.
+    const BOOTSTRAP_HEIGHT_SKEW: u64 = 16;
+    if let Some(expected_height) = expected_height {
+        let th = u64::from(tip_index);
+        let below = expected_height.saturating_sub(th);
+        let above = th.saturating_sub(expected_height);
+        if below > BOOTSTRAP_HEIGHT_SKEW || above > BOOTSTRAP_HEIGHT_SKEW {
+            return Err(format!(
+                "Bootstrap snapshot height mismatch beyond tolerance: expected ~{}, got {}",
+                expected_height, tip_index
+            )
+            .into());
+        }
+    }
+
+    let key = format!("block_{}", tip_index);
+    let raw = db
+        .get(key.as_bytes())?
+        .ok_or("Bootstrap snapshot tip block is missing")?;
+    let block = Block::from_bytes(raw.as_ref())?;
+    if block.calculate_hash_for_block() != block.hash {
+        return Err("Bootstrap snapshot tip block hash is invalid".into());
+    }
+
+    // Only bind against the manifest tip hash when the heights match exactly; a
+    // fresher snapshot has a different (newer) tip whose hash can't equal the
+    // manifest's declared one — its own hash integrity (checked above) plus the
+    // SHA-256 manifest binding are the authenticity guarantees there.
+    if let (Some(expected_tip_hash), Some(expected_height)) = (expected_tip_hash, expected_height) {
+        if u64::from(tip_index) == expected_height {
+            let expected_tip_hash = expected_tip_hash.trim().to_ascii_lowercase();
+            if !expected_tip_hash.is_empty() {
+                let actual = hex::encode(block.hash);
+                if actual != expected_tip_hash {
+                    return Err(format!(
+                        "Bootstrap snapshot tip mismatch: expected {}, got {}",
+                        expected_tip_hash, actual
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
+    drop(db);
+    Ok(())
+}
+
+fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
+    blockchain.consensus_fingerprint()
+}
+
+/// App-thread stack. Windows gives the process main thread only 1MB (Unix: 8MB),
+/// and debug builds use far larger frames — `cargo run` on Windows overflowed in
+/// node creation (STATUS_STACK_OVERFLOW). #[tokio::main]'s block_on runs the
+/// whole async body on that 1MB thread, so instead main() spawns the runtime on
+/// a thread with an explicit stack. Reserve is address space, not committed
+/// memory, so generous is free; this also makes every platform/toolchain behave
+/// identically (no MSVC vs GNU linker-flag games).
+/// Lines the `mine --continuous` stop-reader swallowed AFTER mining had already
+/// ended, handed back to the REPL instead of being lost.
+///
+/// The stop-reader is a detached thread parked in a blocking `stdin().read_line`,
+/// and nothing can cancel a blocking read. When mining exits any way OTHER than
+/// the user pressing Enter (a prep failure, an error cap, Ctrl-C), that thread is
+/// still sitting on stdin — so the operator's NEXT command went to the zombie
+/// instead of the prompt and came back as "invalid command" with the cursor in
+/// the wrong place. The reader now checks whether mining is still running: if it
+/// is, the line means "stop"; if it is not, the line was a command and is queued
+/// here for the REPL to run on its next turn. Nothing is swallowed either way.
+static PENDING_INPUT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// True while a `mine --continuous` session is still listening for its stop line.
+static MINING_READING_STDIN: AtomicBool = AtomicBool::new(false);
+/// Number of `mine --continuous` stop-reader threads currently parked in a blocking stdin read.
+/// A reader outlives its mining session whenever mining ended by any route other than the user
+/// pressing Enter, and nothing can cancel a blocking read. While one is parked it competes for
+/// stdin with any interactive prompt -- and a line it wins is replayed to the terminal and into
+/// rustyline's history, so a passphrase typed at such a moment would be echoed in the clear.
+static STDIN_READERS_PARKED: AtomicUsize = AtomicUsize::new(0);
+
+/// rustyline's line editor owns the terminal while a prompt is displayed: it
+/// tracks where the cursor is so it can redraw the input line. A background task
+/// that writes with plain `println!` therefore corrupts that model — the text
+/// lands on top of the prompt, rustyline's idea of the cursor no longer matches
+/// reality, and the next thing typed overwrites the `a#:` prompt and comes back
+/// as an invalid command. Reported live: a client several hours behind, where the
+/// reconcile loop's "Behind the network tip" notice fires on its own timer.
+///
+/// rustyline provides exactly one safe way to do this: an ExternalPrinter, which
+/// erases the prompt line, writes the message, and redraws the prompt. Every
+/// background notice goes through `notify()` so it uses that when a prompt is
+/// live, and falls back to println! for headless runs where there is no editor.
+static EXTERNAL_PRINTER: std::sync::Mutex<Option<Box<dyn rustyline::ExternalPrinter + Send>>> =
+    std::sync::Mutex::new(None);
+
+/// Print a line from a BACKGROUND task without corrupting a live prompt.
+///
+/// BLOCKING, by nature: rustyline's ExternalPrinter hands the line to the editor over a
+/// depth-1 channel, and this takes the process-global printer mutex to do it. Callers on the
+/// async runtime must therefore not invoke it directly — a wedged or unread terminal parks
+/// the calling worker, and with the printer mutex held it serializes every other notifier
+/// behind it. Use `notify_async` from a task; this stays for synchronous callers.
+fn notify(msg: String) {
+    if let Ok(mut guard) = EXTERNAL_PRINTER.lock() {
+        if let Some(p) = guard.as_mut() {
+            if p.print(format!("{}\n", msg)).is_ok() {
+                return;
+            }
+        }
+    }
+    println!("{}", msg);
+}
+
+/// `notify` for async callers: performs the blocking write on the blocking pool so a stalled
+/// terminal cannot park a runtime worker, and cannot hold the global printer mutex across a
+/// scheduling point that other notifiers are queued behind.
+async fn notify_async(msg: String) {
+    if tokio::task::spawn_blocking(move || notify(msg))
+        .await
+        .is_err()
+    {
+        // The blocking pool is gone (runtime shutting down); the notice is not worth
+        // resurrecting a path for at that point.
+    }
+}
+
+const MAIN_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
+/// Tokio worker stacks (default 2MB) get the same debug-frame headroom.
+const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    // Install the process-wide rustls crypto provider (ring) BEFORE any HTTPS. reqwest
+    // uses `rustls-no-provider` (7.8.2), so the first TLS handshake panics with "no
+    // process-level CryptoProvider available" unless a default is installed first. This
+    // is the same `ring` provider the DTLS mesh uses; install_default is idempotent, so
+    // the mesh's later call is a harmless no-op.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Panic VISIBILITY: with panic = "unwind" and ~40 detached background tasks, a
+    // panic unwound into an unread JoinError — the node kept running visibly "up"
+    // with the panicked subsystem silently gone. The supervised spawns re-arm the
+    // load-bearing loops; this hook makes every panic loud (stderr survives even
+    // when the log stack is filtered) and names the thread it happened on.
+    // Offline maintenance subcommand (never a resident mode): one-time
+    // sled -> redb conversion for nodes migrating in place. Compiled only with
+    // the `sled-convert` feature; client release builds carry no sled code.
+    #[cfg(feature = "sled-convert")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("convert-sled-db") {
+            let (src, dst) = match (args.get(2), args.get(3)) {
+                (Some(s), Some(d)) => (s.clone(), d.clone()),
+                _ => {
+                    eprintln!("usage: alphanumeric convert-sled-db <sled-db-dir> <output-db-dir>");
+                    std::process::exit(2);
+                }
+            };
+            match run_sled_conversion(&src, &dst) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!("conversion FAILED: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            eprintln!(
+                "PANIC on thread '{}': {} — the node may be degraded; please report this.",
+                thread.name().unwrap_or("<unnamed>"),
+                info
+            );
+            default_hook(info);
+        }));
+    }
+    let app = std::thread::Builder::new()
+        .name("alphanumeric-main".to_string())
+        .stack_size(MAIN_THREAD_STACK_BYTES)
+        .spawn(|| -> std::result::Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(WORKER_THREAD_STACK_BYTES)
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to start async runtime: {}", e))?;
+            // Errors cross the thread join as strings because the error chain is
+            // not Send (BlockchainError); the message is what main reported anyway.
+            runtime.block_on(async_main()).map_err(|e| e.to_string())
+        })
+        .expect("failed to spawn app thread")
+        .join();
+    match app {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err(message.into()),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// True only for a bare arrow-up escape typed as the ENTIRE line in the raw-stdin
+/// fallback. rustyline consumes arrow-up itself, so recall must never fire when an
+/// editor is present; and matching a substring (an ESC byte or "[A" anywhere) would
+/// let an arbitrary payment message/address silently re-fire the previous command,
+/// which can be a funded create/whisper.
+fn is_recall_line(command: &str, editor_present: bool) -> bool {
+    !editor_present && matches!(command, "\u{1b}[A" | "\u{1b}OA")
+}
+
+/// A wallet seed on the wire is the 32-byte ML-DSA secret key as lowercase hex.
+const SEED_HEX_CHARS: usize = mldsa::SECRET_KEY_BYTES * 2;
+
+/// True for a token that could be a wallet seed: exactly 64 hexadecimal characters.
+fn is_seed_shaped(token: &str) -> bool {
+    token.len() == SEED_HEX_CHARS && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// True when a command line carries a token shaped like a wallet seed.
+///
+/// Matched on the PAYLOAD, never on the verb. Gating on `import-seed` alone was a
+/// gate on the one spelling that works: `Import-Seed <hex64>`, `importseed <hex64>`,
+/// `import_seed <hex64>` and a bare pasted seed with no verb at all all miss it, are
+/// rejected as unknown commands, and leave the seed in rustyline's history and in
+/// `last_console_command` FIRST -- copies this process owns and can wipe, which is
+/// the exact class the masked prompt exists to close. A pasted bare seed is not an
+/// exotic input: it is what happens when someone means to paste after the verb and
+/// the verb does not make it into the line.
+///
+/// Deliberately over-broad. Any 64-character hex token is treated as secret. The
+/// cost of a false positive is that one command line loses its history entry; the
+/// cost of a false negative is a spendable key sitting in a recall buffer. It also
+/// keeps working if the command is ever renamed.
+fn carries_a_seed_shaped_token(command: &str) -> bool {
+    command.split_whitespace().any(is_seed_shaped)
+}
+
+/// True when a line must be kept out of the history and wiped afterwards.
+///
+/// Two clauses. The first is the shape test above, which catches a seed however
+/// it was spelled or whether it had a verb at all. The second catches the case
+/// the shape test cannot: `import-seed` followed by ANYTHING -- a seed one
+/// character short of 64 is a rejected command, but it is still most of a
+/// spendable key and there is no reason to keep it. A bare `import-seed` with no
+/// argument stays recallable, because that form carries nothing.
+///
+/// What neither clause catches is a truncated seed under a mistyped verb.
+/// Catching that would mean treating every long hexadecimal string as secret.
+fn line_may_carry_a_seed(command: &str) -> bool {
+    if carries_a_seed_shaped_token(command) {
+        return true;
+    }
+    let mut tokens = command.split_whitespace();
+    tokens.next() == Some("import-seed") && tokens.next().is_some()
+}
+
+/// `command` with every seed-shaped token replaced, for the one place a line this
+/// process did not prompt for still has to be echoed back (see `PENDING_INPUT`).
+fn redact_seed_shaped_tokens(command: &str) -> String {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    // Redacted on the same two grounds `line_may_carry_a_seed` uses, so anything
+    // that line refuses to keep is also something this refuses to print: a token
+    // that looks like a seed, or the argument to the one command whose argument
+    // IS one -- which is what covers a truncated paste. Only that one position,
+    // so an optional wallet name after it stays readable.
+    let verb_takes_a_seed = tokens.first() == Some(&"import-seed");
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(position, token)| {
+            if is_seed_shaped(token) || (verb_takes_a_seed && position == 1) {
+                "<seed hidden>"
+            } else {
+                *token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Wipe anything a parked mining reader queued that the REPL never got to run.
+///
+/// A queued line can carry a seed, and every other copy of one is wiped
+/// explicitly. Leaving the queue to be dropped on the way out would make this the
+/// one exception. Called from `StartupLockGuard::drop`, so it covers every way the
+/// session ends normally -- `exit`, Ctrl-C, EOF, the shutdown flag -- not just the
+/// arm that happened to be edited.
+fn wipe_pending_input() {
+    if let Ok(mut queued) = PENDING_INPUT.lock() {
+        for line in queued.iter_mut() {
+            line.zeroize();
+        }
+        queued.clear();
+    }
+}
+
+async fn async_main() -> Result<()> {
+    // Initialize logging with ERROR level during startup to avoid UI interference.
+    // RUST_LOG still wins when set so field diagnostics stay possible.
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Error)
+        .parse_default_env()
+        .init();
+
+    print_ascii_intro();
+
+    // Load configuration from environment variables
+    let config = AppConfig::from_env();
+    config.log_config();
+    let headless = env_flag_enabled("ALPHANUMERIC_HEADLESS");
+
+    // Read here so a bad config fails before the expensive boot rather than after
+    // it. A wrong backend value is knowable before the DB is even opened; saying
+    // so only once a snapshot has downloaded wastes the operator's time.
+    let headless_mining = match parse_headless_mining(
+        std::env::var("ALPHANUMERIC_MINE").ok().as_deref(),
+        std::env::var("ALPHANUMERIC_MINE_BACKEND").ok().as_deref(),
+        cfg!(feature = "gpu_miner"),
+        headless,
+    ) {
+        Ok(config) => config,
+        Err(message) => return Err(message.into()),
+    };
+
+    // Boot step bar. NOTE: never print! around a live bar — route one-off status
+    // lines through boot_note()/pb.println() so they land ABOVE the bar instead of
+    // baking a stale copy of it into the scrollback (the pre-7.8.2 artifact).
+    let boot_style = ProgressStyle::with_template("{spinner:.green} [{bar:40.cyan/blue}] {msg}")?
+        .progress_chars("█▓░");
+    let pb = ProgressBar::new(7);
+    pb.set_style(boot_style.clone());
+
+    // Resolve relative DB paths robustly:
+    // - Prefer any path that already contains block data.
+    // - Otherwise, create new relative databases under the current working directory.
+    //
+    // This keeps dev/source runs from silently creating a second DB under `target/release`.
+    let db_path = {
+        let raw = config.database.path.clone();
+        let p = Path::new(&raw);
+        if p.is_absolute() {
+            raw
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| cwd.clone());
+
+            let cwd_candidate = cwd.join(p);
+            let exe_candidate = exe_dir.join(p);
+
+            let cwd_str = cwd_candidate.to_string_lossy().to_string();
+            let exe_str = exe_candidate.to_string_lossy().to_string();
+
+            let cwd_is_launch = local_db_matches_launch_genesis(&cwd_str);
+            let exe_is_launch = local_db_matches_launch_genesis(&exe_str);
+            let cwd_has_blocks = has_local_block_data(&cwd_str);
+            let exe_has_blocks = has_local_block_data(&exe_str);
+
+            if cwd_is_launch {
+                cwd_str
+            } else if exe_is_launch {
+                exe_str
+            } else if cwd_has_blocks {
+                cwd_str
+            } else if exe_has_blocks {
+                exe_str
+            } else {
+                cwd_str
+            }
+        }
+    };
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async move {
+        // Database init
+        let _startup_locks = acquire_startup_locks(&db_path)
+            .map_err(|e| format!("Startup lock failed for {}: {}", db_path, e))?;
+        pb.set_message("Checking bootstrap snapshot...");
+        let create_launch_genesis = env_flag_enabled("ALPHANUMERIC_CREATE_LAUNCH_GENESIS")
+            || env_flag_enabled("ALPHANUMERIC_RESET_TO_LAUNCH_GENESIS");
+        // Mirror config.rs seed-node precedence exactly: ALPHANUMERIC_SEED_NODES wins if set,
+        // else the ALPHANUMERIC_BOOTSTRAP_PEERS alias. Reading only SEED_NODES here meant a node
+        // configured via the alias had seed_peer_configured=false, so a snapshot outage failed
+        // CLOSED instead of entering the P2P peer-bootstrap fallback. True iff config.seed_nodes
+        // would be non-empty (any non-blank comma entry).
+        let seed_peer_configured = std::env::var("ALPHANUMERIC_SEED_NODES")
+            .or_else(|_| std::env::var("ALPHANUMERIC_BOOTSTRAP_PEERS"))
+            .map(|s| s.split(',').any(|p| !p.trim().is_empty()))
+            .unwrap_or(false);
+        let mut peer_bootstrap_mode = false;
+        if create_launch_genesis && !has_local_block_data(&db_path) {
+            boot_note(Some(&pb), "creating deterministic launch genesis".to_string());
+        } else if !has_local_block_data(&db_path) {
+            // Fresh node (no local blocks): the gateway snapshot is the primary bootstrap.
+            // If it is unavailable (Upstash / gateway outage) AND a seed peer is configured,
+            // a snapshot failure is NOT fatal — create the deterministic genesis locally and
+            // reconstruct the chain from the seed peer over P2P GetBlocks (Tier-2 fallback; the
+            // reconcile loop's peer full-history sync does the pull, with the SAME validation).
+            // With no seed peer, fail closed exactly as before.
+            match ensure_bootstrap_db(&db_path, Some(pb.clone())).await {
+                Ok(()) => {}
+                Err(e) if seed_peer_configured => {
+                    boot_note(
+                        Some(&pb),
+                        format!(
+                            "snapshot unavailable ({}); reconstructing the chain from a seed peer over P2P",
+                            e
+                        ),
+                    );
+                    peer_bootstrap_mode = true;
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            // Existing local chain: reconcile it against the signed manifest as before.
+            ensure_bootstrap_db(&db_path, Some(pb.clone())).await?;
+        }
+        // The bootstrap phase retires the step bar when it runs a download (the
+        // download/extract bars own the screen); re-create it for the remaining
+        // steps so the boot flow keeps one clean live line.
+        let pb = if pb.is_finished() {
+            let npb = ProgressBar::new(7);
+            npb.set_style(boot_style.clone());
+            npb.set_position(1);
+            npb
+        } else {
+            pb
+        };
+        pb.set_message("Preparing the database...");
+        let db = match open_chain_db(&db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                // Corruption is classified at the store boundary from redb's
+                // error VARIANTS (clobbered magic = Io(InvalidData), damaged
+                // pages = Corrupted, gross truncation = pre-open guard), never
+                // by string-matching engine internals here. Anything classified
+                // gets the quarantine ladder, same recovery contract as before.
+                let is_corruption = e.is_corruption();
+                if is_corruption {
+                    warn!("Store reported corruption; retrying open before quarantine...");
+                    match open_chain_db(&db_path) {
+                        Ok(db) => db,
+                        Err(reopen_err) => {
+                            warn!("Reopen failed after cleanup: {}", reopen_err);
+                            let quarantined = quarantine_db(&db_path);
+                            if let Err(q_err) = quarantined {
+                                error!("Failed to quarantine DB: {}", q_err);
+                                return Err(Box::new(reopen_err) as Box<dyn Error>);
+                            }
+                            open_chain_db(&db_path)
+                                .map_err(|fresh_err| {
+                                error!("Failed to open fresh DB: {}", fresh_err);
+                                Box::new(fresh_err) as Box<dyn Error>
+                            })?
+                        }
+                    }
+                } else {
+                    error!("Error opening database: {}", e);
+                    return Err(Box::new(e) as Box<dyn Error>);
+                }
+            }
+        };
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        {
+            let shutdown_flag = shutdown_requested.clone();
+            let db_for_signal = db.clone();
+            let db_path_for_signal = db_path.clone();
+            tokio::spawn(async move {
+                // Treat SIGTERM (systemd/docker `stop`) identically to SIGINT (Ctrl-C):
+                // without it, `systemctl stop` kills the node with no graceful flush and
+                // the last flush-window of non-marker writes would be lost
+                // (consensus state is marker-flushed per block; see a9::store).
+                //
+                // This task must OUTLIVE the first signal and must TERMINATE the
+                // process. The previous version fired once — set the flag, flushed,
+                // printed — and returned. Loops that poll the flag (mining) wound
+                // down; the REPL, blocked on stdin, polls nothing, so a node at the
+                // idle prompt absorbed SIGTERM and kept running until the
+                // supervisor's kill timeout — measured live: two SIGTERMs ignored
+                // at the menu. Now: first signal flags, flushes, and starts a short
+                // grace so an in-flight mining batch can finish, then removes the
+                // locks and exits; a second signal exits immediately.
+                #[cfg(unix)]
+                let mut term = {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    match signal(SignalKind::terminate()) {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            eprintln!("Failed to install SIGTERM handler ({e}); Ctrl-C only");
+                            None
+                        }
+                    }
+                };
+                let mut signals_seen = 0u32;
+                loop {
+                    #[cfg(unix)]
+                    {
+                        match term.as_mut() {
+                            Some(t) => {
+                                tokio::select! {
+                                    _ = tokio::signal::ctrl_c() => {}
+                                    _ = t.recv() => {}
+                                }
+                            }
+                            None => {
+                                let _ = tokio::signal::ctrl_c().await;
+                            }
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }
+                    signals_seen += 1;
+                    if signals_seen > 1 {
+                        eprintln!("Second signal: exiting immediately.");
+                        std::process::exit(1);
+                    }
+                    shutdown_flag.store(true, Ordering::Release);
+                    alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    let _ = db_for_signal.flush();
+                    eprintln!("Shutting down cleanly...");
+                    let db = db_for_signal.clone();
+                    let lock_path = format!("{}.lock", db_path_for_signal);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        let _ = db.flush();
+                        let _ = remove_db_lock(&lock_path);
+                        let _ = remove_instance_lock();
+                        // Same terminal courtesy as restart_in_place: rustyline may
+                        // hold the tty raw, and exiting skips its restore.
+                        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                            let _ = std::process::Command::new("stty").arg("sane").status();
+                        }
+                        std::process::exit(0);
+                    });
+                }
+            });
+        }
+        {
+            let db_for_flush = db.clone();
+            // SUPERVISED, because this loop IS the durability barrier. Ordinary
+            // mutations commit with Durability::None; `flush()` is the only
+            // Immediate two-phase commit the node ever makes. A panic in a plain
+            // spawn unwinds into a JoinError nobody reads, so the node would keep
+            // running and keep accepting blocks while nothing more reached disk —
+            // silently, until a crash discarded everything since the last tick.
+            alphanumeric::a9::node::spawn_supervised("db-flush", move || {
+                let db_for_flush = db_for_flush.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        interval.tick().await;
+                        // Flush on the blocking pool, never a runtime worker: a synchronous
+                        // flush that stalls under storage contention must not pin a tokio
+                        // worker. All-4-worker pins on inline store I/O are what froze the
+                        // publisher runtime (2026-07-16 park); off-worker => the runtime +
+                        // watchdog stay alive.
+                        let dbf = db_for_flush.clone();
+                        let _ = tokio::task::spawn_blocking(move || dbf.flush()).await;
+                    }
+                }
+            });
+        }
+        let db_arc = Arc::new(RwLock::new(db.clone()));
+        pb.inc(1);
+
+        pb.set_message("Loading the chain...");
+        // Per-sender admission circuit breaker: catches a client stuck in a submit loop
+        // without shaping legitimate concentrated traffic. It is NOT the inbound spam gate —
+        // gossip is paced per-PEER before dispatch, and mempool occupancy is bounded
+        // separately by MEMPOOL_MAX_PER_ADDRESS. At the previous 100/60s a single sender was
+        // capped at 1.67 tx/s, which a pool paying its miners reaches in one payout round.
+        let rate_limiter = Arc::new(RateLimiter::new(60, 2_000));
+        let difficulty = Arc::new(Mutex::new(0_u64));
+
+        let blockchain = Arc::new(RwLock::new(Blockchain::new(
+            db.clone(),
+            0.000563063063,
+            50.0,
+            100,
+            5,
+            rate_limiter.clone(),
+            difficulty.clone(), // Pass in the Arc<Mutex>
+        )));
+
+        pb.inc(1);
+
+        if (create_launch_genesis || peer_bootstrap_mode) && db.scan_prefix("block_").next().is_none()
+        {
+            pb.set_message("Creating launch genesis...");
+            blockchain.write().await.create_genesis_block().await?;
+        }
+
+        // If the last stop left a recovery marker, say so BEFORE the work starts —
+        // with an estimate — instead of sitting silent and reporting afterwards.
+        // The rebuild holds the chain write lock, so to a user this stretch is
+        // otherwise indistinguishable from a hang, and an unexplained hang next to
+        // the passphrase prompt is how an operator learns to force-kill the node
+        // (which, during recovery specifically, re-arms the identical work). This
+        // is a read-only peek; initialize() below remains the only entry into
+        // recovery.
+        let pending_recovery = blockchain.read().await.pending_recovery();
+        match &pending_recovery {
+            Some((reason, _)) => {
+                let est = alphanumeric::a9::blockchain::Blockchain::recovery_estimate_secs(
+                    blockchain.read().await.get_latest_block_index() as u64,
+                );
+                let what = if reason == "receipt_batch" {
+                    "an interrupted sync"
+                } else {
+                    "an interrupted write"
+                };
+                pb.set_message(format!(
+                    "Restoring state after {} — about {}s at this height...",
+                    what, est
+                ));
+            }
+            None => pb.set_message("Verifying blockchain state..."),
+        }
+        let init_started = std::time::Instant::now();
+        if let Err(e) = blockchain.write().await.initialize().await {
+            error!("Failed to initialize blockchain: {}", e);
+            return Err(Box::new(e));
+        }
+        if pending_recovery.is_some() {
+            // The counterpart of the promise above: confirm the pause was the
+            // restore, and that it is over. Plain text on purpose — this is the
+            // routine outcome, not an event. The clock covers all of initialize,
+            // not just the rebuild, so say "verification" rather than promising
+            // the number measures the restore alone: on a first boot after an
+            // upgrade, one-time index work can legitimately dwarf the estimate.
+            pb.println(format!(
+                "  state restored — verification finished in {:.1}s",
+                init_started.elapsed().as_secs_f64()
+            ));
+        }
+        pb.inc(1);
+
+        // Seed the trusted checkpoint on first run under this build. Everything we
+        // already hold — genesis, the verified bootstrap snapshot, prior sync — is
+        // trusted as of this tip; only blocks arriving ABOVE it must pass full
+        // ML-DSA verification. For a fresh node this tip IS the signed bootstrap
+        // snapshot height, so witness-pruned history below it never has to be
+        // re-verified. Idempotent: a no-op once a checkpoint exists.
+        if let Err(e) = blockchain.read().await.seed_trusted_checkpoint_if_unset() {
+            warn!("Failed to seed trusted checkpoint: {}", e);
+        }
+
+        // Build the replay registry from the chain we already hold if it hasn't
+        // been built yet (first run under this feature, or after a bootstrap
+        // import). Existing history is grandfathered; only new blocks are checked.
+        if let Err(e) = blockchain.read().await.ensure_confirmed_tx_index() {
+            warn!("Failed to build the replay registry: {}", e);
+        }
+
+        let (consensus_descriptor, consensus_fingerprint) = {
+            let blockchain_lock = blockchain.read().await;
+            compute_consensus_fingerprint(&blockchain_lock)
+        };
+        // Bootstrap publishing (zip+upload+sign) is compiled out by default to reduce false positives.
+        // Enable with `--features bootstrap_publisher` for the ONE canonical node that should publish.
+        #[cfg(feature = "bootstrap_publisher")]
+        {
+            // Single env var enables it:
+            // - ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN
+            if let Ok(token) = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN") {
+                let token = token.trim().to_string();
+                if !token.is_empty() {
+                    let db_path_for_publish = db_path.clone();
+                    let blockchain_for_publish = blockchain.clone();
+                    tokio::spawn(async move {
+                        bootstrap_publish_loop(db_path_for_publish, blockchain_for_publish, token)
+                            .await;
+                    });
+                }
+            }
+        }
+
+        // Continue with rest of initialization
+        pb.set_message("Preparing the console...");
+        let (_transaction_fee, _mining_reward, _difficulty_adjustment_interval, _block_time) = {
+            let blockchain_lock = blockchain.read().await;
+            (
+                blockchain_lock.transaction_fee,
+                blockchain_lock.mining_reward,
+                blockchain_lock.difficulty_adjustment_interval,
+                blockchain_lock.block_time,
+            )
+        }; // blockchain_lock is dropped here
+
+        // Open the ONE operator payment ledger, shared between the CLI signer (collision-free
+        // timestamp allocation) and the node's protected submission endpoints (idempotency and
+        // cross-path collision detection). A single shared instance is required: a payment signed
+        // locally and one submitted through the API must land in the same transaction index, or a
+        // collision between them goes undetected. Failure to open is not fatal to the node — mining,
+        // serving and the legacy endpoints run regardless — but every payment path that depends on
+        // it fails closed rather than fall back to unsafe timestamp reuse.
+        let ledger_config = LedgerConfig {
+            tx_age_limit_secs: MAX_TX_AGE_SECS,
+            future_allocation_margin_secs: MAX_BLOCK_FUTURE_TIME,
+            ..LedgerConfig::default()
+        };
+        let ledger =
+            match WalletLedger::open(DEFAULT_LEDGER_FILENAME, ledger_config) {
+                Ok(ledger) => Some(Arc::new(ledger)),
+                Err(error) => {
+                    error!(
+                        "wallet payment ledger unavailable ({error}); local payment signing and \
+                         protected submission endpoints are disabled until it can be opened"
+                    );
+                    None
+                }
+            };
+
+        let mgmt = Box::new(Mgmt::new(
+            db.clone(),
+            blockchain.clone(),
+            ledger.clone(),
+        ));
+        pb.inc(1);
+
+        // First generate the keypair
+        pb.set_message("Loading node identity...");
+        let key_pair_pkcs8 = load_or_create_node_identity_key(NODE_IDENTITY_KEY_PATH).await?;
+        pb.inc(1);
+
+        // Then create the node (single instance)
+        pb.set_message("Starting the node...");
+        let explicit_bind = std::env::var("ALPHANUMERIC_BIND_IP").is_ok()
+            || std::env::var("ALPHANUMERIC_PORT").is_ok();
+        let bind_addr = if explicit_bind {
+            Some(SocketAddr::new(config.network.bind_ip, config.network.port))
+        } else {
+            None
+        };
+
+        let node = match Node::new(
+            Arc::new(db.clone()),
+            blockchain.clone(),
+            key_pair_pkcs8.clone(),
+            NodeRuntimeConfig {
+                bind_addr,
+                velocity_enabled: config.network.velocity_enabled,
+                max_peers: config.network.max_peers,
+                max_connections: config.network.max_connections,
+                seed_nodes: config.network.seed_nodes.clone(),
+                // Peer cache lives next to the chain DB so it survives reboots
+                // (the temp-dir default gets wiped exactly when it matters).
+                data_dir: Some(db_path.clone()),
+                ledger: ledger.clone(),
+            },
+        )
+        .await {
+            Ok(node) => Arc::new(node),
+            Err(e) => {
+                error!("Failed to create node: {}", e);
+                return Err(e.into());
+            }
+        };
+
+        pb.inc(1);
+
+        // Complete the progress bar and clear the line
+        pb.finish_and_clear();
+
+        // Spawn node task with integrated monitoring
+        let node_clone = Arc::clone(&node);
+        tokio::task::spawn_local(async move {
+    let local = tokio::task::LocalSet::new();
+
+    local.spawn_local(async move {
+        const FAST_SYNC_LATENCY: u64 = 50;       // 50ms target latency
+        const RECOVERY_LATENCY: u64 = 500;        // 500ms acceptable during network stress
+        const MIN_VIABLE_PEERS: usize = 3;        // Minimum peers for operation
+        const MAX_SYNC_ATTEMPTS: u32 = 3;         // Maximum sync retries before backing off
+        const HEALTH_CHECK_INTERVAL: u64 = 1000;  // 1s health checks
+        const SYNC_CHECK_INTERVAL: u64 = 2000;    // 2s sync checks
+        const SLEEP_THRESHOLD: u64 = 10;          // 10s threshold for sleep detection
+        const MAX_BLOCK_AGE: u64 = 2;            // Maximum acceptable block age deviation
+        const MIN_PEER_LATENCY: u64 = 10;        // Minimum acceptable peer latency
+        const RECENT_PEER_THRESHOLD: u64 = 300;   // Peer considered recent within 300s
+        const MAX_DISCOVERY_ATTEMPTS: u32 = 5;    // Maximum discovery retry attempts
+
+        // Track last activity time for sleep detection
+        let last_active = Arc::new(AtomicU64::new(SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()));
+
+        // Initialize core services. On failure the task returns here — before sync and before
+        // the monitor is spawned — so the node has no networking, yet the REPL still opens its
+        // normal menu and looks healthy. error! alone can be suppressed by RUST_LOG, so also
+        // print a stderr WARNING. Kept non-fatal so local wallet/balance inspection off the
+        // on-disk DB still works; the operator must restart to get networking back.
+        if let Err(e) = node_clone.start().await {
+            error!("Critical error during startup: {}", e);
+            eprintln!(
+                "WARNING: node networking failed to start ({}). Running OFFLINE — sync, mining \
+                 and sends will not work until you restart.",
+                e
+            );
+            return;
+        }
+
+        // Converge to the network tip immediately on launch. "Bootstrapped" only means
+        // the local DB is genesis-valid — NOT that it is at the current tip — so a node
+        // that was behind (or on a stale fork) used to start up "done" yet several
+        // blocks behind. Sync to the signed beacon now, before the node is usable; the
+        // live beacon-watch loop keeps it current afterward. Bounded and best-effort.
+        let _ = node_clone.sync_to_beacon().await;
+
+        // Combined monitor for network and chain
+        let monitor_handle = {
+            let node = Arc::clone(&node_clone);
+            let activity_time = Arc::clone(&last_active);
+
+            tokio::task::spawn_local(async move {
+                let mut sync_interval = tokio::time::interval(Duration::from_millis(SYNC_CHECK_INTERVAL));
+                let mut health_interval = tokio::time::interval(Duration::from_millis(HEALTH_CHECK_INTERVAL));
+                // Wake-from-sleep: this monitor DETECTS the suspend, so its own
+                // tickers must not Burst-replay the slept-through backlog (a 12h
+                // sleep = ~21k sync ticks + ~43k health ticks fired back-to-back
+                // at the exact moment recovery starts).
+                sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut block_times = VecDeque::with_capacity(50);
+                let mut sync_attempts: u32 = 0;
+                let mut discovery_failures: u32 = 0;
+
+                loop {
+                    tokio::select! {
+                        // Network sync check
+                        _ = sync_interval.tick() => {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+
+                            // Sleep detection with state reset. saturating_sub: `now`/`last` are
+                            // wall-clock seconds, so a backward clock step (NTP, host time sync)
+                            // makes now < last — a bare subtraction panics in debug and wraps to a
+                            // huge value in release, firing false "sleep detected" resets every
+                            // tick. Matches the sibling checks elsewhere in this monitor.
+                            let last = activity_time.load(Ordering::Acquire);
+                            let mut now = now;
+                            if now.saturating_sub(last) > SLEEP_THRESHOLD {
+                                debug!("Sleep detected, resetting network state");
+                                // Reset all counters
+                                sync_attempts = 0;
+                                discovery_failures = 0;
+                                block_times.clear();
+
+                                // Drop the pooled sockets + circuit-breaker verdicts
+                                // BEFORE rediscovery: after a suspend the pool holds
+                                // only half-open sockets (each worth a full
+                                // response-timeout stall) and the breakers hold
+                                // pre-sleep verdicts. "Resetting network state"
+                                // previously reset counters, not sockets.
+                                node.reset_connection_pool().await;
+
+                                // Attempt immediate network recovery
+                                if let Err(e) = node.discover_network_nodes().await {
+                                    error!("Network rediscovery after wake failed: {}", e);
+                                }
+
+                                // A completed recovery IS activity. The reset plus the
+                                // inline rediscovery above take longer than
+                                // SLEEP_THRESHOLD themselves (measured 8-13s), so
+                                // stamping the PRE-recovery clock below made the very
+                                // next tick read another >10s gap and fire again — a
+                                // self-sustaining reset storm (measured live: nine
+                                // consecutive pool resets over two minutes, every
+                                // outbound TCP send failing throughout, after one
+                                // ordinary wake-from-sleep or a long passphrase
+                                // prompt starving this thread). Re-read the clock so
+                                // one stall costs exactly one reset.
+                                now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                            }
+                            activity_time.store(now, Ordering::Release);
+
+                            // Network state check. Snapshot under a short-lived guard:
+                            // holding this read lock across the sleeps/discovery/sync
+                            // awaits below deadlocks every peers.write() in verify_peer.
+                            let (active_peers, target_latency, available_peers) = {
+                                let peers = node.peers.read().await;
+                                let active_peers = peers.len();
+
+                                // Calculate network health with safe division
+                                let avg_latency = peers.iter()
+                                    .filter(|(_, info)| info.latency >= MIN_PEER_LATENCY)
+                                    .map(|(_, info)| info.latency)
+                                    .sum::<u64>()
+                                    .checked_div(active_peers.max(1) as u64)
+                                    .unwrap_or(RECOVERY_LATENCY);
+
+                                let target_latency = if avg_latency > FAST_SYNC_LATENCY {
+                                    RECOVERY_LATENCY
+                                } else {
+                                    FAST_SYNC_LATENCY
+                                };
+
+                                // Efficient peer selection with latency filtering
+                                let available_peers: Vec<_> = peers.iter()
+                                    .filter(|(_, info)| {
+                                        info.latency <= target_latency &&
+                                        now.saturating_sub(info.last_seen) <= RECENT_PEER_THRESHOLD
+                                    })
+                                    .map(|(addr, _)| *addr)
+                                    .collect();
+
+                                (active_peers, target_latency, available_peers)
+                            };
+
+                            if active_peers > 0 {
+                                // P2P height fan-out ONLY when the gateway beacon is
+                                // dark: with a live beacon the converge loops already
+                                // own catch-up, and this arm burned a GetBlockHeight
+                                // round-trip per eligible peer every 2s (~240 RPC/min
+                                // at the tip) with 50-500ms timeouts — the main
+                                // producer of cancelled mid-exchange requests. A
+                                // beacon observed within the rolling window means the
+                                // gateway path is alive; this fan-out is the
+                                // gateway-outage fallback, its one unique job.
+                                let beacon_dark = node.beacon_high_water_height() == 0;
+                                if !available_peers.is_empty() {
+                                    if !beacon_dark {
+                                        // Beacon alive: nothing for this arm to do —
+                                        // and no discovery either (peers are fine).
+                                        continue;
+                                    }
+                                    // Check chain state with safe conversion
+                                    let local_height = {
+                                        let blockchain = node.blockchain.read().await;
+                                        match u32::try_from(blockchain.get_latest_block_index()) {
+                                            Ok(height) => height,
+                                            Err(e) => {
+                                                error!("Error converting block height: {}", e);
+                                                return;
+                                            }
+                                        }
+                                    };
+
+                                    // Parallel height checks with timeout handling
+                                    let heights = futures::future::join_all(
+                                        available_peers.iter().map(|&peer| {
+                                            let node = node.clone();
+                                            async move {
+                                                match tokio::time::timeout(
+                                                    Duration::from_millis(target_latency),
+                                                    node.request_peer_height(peer)
+                                                ).await {
+                                                    Ok(Ok(height)) => Some(height),
+                                                    _ => None
+                                                }
+                                            }
+                                        })
+                                    ).await;
+
+                                    // Process height differences with backoff
+                                    if let Some(&max_height) = heights.iter().flatten().max() {
+                                        if max_height > local_height {
+                                            sync_attempts = sync_attempts.saturating_add(1);
+                                            if sync_attempts < MAX_SYNC_ATTEMPTS {
+                                                match node.sync_with_network().await {
+                                                    Ok(_) => {
+                                                        if let Err(e) = node.publish_local_tip().await {
+                                                            warn!("Post-sync publish failed: {}", e);
+                                                        }
+                                                        sync_attempts = 0;
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Chain sync failed (attempt {}/{}): {}", 
+                                                            sync_attempts, MAX_SYNC_ATTEMPTS, e);
+                                                        if sync_attempts == MAX_SYNC_ATTEMPTS - 1 {
+                                                            warn!("Max sync attempts reached, backing off");
+                                                            tokio::time::sleep(Duration::from_secs(5)).await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Emergency peer discovery with exponential backoff
+                                let backoff_delay = if discovery_failures > 0 {
+                                    let max_delay = 30_u64;
+                                    let shift = u64::from(discovery_failures.min(MAX_DISCOVERY_ATTEMPTS));
+                                    let delay = (1_u64).checked_shl(shift as u32)
+                                        .unwrap_or(1_u64 << MAX_DISCOVERY_ATTEMPTS)
+                                        .saturating_sub(1);
+                                    Duration::from_secs(delay.min(max_delay))
+                                } else {
+                                    Duration::from_secs(1)
+                                };
+
+                                tokio::time::sleep(backoff_delay).await;
+
+                                match node.discover_network_nodes().await {
+                                    Ok(_) => {
+                                        discovery_failures = 0;
+                                    }
+                                    Err(e) => {
+                                        error!("Emergency peer discovery failed: {}", e);
+                                        discovery_failures = discovery_failures.saturating_add(1);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Chain health check
+                        _ = health_interval.tick() => {
+                            // Snapshot the tip timestamp under a short-lived guard and drop it
+                            // before any network await below. Holding the blockchain read lock
+                            // across discover_network_nodes().await deadlocks: the discovery ->
+                            // verify_peer -> perform_handshake path re-acquires blockchain.read(),
+                            // and a block-ingest write() queued between the two reads blocks the
+                            // re-entrant read forever (tokio's fair RwLock). Mirrors the sync arm.
+                            let last_ts = {
+                                let blockchain = node.blockchain.read().await;
+                                blockchain.get_last_block().map(|b| b.timestamp)
+                            };
+                            if let Some(last_ts) = last_ts {
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+
+                                let block_time = now.saturating_sub(last_ts);
+                                block_times.push_back(block_time);
+                                if block_times.len() > 50 {
+                                    block_times.pop_front();
+                                }
+
+                                // Monitor block times with moving average
+                                let avg_block_time = if !block_times.is_empty() {
+                                    block_times.iter().sum::<u64>() as f64 / block_times.len() as f64
+                                } else {
+                                    0.0
+                                };
+
+                                // Handle slow blocks
+                                if avg_block_time > MAX_BLOCK_AGE as f64 {
+                                    {
+                                        let mut health = node.network_health.write().await;
+                                        health.adjust_for_slow_blocks(avg_block_time);
+                                    }
+
+                                    // Decide whether to rediscover under a short peers guard,
+                                    // then release it before the discovery await (same lock-
+                                    // across-await hazard as above).
+                                    let need_discovery = {
+                                        let peers = node.peers.read().await;
+                                        peers.len() < MIN_VIABLE_PEERS
+                                            || peers.values().all(|p| p.latency > RECOVERY_LATENCY)
+                                    };
+                                    if need_discovery {
+                                        if let Err(e) = node.discover_network_nodes().await {
+                                            error!("Failed to discover peers during health check: {}", e);
+                                        }
+                                    }
+                                }
+
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        // Wait for monitor failure with error context
+        if let Err(e) = monitor_handle.await {
+            error!("Critical monitor failure: {} - Check system resources and network connectivity", e);
+        }
+    });
+
+    local.await;
+});
+
+        pb.set_message("Loading wallets...");
+        let key_data_result = fs::read_to_string(KEY_FILE_PATH).await;
+        let wallet_data: Vec<WalletKeyData> = key_data_result
+            .as_deref()
+            .ok()
+            .and_then(|data| serde_json::from_str(data).ok())
+            .unwrap_or_default();
+
+        let mut wallet_encryption_state: Option<zeroize::Zeroizing<Vec<u8>>> = None;
+
+        if !headless && !wallet_data.is_empty() {
+            println!("\nWallet(s) found. Enter passphrase (leave blank for unencrypted wallets):");
+
+            let passphrase = zeroize::Zeroizing::new(
+                // Unlock, not set: this ENTERS an existing passphrase, so inquire's
+                // default confirmation re-ask is wrong here (mistype = retry loop).
+                Password::new("Passphrase:")
+                    .with_display_mode(PasswordDisplayMode::Masked)
+                    .without_confirmation()
+                    .prompt()
+                    .unwrap_or_default(),
+            );
+
+            if !passphrase.trim().is_empty() {
+                wallet_encryption_state = Some(zeroize::Zeroizing::new(
+                    passphrase.trim().as_bytes().to_vec(),
+                ));
+            }
+        }
+
+        let mut wallets = if headless
+            && matches!(&key_data_result, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            println!("Headless mode: no private.key found; continuing without a local wallet.");
+            HashMap::new()
+        } else if headless && key_data_result.is_err() {
+            // Existing-but-unreadable key file (EACCES / non-UTF-8 / AV lock): do NOT silently run
+            // walletless on a key-holding node — that masks the condition. Abort loudly, mirroring
+            // the H4 guard in load_wallets.
+            let e = key_data_result.as_ref().err().unwrap();
+            return Err(format!(
+                "{} exists but could not be read ({:?}: {}). Refusing to start walletless so the \
+                 condition is not masked — fix permissions or restore from backup.",
+                KEY_FILE_PATH,
+                e.kind(),
+                e
+            )
+            .into());
+        } else if wallet_encryption_state.is_some() {
+            mgmt.load_wallets(
+                &db_arc,
+                wallet_encryption_state
+                    .as_ref()
+                    .map(|passphrase| passphrase.as_slice()),
+            )
+            .await?
+        } else {
+            mgmt.load_wallets(&db_arc, None).await?
+        };
+        pb.inc(1);
+
+        if let Some(config) = &headless_mining {
+            // A node told to mine that quietly does not mine stays in that state
+            // for days — nobody is watching a headless console to notice. This
+            // file already makes the same call for a key file it cannot read
+            // ("Refusing to start walletless so the condition is not masked").
+            let known = wallets.contains_key(&config.wallet)
+                || wallets.values().any(|w| w.address == config.wallet);
+            if !known {
+                let mut names: Vec<&str> = wallets.keys().map(|s| s.as_str()).collect();
+                names.sort_unstable();
+                // Lead with the cause that is actually true here, not just the one
+                // that is always true. When private.key is simply absent from the
+                // working directory (the common systemd-WorkingDirectory-is-wrong
+                // case), saying only "the mining wallet must be unencrypted" sends
+                // the operator to decrypt a wallet that was never the problem —
+                // the same misdirection this refusal exists to prevent, just aimed
+                // at the wrong cause.
+                let key_file_missing = matches!(
+                    &key_data_result,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                );
+                let lead = if key_file_missing {
+                    format!(
+                        "ALPHANUMERIC_MINE names '{}', which is not a loaded wallet: no \
+                         {KEY_FILE_PATH} exists in the working directory ({}). Start the node \
+                         from the directory that holds it, or move it there.",
+                        config.wallet,
+                        std::env::current_dir()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "?".to_string())
+                    )
+                } else {
+                    format!(
+                        "ALPHANUMERIC_MINE names '{}', which is not a loaded wallet (loaded: {}).",
+                        config.wallet,
+                        if names.is_empty() { "none".to_string() } else { names.join(", ") }
+                    )
+                };
+                return Err(format!(
+                    "{lead} Headless cannot prompt for a passphrase, so an encrypted wallet is \
+                     skipped at load and will not appear here — the mining wallet must be \
+                     unencrypted. Refusing to start a node that was told to mine and cannot.",
+                )
+                .into());
+            }
+        }
+
+        // Staking
+        let header_sentinel = node.header_sentinel().ok_or_else(|| {
+            std::io::Error::other("Missing header sentinel")
+        })?;
+        let staking_node = Arc::new(RwLock::new(BPoSSentinel::new(
+            blockchain.clone(),
+            Arc::clone(&node),
+            header_sentinel,
+        )));
+
+        // Whisper
+        let whisper_module = Arc::new(RwLock::new(WhisperModule::new()));
+        let wallet_addresses: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(
+            wallets.values().map(|w| w.address.clone()).collect(),
+        ));
+
+        // Push the tip to an external hook (Bitcoin's -blocknotify contract) for
+        // Stratum pools, which otherwise poll and hand out work on a dead parent.
+        // Unconditional by design: a pool runs headless, so gating this on the
+        // interactive path would disable it for its only audience. No-op unless
+        // ALPHANUMERIC_BLOCKNOTIFY is set; see a9::blocknotify.
+        alphanumeric::a9::blocknotify::spawn(blockchain.clone());
+
+        // Instant received-funds notification. Subscribes to the in-process tip
+        // signal (fired by the live beacon-watch sync on every applied block) and
+        // scans the newly-applied block(s) for credits to a local wallet — no
+        // polling, no server state, no per-wallet index; it rides the delta the
+        // node already pulled. This is what makes an incoming payment show up
+        // instantly without restarting or refreshing.
+        // Session-mined blocks (height, hash, reward): the tip-signal task below
+        // re-checks these on every applied block and reports a reorg that orphaned
+        // one — the miner otherwise never learns; the maturing reward just
+        // silently vanishes from `balance` and the end-of-run summary overstates
+        // earnings.
+        #[allow(clippy::type_complexity)] // Session telemetry: height, exact hash, reward.
+        let session_mined: Arc<tokio::sync::Mutex<Vec<(u32, [u8; 32], f64)>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        {
+            let wallet_addresses = wallet_addresses.clone();
+            let blockchain = blockchain.clone();
+            let whisper_module = whisper_module.clone();
+            let session_mined_watch = Arc::clone(&session_mined);
+            tokio::spawn(async move {
+                let mut rx = { blockchain.read().await.subscribe_tip_changes() };
+                let mut last_scanned: u32 =
+                    { blockchain.read().await.get_latest_block_index() as u32 };
+                // Per-session, owned by this task alone — no lock on the notice path.
+                // Payments and whispers get SEPARATE budgets: the payment digest is
+                // lossy (it drops per-payment amounts and senders), so a shared budget
+                // would let whisper spam — the cheapest traffic on the chain — collapse
+                // the credit lines an exchange actually needs to see.
+                let mut receipt_rate = NoticeRate::new();
+                let mut whisper_rate = NoticeRate::new();
+                let mut whisper_accum = WhisperAccum::new();
+                let mut whisper_last_emit: Option<Instant> = None;
+                let mut announced = AnnouncedCredits::new();
+                loop {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                    let height = rx.borrow().height;
+                    let addresses = { wallet_addresses.read().await.clone() };
+                    if addresses.is_empty() {
+                        last_scanned = height;
+                        continue;
+                    }
+                    // Scan every block applied since the last signal (covers a
+                    // multi-block catch-up); on a reorg just re-scan the new tip.
+                    let from = if height > last_scanned {
+                        last_scanned.saturating_add(1)
+                    } else {
+                        height
+                    };
+                    for h in from..=height {
+                        let block = { blockchain.read().await.get_block(h).ok() };
+                        let Some(block) = block else { continue };
+                        // Classify the whole block BEFORE printing anything: the
+                        // digest decision needs this block's total, and a line
+                        // already written to the terminal cannot be taken back.
+                        let mut payments: Vec<(f64, String, String)> = Vec::new();
+                        let mut whispers: Vec<(String, String, f64)> = Vec::new();
+                        {
+                            // ONE read guard for the whole block. The whisper module is
+                            // never written after construction, and taking it per
+                            // transaction cost an acquisition per candidate. The guard is
+                            // scoped so it is provably dropped before any output — the
+                            // publisher-park rule (never hold a guard across a print).
+                            let whisper_module = whisper_module.read().await;
+                            for tx in &block.transactions {
+                                if tx.sender == "MINING_REWARDS" {
+                                    continue; // mining rewards are reported by the miner
+                                }
+                                if !addresses.contains(&tx.recipient) {
+                                    continue;
+                                }
+                                // A reorg re-scans the tip, so the same credit can arrive
+                                // here twice. Report each one once — by identity, not by
+                                // height, because a reorg can just as easily bring a
+                                // DIFFERENT set of transactions to the same height and those
+                                // must still be announced.
+                                if !announced.first_sighting(tx) {
+                                    continue;
+                                }
+                                // FULL sender, never abbreviated. A 10-character prefix
+                                // is 40 bits, which is minutes of GPU grinding to collide
+                                // deliberately — the address-poisoning shape, where a
+                                // lookalike sender gets trusted or copied out of history.
+                                // The sender is the attacker-controlled, actionable half,
+                                // so it is shown whole. The recipient stays short: it is
+                                // one of the operator's own addresses, from a set they
+                                // already know, and nothing is decided by reading it.
+                                let from_full = tx.sender.clone();
+                                let amount = Transaction::from_units(tx.amount_units);
+                                // A whisper carries a message in its fee. It is still a
+                                // payment: the amount travels with it and is reported
+                                // either way, because the fee band is not an exclusive
+                                // signal — an ordinary payment at a flat fee schedule
+                                // lands in it too (a 1 ♦ payment at a 0.001 fee decodes
+                                // as some code). Reporting the code without the value
+                                // would hide real money behind a novelty.
+                                match whisper_module.decode_whisper_in_tx(tx) {
+                                    Some(code) => whispers.push((from_full, code, amount)),
+                                    None => payments.push((
+                                        amount,
+                                        short_addr(&tx.recipient),
+                                        from_full,
+                                    )),
+                                }
+                            }
+                        }
+
+                        // Whispers first, then payments: with collapsing in play the
+                        // reading order has to be fixed, not transaction order.
+                        let now = Instant::now();
+                        if !whispers.is_empty() {
+                            let recent = whisper_rate.recent(now);
+                            // Count whispers OBSERVED, never lines printed — see NoticeRate.
+                            whisper_rate.record(now, whispers.len());
+                            if whisper_action(whispers.len(), recent, !whisper_accum.is_empty())
+                                == WhisperAction::Verbose
+                            {
+                                for (from_full, code, amount) in &whispers {
+                                    notify_async(format!(
+                                        "\n{}whisper{}   {}{}{}  {:.8} ♦  from {}",
+                                        EV_WHISPER,
+                                        EV_OFF,
+                                        EV_CODE,
+                                        code,
+                                        EV_OFF,
+                                        amount,
+                                        from_full,
+                                    )).await;
+                                }
+                            } else {
+                                whisper_accum.merge(block.index, &whispers);
+                            }
+                        }
+                        // Runs even on a block with no whispers, so a rollup left
+                        // pending when the flood stops still flushes.
+                        if !whisper_accum.is_empty() && whisper_rollup_due(whisper_last_emit, now) {
+                            notify_async(whisper_accum.render()).await;
+                            whisper_accum.clear();
+                            whisper_last_emit = Some(now);
+                        }
+
+                        if !payments.is_empty() {
+                            let recent = receipt_rate.recent(now);
+                            let digest = should_digest_receipts(payments.len(), recent);
+                            // Record before emitting, and record the payment count
+                            // even when digesting — see NoticeRate.
+                            receipt_rate.record(now, payments.len());
+
+                            if digest {
+                                let total: f64 = payments.iter().map(|(amount, ..)| amount).sum();
+                                let wallets: std::collections::HashSet<&str> =
+                                    payments.iter().map(|(_, to, _)| to.as_str()).collect();
+                                notify_async(format!(
+                                    "\n{}received{}  {} payments  +{:.8} ♦  to {} wallet{}  {}block {} · history for detail{}",
+                                    EV_RECEIVED,
+                                    EV_OFF,
+                                    payments.len(),
+                                    total,
+                                    wallets.len(),
+                                    if wallets.len() == 1 { "" } else { "s" },
+                                    EV_DIM,
+                                    block.index,
+                                    EV_OFF
+                                )).await;
+                            } else {
+                                for (amount, _to_short, from_full) in &payments {
+                                    notify_async(format!(
+                                        "\n{}received{}  {:.8} ♦  from {}",
+                                        EV_RECEIVED,
+                                        EV_OFF,
+                                        amount,
+                                        from_full,
+                                    )).await;
+                                }
+                            }
+                        }
+                    }
+                    // Session-mined blocks: report a reorg that orphaned one.
+                    // Judged only for heights the current tip has reached;
+                    // still-canonical entries stop being tracked once buried
+                    // beyond reorg reach.
+                    let snapshot: Vec<(u32, [u8; 32], f64)> =
+                        { session_mined_watch.lock().await.clone() };
+                    if !snapshot.is_empty() {
+                        let mut orphaned: Vec<u32> = Vec::new();
+                        for (h, expected_hash, reward) in &snapshot {
+                            if *h > height {
+                                continue; // judged when the tip re-reaches it
+                            }
+                            let stored =
+                                { blockchain.read().await.get_block(*h).ok().map(|b| b.hash) };
+                            if stored != Some(*expected_hash) {
+                                orphaned.push(*h);
+                                notify_async(format!(
+                                    "\n{}reorged{}   block {} lost the race — its {:.8} ♦ reward is no longer on the canonical chain",
+                                    EV_REORG, EV_OFF, h, reward
+                                )).await;
+                            }
+                        }
+                        let mut mined = session_mined_watch.lock().await;
+                        mined.retain(|(h, _, _)| {
+                            !orphaned.contains(h) && height.saturating_sub(*h) < 1024
+                        });
+                    }
+                    last_scanned = height;
+                }
+            });
+        }
+
+        // Initialize the BPoS sentinel in the BACKGROUND. initialize() runs
+        // verify_chain_state, whose anomaly path chases peers over the network — at a
+        // high block rate it reliably finds work and takes the full time-box, which
+        // (when awaited in-band) stalled EVERY startup for up to 8s right after
+        // "Loaded N wallets successfully" before the menu appeared. It is idempotent,
+        // its monitoring tasks spawn before the blocking part, and the 60s monitor
+        // loop covers the rest — so running it off the startup path is safe and just
+        // removes the visible stall; the menu now appears immediately. Still
+        // time-boxed inside the task so it can never sit forever.
+        {
+            let staking_bg = staking_node.clone();
+            tokio::spawn(async move {
+                let sentinel = staking_bg.write().await;
+                match tokio::time::timeout(Duration::from_secs(8), sentinel.initialize()).await {
+                    Ok(Err(e)) => error!("Failed to initialize staking sentinel: {}", e),
+                    Err(_) => {
+                        warn!("Staking sentinel initialization deferred (node busy)")
+                    }
+                    Ok(Ok(())) => {}
+                }
+            });
+        }
+
+        // Runtime canonical reconciliation — for EVERY node, interactive included
+        // (v7.6.5: this used to run only in headless mode, so an interactive `a#:`
+        // client had NO background sync at all — it only converged inside mine-prep,
+        // fell behind the racing tip the whole time it sat at the menu, and then had
+        // to cross the entire accumulated gap inside one prep budget: the "my client
+        // is always behind / can't compete" complaint all night). A 20s cadence
+        // keeps an idle client within a block or two of the tip; when already at the
+        // tip a check is one CDN-cached beacon poll and a local compare. A node that
+        // drifts onto a fork heals in place (incremental reorg); only a genuine,
+        // repeated below-finality divergence escalates to restart + re-bootstrap.
+        {
+            let node_recon = node.clone();
+            let shutdown_recon = shutdown_requested.clone();
+            let db_path_recon = db_path.clone();
+            let db_for_recon = db.clone();
+            // spawn_logged: a panic in this loop previously died silently — the node
+            // kept running with no background reconciliation at all.
+            alphanumeric::a9::node::spawn_logged("runtime-reconcile", async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(20));
+                // Wake-from-sleep: where Instant advances across an OS suspend
+                // (Windows), the default Burst behavior replays every slept-through
+                // tick back-to-back — two NeedsBootstrap iterations (= two strikes,
+                // marker + exit) could fire within seconds of waking, before
+                // discovery had re-dialed a single live peer. Delay ticks once
+                // immediately, then resumes the 20s cadence, so the wake-recovery
+                // delta-sync gets its chance and strikes stay >= 20s apart.
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut strikes = 0u32;
+
+                let mut progress_resets = 0;
+                let mut cooldown_logged = false;
+                let mut behind_logged = false;
+                loop {
+                    ticker.tick().await;
+                    if shutdown_recon.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match node_recon.sync_to_beacon().await {
+                        Converge::Converged => {
+                            strikes = 0;
+                            // PROVEN convergence invalidates any stale marker: a node
+                            // that recovered in place during a fail-open (gateway-down)
+                            // boot must not get its now-healthy chain wiped at the next
+                            // gateway-up restart (review finding, 2026-07-11). Every
+                            // Converged tick, not once: mine-prep can write a marker at
+                            // any later moment (transient fork-storm NeedsBootstrap),
+                            // and a one-shot cleanup left that marker to wipe a chain
+                            // that then converged healthily for hours (audit finding).
+                            // Cost: one unlink of a usually-absent path per 20s tick.
+                            let _ = std::fs::remove_file(force_rebootstrap_marker_path(
+                                &db_path_recon,
+                            ));
+                            behind_logged = false;
+                        }
+                        Converge::AtTipAhead
+                        | Converge::Progressed
+                        | Converge::BeaconStale
+                        | Converge::BranchInvalid => {
+                            strikes = 0;
+                            behind_logged = false;
+                        }
+                        Converge::NeedsBootstrap => {
+                            // RESILIENT SERVICE CLIENTS (exchange / explorer /
+                            // web-wallet API): a NeedsBootstrap from an idle node
+                            // is almost always a FALSE POSITIVE — the node mints
+                            // nothing, so it is a canonical PREFIX (not a fork),
+                            // just behind and momentarily unable to fetch the
+                            // intervening bodies (relay holes / thin mesh /
+                            // partition). The old code escalated that to a process
+                            // exit every ~minute, taking the SERVICE down and
+                            // thinning the mesh. Only a genuine "fallen more than
+                            // ORPHAN_REORG_DEPTH behind" (bodies aged out, snapshot
+                            // is the only cure) warrants the disruptive exit +
+                            // re-bootstrap. Below that, STAY UP and keep serving —
+                            // the in-place converge / Tier-2 peer-sync / gossip
+                            // loops recover the node, and if it never catches up it
+                            // crosses the threshold on its own and re-bootstraps
+                            // then. Read-only + mining-neutral: mine-prep still
+                            // re-checks convergence and writes its own marker
+                            // (schedule_force_rebootstrap_hard) untouched.
+                            let (genuinely_too_far, forked) = {
+                                let local_tip = node_recon
+                                    .blockchain
+                                    .read()
+                                    .await
+                                    .get_latest_block_index()
+                                    as u32;
+                                // FORK vs BEHIND: NeedsBootstrap is overloaded. A
+                                // genuine FORK (our tip is not on canonical) can
+                                // have a small — or even negative — height gap, so
+                                // gap alone would leave a forked service node
+                                // serving wrong-chain data. Re-derive the two fork
+                                // checks the boot reconcile uses, read through the
+                                // OPEN handle (no DB re-open), touching nothing on
+                                // the mine path:
+                                let beacon = node_recon.network_beacon_tip().await;
+                                //  (B) anchor at-or-below our tip: fetch a signed
+                                //      canonical header <= local_tip and compare its
+                                //      hash to the block we hold there. Catches a
+                                //      fork whose divergence point is at/below our
+                                //      tip and below the beacon.
+                                let mut forked = match fetch_canonical_anchor_at_or_below(
+                                    local_tip,
+                                )
+                                .await
+                                {
+                                    Some((anchor_h, anchor_hash)) if anchor_h <= local_tip => {
+                                        match node_recon
+                                            .blockchain
+                                            .read()
+                                            .await
+                                            .get_block(anchor_h)
+                                        {
+                                            Ok(b) => !hex::encode(b.hash)
+                                                .eq_ignore_ascii_case(&anchor_hash),
+                                            Err(_) => false,
+                                        }
+                                    }
+                                    _ => false,
+                                };
+                                //  (A) at the beacon tip: when we are AT/ABOVE the
+                                //      beacon height, compare our block at the beacon
+                                //      height to the signed beacon hash. Catches an
+                                //      out-extended taller-but-losing fork (gap<=0),
+                                //      which check (B)'s anchor — landing on the
+                                //      shared fork point — would miss.
+                                if !forked {
+                                    if let Some((bh, bhash)) = &beacon {
+                                        if local_tip >= *bh {
+                                            if let Ok(b) = node_recon
+                                                .blockchain
+                                                .read()
+                                                .await
+                                                .get_block(*bh)
+                                            {
+                                                forked = !hex::encode(b.hash)
+                                                    .eq_ignore_ascii_case(bhash);
+                                            }
+                                        }
+                                    }
+                                }
+                                let beacon_height = beacon.as_ref().map(|(h, _)| *h);
+                                (
+                                    idle_reconcile_needs_snapshot(local_tip, beacon_height, forked),
+                                    forked,
+                                )
+                            };
+                            if !genuinely_too_far {
+                                strikes = 0;
+                                if !behind_logged {
+                                    notify_async("Behind the network tip; catching up in the background. The node stays up and keeps serving.".to_string()).await;
+                                    behind_logged = true;
+                                }
+                                continue;
+                            }
+                            // Genuinely too far, but NOT forked: an on-canonical prefix
+                            // that has simply fallen far behind (> ORPHAN_REORG_DEPTH).
+                            // Before escalating to a full-snapshot re-bootstrap (marker +
+                            // exit + ~885 MB download + a BLOATED bulk-imported DB), try to
+                            // close the gap with a bulk P2P delta-sync from any full-history
+                            // peer — seeds OR already-connected peers (include_connected_peers
+                            // = true). This keeps the node UP, keeps its sled DB COMPACT
+                            // (incremental append vs bulk import), and only re-bootstraps
+                            // when no peer can actually serve the range. A genuine FORK still
+                            // escalates immediately (skipped here). If the delta-sync can't
+                            // proceed — no full-history peer, aged-out span, or a stall — we
+                            // fall straight through to the existing strike/snapshot path, so
+                            // the snapshot stays the guaranteed escape and no forked or truly
+                            // stranded node is left behind. Source-independent safety: the
+                            // sync's STEP-2 tip probe pins the tip to the gateway-signed
+                            // beacon hash and every block is validated on ingest, so a lying
+                            // or off-canonical peer cannot advance us (returns NeedsBootstrap
+                            // -> falls through). Mining-neutral: read-only convergence, no
+                            // marker written, mine-prep's own reconcile untouched.
+                            if !forked {
+                                // Tip before this converge cycle, for the progress check in
+                                // the fallthrough arm. Guard is a temporary — dropped at the
+                                // semicolon, never held across the sync await.
+                                let tip_before = node_recon
+                                    .blockchain
+                                    .read()
+                                    .await
+                                    .get_latest_block_index()
+                                    as u32;
+                                match node_recon.sync_full_history_from_peer(true).await {
+                                    verdict @ (Converge::Converged
+                                    | Converge::AtTipAhead
+                                    | Converge::Progressed) => {
+                                        // Converged/AtTipAhead prove this generation reached
+                                        // the tip: the incident is over, so a FUTURE deep gap
+                                        // starts a fresh respawn budget. Progressed is still
+                                        // mid-heal and deliberately does not count.
+                                        if !matches!(verdict, Converge::Progressed) {
+                                            LINEAGE_HEALED.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
+                                            progress_resets = 0;
+                                        }
+                                        strikes = 0;
+                                        if !behind_logged {
+                                            notify_async("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string()).await;
+                                            behind_logged = true;
+                                        }
+                                        continue;
+                                    }
+                                    _ => {
+                                        // A failed VERDICT is not a failed HEAL: the bounded
+                                        // converge reports NeedsBootstrap for ANY residual gap,
+                                        // including the cycle that just applied thousands of
+                                        // blocks and ran out of deadline (expiry keeps a
+                                        // consistent prefix; the next cycle resumes from the
+                                        // advanced tip). Striking on that verdict killed nodes
+                                        // 5-10 minutes into a working catch-up. So the fuse
+                                        // resets on measured PROGRESS — the same rule mine-prep
+                                        // uses — and only a cycle that moved the tip nowhere
+                                        // counts toward the snapshot escape.
+                                        let tip_now = node_recon
+                                            .blockchain
+                                            .read()
+                                            .await
+                                            .get_latest_block_index()
+                                            as u32;
+                                        // Bounded: an eclipse peer could drip just enough
+                                        // real blocks to keep resetting the fuse while the
+                                        // node never actually gains on the network. The
+                                        // largest legitimate runtime heal is one keep-band
+                                        // (8192 blocks) plus slow pre-mesh retries — well
+                                        // inside 60 cycles — so past the budget the drip
+                                        // stops counting as health and the snapshot escape
+                                        // proceeds. Reset on any proven arrival at the tip.
+                                        if tip_now > tip_before && progress_resets < 60 {
+                                            progress_resets += 1;
+                                            strikes = 0;
+                                            if !behind_logged {
+                                                notify_async("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string()).await;
+                                                behind_logged = true;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            behind_logged = false;
+                            strikes += 1;
+                            if strikes >= 2 {
+                                // Bootstrap-cycle cooldown: on a genuinely shattered
+                                // network this exit repeats; without a floor the old
+                                // cheap ~21s crash-loop becomes a snapshot-download
+                                // loop. This verdict is a PROVEN below-finality
+                                // divergence against the signed beacon, so it uses the
+                                // HARD (short) window: suppressing it for the generic
+                                // 30 minutes left a node that knew it was stranded
+                                // sitting stale doing nothing (2026-07-11). Within the
+                                // short window, stay up and keep retrying converge —
+                                // same eventual recovery, bounded cost.
+                                if rebootstrap_hard_cooldown_active(&db_path_recon) {
+                                    if !cooldown_logged {
+                                        notify_async("Chain cannot converge, but a forced re-bootstrap ran recently; staying up and retrying until the cooldown passes".to_string()).await;
+                                        cooldown_logged = true;
+                                    }
+                                    strikes = 0;
+                                    continue;
+                                }
+                                // Drop the force-rebootstrap marker BEFORE exiting: the
+                                // boot-time manifest comparison lags its publish cadence,
+                                // so a fork AT tip height read as "in sync" at boot and
+                                // this exit crash-looped ~21s at a time until the manifest
+                                // caught up (observed 7x back-to-back, 2026-07-10). The
+                                // marker makes the next boot re-bootstrap unconditionally
+                                // — the live loop has PROVEN convergence is impossible,
+                                // which outranks any boot-time guess.
+                                let marker = force_rebootstrap_marker_path(&db_path_recon);
+                                // Durable (fsync'd): this marker exists to break a
+                                // crash loop, so it must survive the power cut /
+                                // kernel panic that may follow the exit below.
+                                if let Err(e) = alphanumeric::a9::node::write_durable(
+                                    &marker,
+                                    b"runtime too-far-behind exit\n",
+                                ) {
+                                    eprintln!(
+                                        "Warning: could not write re-bootstrap marker {}: {}",
+                                        marker.display(),
+                                        e
+                                    );
+                                }
+                                // Interactive sessions never die into a dead terminal:
+                                // the marker above already guarantees the next boot
+                                // re-bootstraps, so hand this same terminal a next boot.
+                                // Exec does not run Drop — identical semantics to the
+                                // exit(3) below, which is the point: the durable marker,
+                                // not teardown, is the recovery contract. Headless nodes
+                                // keep exit(3) byte-for-byte: supervisors depend on it,
+                                // and the other watchdogs already draw this same
+                                // interactive/headless line.
+                                let interactive = !env_flag_enabled("ALPHANUMERIC_HEADLESS")
+                                    && std::io::IsTerminal::is_terminal(&std::io::stdin());
+                                if interactive {
+                                    println!(
+                                        "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; restarting in place to pull a fresh verified snapshot...",
+                                        alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
+                                    );
+                                    alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+                                    let _ = db_for_recon.flush();
+                                    let _ = remove_db_lock(&format!(
+                                        "{}.lock",
+                                        db_path_recon
+                                    ));
+                                    let _ = remove_instance_lock();
+                                    let err = restart_in_place();
+                                    eprintln!(
+                                        "In-place restart unavailable ({}); exiting — relaunch the app to finish the re-bootstrap.",
+                                        err
+                                    );
+                                    std::process::exit(3);
+                                }
+                                println!(
+                                    "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; re-bootstrapping from a fresh snapshot. Run under a supervisor (systemd/docker restart) so the service comes back automatically.",
+                                    alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
+                                );
+                                // Flush before exit like every other exit path:
+                                // the store buffers non-durable writes between periodic flushes, and discarding them
+                                // here costs a derived-state rebuild on the next
+                                // boot — on the very path whose job is recovery.
+                                let _ = db_for_recon.flush();
+                                // Nonzero: this exit exists to BE re-launched (the marker written
+                                // above makes the next boot re-bootstrap). exit(0) reads as success,
+                                // so systemd Restart=on-failure / docker restart:on-failure would
+                                // leave the stranded node dead instead of restarting it.
+                                std::process::exit(3);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        if headless {
+            println!("Headless mode enabled. Node services are running.");
+
+            if let Some(config) = headless_mining {
+                println!(
+                    "mining: starting continuous {} mining to {}",
+                    if config.use_gpu { "GPU" } else { "CPU" },
+                    config.wallet
+                );
+
+                // Headless mining is always continuous: a session that mines one
+                // block and stops has nobody at a terminal to start it again.
+                // There is no Enter-to-stop reader here (no one is watching
+                // stdin), so `stop` is driven only by the process shutting
+                // down — mirror it the way the REPL mirrors SIGTERM into its
+                // own stop flag, since only `stop` (not `shutdown` alone)
+                // interrupts an in-progress mining round.
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_on_signal = Arc::clone(&stop);
+                let shutdown_watch = Arc::clone(&shutdown_requested);
+                let signal_bridge = tokio::spawn(async move {
+                    while !shutdown_watch.load(Ordering::Acquire) {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    stop_on_signal.store(true, Ordering::SeqCst);
+                });
+
+                // Same announce path the REPL's `mine` command uses: publish the
+                // freshly-mined block immediately, retrying with backoff, and
+                // say so if every attempt fails — a block that never leaves
+                // this machine looks like a normal success otherwise.
+                let announce_node = Arc::clone(&node);
+                let announce = move |block: &Block| {
+                    let publish_node = Arc::clone(&announce_node);
+                    let mined_block = block.clone();
+                    let mined_height = mined_block.index;
+                    tokio::spawn(async move {
+                        const MAX_PUBLISH_ATTEMPTS: u32 = 4;
+                        for attempt in 1..=MAX_PUBLISH_ATTEMPTS {
+                            match publish_node
+                                .publish_block(mined_block.clone(), "Post-mine")
+                                .await
+                            {
+                                Ok(()) => return,
+                                Err(e) if attempt < MAX_PUBLISH_ATTEMPTS => {
+                                    warn!(
+                                        "Failed to publish mined block (attempt {}/{}): {}",
+                                        attempt, MAX_PUBLISH_ATTEMPTS, e
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(2 * attempt as u64))
+                                        .await;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to publish mined block after {} attempts: {}",
+                                        MAX_PUBLISH_ATTEMPTS, e
+                                    );
+                                    // Say it on the console too, same as the REPL's `mine`
+                                    // command: a block that never left this machine looks
+                                    // like a normal success otherwise, and RUST_LOG being
+                                    // unset must not be the reason this goes unnoticed.
+                                    println!(
+                                        "\n⚠ Block #{} could not be published to the network ({} attempts). It is saved locally, but until connectivity recovers other miners may overtake it — check your connection.",
+                                        mined_height, MAX_PUBLISH_ATTEMPTS
+                                    );
+                                }
+                            }
+                        }
+                    });
+                };
+
+                // The session loop does not know how to talk to a person: it
+                // reports, and this prints. Every string here is written for
+                // this, not lifted from the REPL's in-place terminal output —
+                // advice like "run `mine` again in a moment" has no one to
+                // act on it here.
+                //
+                // println!/eprintln!, not log::info!/log::warn!: async_main
+                // initializes env_logger at LevelFilter::Error (its own
+                // comment says that is "to avoid UI interference", which
+                // does not apply here — headless has no UI), and there is no
+                // RUST_LOG target that unmutes only this feature without also
+                // unmuting node.rs/blockchain.rs/webrtc.rs and the rest,
+                // since the bin and lib share the crate name. So this must be
+                // visible at the default level, matching the `println!`
+                // immediately above (and `handle_mine_command`'s own
+                // println!s, unconditional regardless of headless).
+                //
+                // Streams are split: the variants that end the session --
+                // `Unminable`, `GaveUp`, and `Failed { backoff: None }` -- go
+                // to stderr, so an operator grepping stderr finds the cause
+                // without wading through per-round chatter; everything else
+                // goes to stdout.
+                //
+                // `prep_open` pairs PreparingStarted/PreparingEnded: the loop
+                // only reports PreparingStarted on the first round of a
+                // continuous session (mgmt.rs gates it on `mined_count == 0`),
+                // but reports PreparingEnded every round -- an unpaired
+                // opener would read as a hang, so the closer only prints when
+                // an opener actually printed first.
+                let prep_open = Arc::new(AtomicBool::new(false));
+                // Cause of a non-shutdown session end (Finding 4): the loop
+                // hands back only a block count, not why it stopped, so this
+                // is filled in from the one-shot reports that mean the
+                // session is over and read back after the call returns.
+                let end_reason: Arc<std::sync::Mutex<Option<String>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let end_reason_report = Arc::clone(&end_reason);
+                let report: Arc<dyn Fn(alphanumeric::a9::mgmt::MiningProgress) + Send + Sync> =
+                    Arc::new(move |progress| {
+                        use alphanumeric::a9::mgmt::MiningProgress as P;
+                        match progress {
+                            P::PreparingStarted => {
+                                prep_open.store(true, Ordering::Relaxed);
+                                println!("mining: preparing to compete for the next block");
+                            }
+                            P::Preparing {
+                                height,
+                                target,
+                                elapsed,
+                            } => match (height, target) {
+                                (Some(local_tip), Some(known_tip)) => println!(
+                                    "mining: still syncing to the network tip ({} of {}, {}s)",
+                                    local_tip,
+                                    known_tip,
+                                    elapsed.as_secs()
+                                ),
+                                // target is None because the network is not ahead of
+                                // us (mgmt.rs), NOT because we're behind and don't
+                                // know it yet -- so this must not say "syncing", or
+                                // an unreachable beacon reads as a sync problem.
+                                (Some(local_tip), None) => println!(
+                                    "mining: preparing at tip {} ({}s) -- not behind the \
+                                     network's known tip",
+                                    local_tip,
+                                    elapsed.as_secs()
+                                ),
+                                (None, _) => {
+                                    println!("mining: preparing ({}s)", elapsed.as_secs())
+                                }
+                            },
+                            P::PreparingEnded => {
+                                if prep_open.swap(false, Ordering::Relaxed) {
+                                    println!("mining: prep finished");
+                                }
+                            }
+                            P::Unminable { reason } => {
+                                // 락이 poison 되면 이 보고를 잃되, 패닉하지는
+                                // 않는다. unwrap 이면 이후 모든 보고가 패닉하고,
+                                // 그 unwind 는 session_ended() 앞을 지나가므로
+                                // 엔드포인트가 프로세스가 죽을 때까지
+                                // `mining: true` 로 얼어붙는다.
+                                if let Ok(mut slot) = end_reason_report.lock() {
+                                    *slot = Some(format!("prep refused: {}", reason));
+                                }
+                                eprintln!("mining: cannot mine right now: {}", reason);
+                            }
+                            P::NotSynced {
+                                retry_in: Some(wait),
+                            } => println!(
+                                "mining: network tip not reached; retrying in {}s",
+                                wait.as_secs()
+                            ),
+                            P::NotSynced { retry_in: None } => {
+                                println!("mining: network tip not reached; session ending")
+                            }
+                            P::Mined { index, elapsed } => println!(
+                                "mining: mined block {} in {:.1}s",
+                                index,
+                                elapsed.as_secs_f64()
+                            ),
+                            P::Absorbing { index } => println!(
+                                "mining: waiting for block {} to propagate before the next round",
+                                index
+                            ),
+                            P::LostRace { retrying: true } => println!(
+                                "mining: lost the race for this block; retargeting the new tip"
+                            ),
+                            P::LostRace { retrying: false } => {
+                                println!("mining: lost the race for this block; session ending")
+                            }
+                            P::Failed { error, backoff } => match backoff {
+                                Some(wait) => println!(
+                                    "mining: round failed: {} — retrying in {}s",
+                                    error,
+                                    wait.as_secs()
+                                ),
+                                None => {
+                                    if let Ok(mut slot) = end_reason_report.lock() {
+                                        *slot = Some(format!("round failed: {}", error));
+                                    }
+                                    eprintln!("mining: round failed: {}", error);
+                                }
+                            },
+                            P::GaveUp { errors } => {
+                                if let Ok(mut slot) = end_reason_report.lock() {
+                                    *slot = Some(format!("{} consecutive mining errors", errors));
+                                }
+                                eprintln!(
+                                    "mining: giving up after {} consecutive failures",
+                                    errors
+                                );
+                            }
+                            P::Stopped { blocks } => println!(
+                                "mining: session stopped after mining {} block(s)",
+                                blocks
+                            ),
+                        }
+                    });
+
+                let mined_count = mgmt
+                    .run_mining_session(
+                        alphanumeric::a9::mgmt::MiningSession {
+                            wallet: config.wallet,
+                            use_gpu: config.use_gpu,
+                            continuous: true,
+                            stop,
+                            shutdown: Arc::clone(&shutdown_requested),
+                            mined_log: Some(Arc::clone(&session_mined)),
+                            announce: &announce,
+                            report,
+                        },
+                        &mut wallets,
+                        &blockchain,
+                        &db_arc,
+                        &node,
+                    )
+                    .await;
+                signal_bridge.abort();
+                println!(
+                    "mining: headless session ended ({} block(s) mined)",
+                    mined_count
+                );
+
+                // A continuous session only stops on its own via `Unminable` (a
+                // divergence retrying cannot heal) or `GaveUp` (errors repeating
+                // back-to-back) — `stop` here is driven solely by `shutdown`, so
+                // reaching this point with no shutdown requested means one of
+                // those, not an intentional exit. This file already refuses to
+                // let a stranded-node exit read as success (see the rebootstrap
+                // `exit(3)` above: "exit(0) reads as success, so
+                // Restart=on-failure would leave the node dead instead of
+                // restarting it"). A mining node that silently stopped mining
+                // is the same failure — exit nonzero so a supervisor restarts it
+                // rather than leaving it up and idle for however long nobody
+                // notices.
+                if !shutdown_requested.load(Ordering::Acquire) {
+                    // Flush before exit like every other exit path (see the
+                    // rebootstrap `exit(3)` above): the store buffers non-durable
+                    // writes between periodic flushes, and this exit is not the
+                    // SIGTERM/Ctrl-C path, so the signal handler's flush never
+                    // runs for it.
+                    let _ = db.flush();
+                    let cause = end_reason
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .unwrap_or_else(|| "unknown (no ending report was captured)".to_string());
+                    return Err(format!(
+                        "Mining session ended on its own ({} block(s) mined this run) rather \
+                         than from a shutdown request: {}. Refusing to exit 0 for this so a \
+                         supervisor (systemd Restart=on-failure, docker restart:on-failure) \
+                         restarts the node instead of leaving it up and not mining.",
+                        mined_count, cause
+                    )
+                    .into());
+                }
+                return Ok(());
+            }
+
+            // (Runtime canonical reconciliation runs for every node — spawned above.)
+            // Poll the shutdown flag every 1s (not 60s) so Ctrl-C / SIGTERM is noticed
+            // promptly and systemd doesn't have to SIGKILL after TimeoutStopSec. The tight
+            // poll is negligible cost since the actual work runs in the spawned tasks.
+            while !shutdown_requested.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            return Ok(());
+        }
+
+        println!(
+            "1. Create Transaction (format: create sender recipient amount [--fee ALPHA])"
+        );
+        println!("2. Whisper Code (format: whisper address msg)");
+        println!("3. Show Balance (format: balance)");
+        println!("4. Make New Wallet (format: new [wallet_name])");
+        println!("5. Account Lookup (format: account address)");
+        println!("6. Mine Block (format: mine miner_wallet_name)");
+        println!("7. Exit");
+
+        let editor_config = Config::builder()
+            .color_mode(ColorMode::Forced)
+            .build();
+        let mut line_editor = match DefaultEditor::with_config(editor_config) {
+            Ok(mut editor) => {
+                editor.set_helper(Some(()));
+                // Hand background tasks a safe way to write to this terminal.
+                // Without it their output lands on top of the prompt and
+                // desynchronizes rustyline's cursor tracking (see notify()).
+                match editor.create_external_printer() {
+                    Ok(printer) => {
+                        if let Ok(mut guard) = EXTERNAL_PRINTER.lock() {
+                            *guard = Some(Box::new(printer));
+                        }
+                    }
+                    Err(e) => debug!("External printer unavailable: {}", e),
+                }
+                Some(editor)
+            }
+            Err(e) => {
+                debug!("Line editor unavailable; falling back to standard input: {}", e);
+                None
+            }
+        };
+        let mut last_console_command: Option<String> = None;
+        let console_prompt = ("a#:", "\x1b[1;97ma#:\x1b[0m");
+
+        loop {
+            if shutdown_requested.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // Run anything the mining stop-reader swallowed after mining had already
+            // finished. Without this the operator's next command vanished into that
+            // parked thread and the prompt looked wedged (see PENDING_INPUT).
+            let handed_back = PENDING_INPUT.lock().ok().and_then(|mut q| {
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            });
+            let mut command = if let Some(line) = handed_back {
+                // Echoed so the operator can see what is about to run -- except for
+                // whatever in it looks like a seed. A line typed while a zombie mining
+                // reader owned stdin reaches the REPL through here, and printing it
+                // whole would put a spendable key on the screen for exactly the reason
+                // the masked prompt exists. Redacted per token, so the rest of the line
+                // is still visible and the echo still does its job.
+                if line_may_carry_a_seed(&line) {
+                    println!("a#: {}", redact_seed_shaped_tokens(&line));
+                } else {
+                    println!("a#: {}", line);
+                }
+                line
+            } else if line_editor.is_some() {
+                // Run the blocking readline on the blocking pool so this LocalSet thread keeps
+                // driving the spawn_local node monitor (health/discovery/wake-recovery) while the
+                // user sits at the prompt — a synchronous readline on this thread froze it. The
+                // owned editor is moved in and handed back; console_prompt is Copy (&'static str
+                // pair). The main reconciliation loop runs on other workers and is unaffected.
+                let editor_owned = line_editor.take().expect("line editor checked");
+                let prompt = console_prompt;
+                let read_result = match tokio::task::spawn_blocking(move || {
+                    let mut ed = editor_owned;
+                    let res = ed.readline(&prompt);
+                    (ed, res)
+                })
+                .await
+                {
+                    Ok((ed_back, res)) => {
+                        line_editor = Some(ed_back);
+                        res
+                    }
+                    Err(_) => {
+                        // The blocking read task panicked; clean up and exit gracefully.
+                        // Flush before exit: the signal-handler flush never runs on
+                        // these paths (rustyline consumes ^C itself and returns
+                        // Interrupted), and exiting without it discards the last
+                        // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = db.flush();
+                        let _ = remove_db_lock(&format!("{}.lock", db_path));
+                        let _ = remove_instance_lock();
+                        return Ok(());
+                    }
+                };
+                match read_result {
+                    // Wiped rather than dropped: a line read here can be
+                    // `import-seed <hex>`, and every intermediate String it passes
+                    // through is another un-zeroized copy of a spendable key left in
+                    // freed memory. Unconditional because the command is not parsed
+                    // yet. (Not every copy is reachable -- rustyline keeps its own
+                    // buffer, which is why the masked prompt is the documented way to
+                    // give this node a seed.)
+                    Ok(mut line) => {
+                        let trimmed = line.trim().to_string();
+                        line.zeroize();
+                        trimmed
+                    }
+                    Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                        // Flush before exit: the signal-handler flush never runs on
+                        // these paths (rustyline consumes ^C itself and returns
+                        // Interrupted), and exiting without it discards the last
+                        // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = db.flush();
+                        let _ = remove_db_lock(&format!("{}.lock", db_path));
+                        let _ = remove_instance_lock();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        debug!("Line editor failed; falling back to standard input: {}", e);
+                        line_editor = None;
+                        continue;
+                    }
+                }
+            } else {
+                let mut stdout = StandardStream::stdout(ColorChoice::Always);
+                let mut prompt_style = ColorSpec::new();
+                prompt_style.set_fg(Some(Color::White)).set_bold(true);
+                let _ = stdout.set_color(&prompt_style);
+                let _ = write!(&mut stdout, "αlphanumeric: ");
+                let _ = stdout.reset();
+                let _ = stdout.flush();
+
+                // Same rationale as the rustyline branch: read on the blocking pool so this
+                // LocalSet thread keeps driving the spawn_local monitor instead of freezing on a
+                // synchronous stdin read.
+                let (mut command, read_res) = match tokio::task::spawn_blocking(|| {
+                    let mut command = String::new();
+                    let res = std::io::stdin().read_line(&mut command);
+                    (command, res)
+                })
+                .await
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Flush before exit: the signal-handler flush never runs on
+                        // these paths (rustyline consumes ^C itself and returns
+                        // Interrupted), and exiting without it discards the last
+                        // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = db.flush();
+                        let _ = remove_db_lock(&format!("{}.lock", db_path));
+                        let _ = remove_instance_lock();
+                        return Ok(());
+                    }
+                };
+                match read_res {
+                    Ok(0) => {
+                        // Flush before exit: the signal-handler flush never runs on
+                        // these paths (rustyline consumes ^C itself and returns
+                        // Interrupted), and exiting without it discards the last
+                        // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = db.flush();
+                        let _ = remove_db_lock(&format!("{}.lock", db_path));
+                        let _ = remove_instance_lock();
+                        return Ok(());
+                    }
+                    // Wiped for the same reason as the rustyline branch above.
+                    Ok(_) => {
+                        let trimmed = command.trim().to_string();
+                        command.zeroize();
+                        trimmed
+                    }
+                    Err(e) => {
+                        warn!("Input loop interrupted: {}", e);
+                        // Flush before exit: the signal-handler flush never runs on
+                        // these paths (rustyline consumes ^C itself and returns
+                        // Interrupted), and exiting without it discards the last
+                        // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = db.flush();
+                        let _ = remove_db_lock(&format!("{}.lock", db_path));
+                        let _ = remove_instance_lock();
+                        return Ok(());
+                    }
+                }
+            };
+            // Normalising allocates a fresh String, so the pre-normalisation one has
+            // to be wiped rather than dropped -- it is a full copy of whatever was
+            // typed, seed included.
+            let normalised = command
+                .trim_start_matches("αlphanumeric:")
+                .trim()
+                .to_string();
+            command.zeroize();
+            command = normalised;
+
+            let recalled_previous = is_recall_line(&command, line_editor.is_some());
+            if recalled_previous {
+                if let Some(previous) = last_console_command.clone() {
+                    println!("{}", previous);
+                    command = previous;
+                } else {
+                    println!("No previous command.");
+                    continue;
+                }
+            }
+
+            if command.is_empty() {
+                // A bare Enter is the most common way a newcomer probes a REPL,
+                // so it should point somewhere instead of scolding them.
+                println!("Type `help` for the command list.");
+                continue;
+            }
+
+            // `import-seed <hex>` is the only command on this REPL whose ARGUMENT is a
+            // spendable key. Every other secret entry point -- the startup unlock, wallet
+            // creation, `export-seed` -- takes its secret at an `inquire::Password` prompt
+            // that rustyline never sees, and so does a bare `import-seed`. The positional
+            // form stays (SIGNING_SPEC documents `import-seed <hex64> [name]`, and scripts
+            // use it), so the two places that would otherwise keep a plain copy alive for
+            // the life of the process -- rustyline's in-memory history, from which the up
+            // arrow recalls and REPRINTS it, and `last_console_command` -- are skipped.
+            //
+            // The test is on the PAYLOAD, not the verb: a typo'''d verb, a different case,
+            // or a seed pasted on its own is still a seed, and gating on the one correct
+            // spelling would let all of those through into history before the line was
+            // rejected as an unknown command. The `command` string itself is wiped after
+            // the match below.
+            let carries_a_seed = line_may_carry_a_seed(&command);
+
+            if !recalled_previous && !carries_a_seed {
+                if let Some(editor) = line_editor.as_mut() {
+                    let _ = editor.add_history_entry(command.as_str());
+                }
+                last_console_command = Some(command.clone());
+            }
+
+            // Match the command VERB case-insensitively so `Send`, `HELP`, `Exit`
+            // work like their lowercase forms. Only the leading word is lowered;
+            // payload args (addresses, amounts, wallet names) are read from the
+            // original `command` and keep their case.
+            match command
+                .split_whitespace()
+                .next()
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("create") | Some("send") | Some("transfer") => {
+                    // Accept the 2-arg default-sender form `send <recipient> <amount>` —
+                    // the verbless `<recipient> <amount>` shorthand already resolves the
+                    // default wallet, so typing the verb should not turn it into a hard
+                    // error demanding a pasted sender. Detected exactly as the shorthand
+                    // is (recipient is a canonical address, last token a positive amount);
+                    // the handler still performs the exact amount/address validation.
+                    let parts: Vec<&str> = command.split_whitespace().collect();
+                    let two_arg = parts.len() == 3
+                        && alphanumeric::a9::blockchain::is_canonical_user_address(parts[1])
+                        && parts[2]
+                            .parse::<f64>()
+                            .map(|a| a.is_finite() && a > 0.0)
+                            .unwrap_or(false);
+                    let effective: Option<String> = if two_arg {
+                        match alphanumeric::a9::mgmt::resolve_default_wallet(&wallets, &blockchain)
+                            .await
+                        {
+                            Some((name, address)) => {
+                                // Name the wallet being spent from, as the shorthand does.
+                                println!("Sending from {} ({})", name, address);
+                                Some(format!("create {} {} {}", address, parts[1], parts[2]))
+                            }
+                            None => {
+                                println!(
+                                    "No wallets are loaded. If private.key exists, the passphrase \
+                                     was wrong — restart and re-enter it. Otherwise create a wallet \
+                                     with `new`."
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        Some(command.clone())
+                    };
+                    if let Some(cmd) = effective {
+                        // Handle the creation of the transaction
+                        match mgmt
+                            .handle_create_transaction(&cmd, &mut wallets, &blockchain, &db_arc)
+                            .await
+                        {
+                            Ok(CreateTransactionOutcome::Submitted(tx)) => {
+                                // Announce it: submission only reaches the LOCAL mempool, and
+                                // the gateway relay carries blocks, not transactions — without
+                                // this gossip no other miner ever hears about the tx and only
+                                // the sender could confirm it (pre-v7.6.8 behavior).
+                                node.gossip_transaction(&tx).await;
+                            }
+                            Ok(CreateTransactionOutcome::AlreadyPending)
+                            | Ok(CreateTransactionOutcome::AlreadyConfirmed(_)) => {}
+                            Err(e) => {
+                                // The handler already prints a styled error + usage; one
+                                // plain restatement here is plenty.
+                                println!("Error: {}", e);
+                            }
+                        }
+                    }
+                }
+                Some("info") => {
+                    let mut stdout = StandardStream::stdout(ColorChoice::Always);
+                    let mut color_spec = ColorSpec::new();
+                    let gateway_overview = fetch_gateway_overview().await;
+
+    // Get total wallets and balance first
+    let mut total_balance = 0.0;
+    let mut total_maturing = 0.0;
+    let mut processed_wallets = 0;
+
+    // Calculate total balance under a SHORT-LIVED guard, dropped before anything
+    // else runs. Holding this read across sentinel.initialize() deadlocked the whole
+    // REPL: initialize() re-reads the blockchain, and tokio's fair RwLock parks that
+    // second read behind any writer queued in between (block ingest queues writers
+    // every few seconds on a live chain) while the writer waits on our first read.
+    {
+        let blockchain_guard = blockchain.read().await;
+        for wallet in wallets.values() {
+            if let Ok(breakdown) = blockchain_guard
+                .get_wallet_balance_breakdown(&wallet.address)
+                .await
+            {
+                total_balance += breakdown.spendable;
+                total_maturing += breakdown.maturing.iter().map(|(_, amount)| amount).sum::<f64>();
+                processed_wallets += 1;
+            }
+        }
+    }
+
+    // Initialize sentinel (idempotent; first info call only). Time-boxed so a busy node
+    // can never wedge the console.
+    //
+    // NOTE: a deferred/failed initialization does NOT retry here. BPoSSentinel::initialize
+    // commits its `initialized` latch BEFORE running its fallible startup work, so if that
+    // work times out or errors the latch stays set and every later call returns Ok(()) early
+    // without re-running it. The result is a latched PARTIAL initialization: background tasks
+    // spawned before the failure keep running, the rest never starts. BPoS is telemetry only,
+    // so this degrades reporting, not chain state.
+    //
+    // Do NOT "fix" the latch in isolation. Allowing retries would re-run verify_chain_state,
+    // which reaches handle_chain_anomalies -> attempt_chain_recovery -> save_block; today
+    // that path executes at most once per process. Widening it before that recovery path is
+    // retired increases exposure to code that is already known ineffective (it cannot repair
+    // a body whose stored hash is intact — save_block returns early on a hash match — yet
+    // still increments fork_count). Retire the recovery path first, then fix the latch.
+    {
+        let sentinel = staking_node.write().await;
+        match tokio::time::timeout(Duration::from_secs(5), sentinel.initialize()).await {
+            Ok(Err(e)) => error!("Failed to initialize staking sentinel: {}", e),
+            Err(_) => warn!("Staking sentinel initialization deferred (node busy)"),
+            Ok(Ok(())) => {}
+        }
+    }
+
+    // Node metrics (validators only) — gathered here, printed after the grid.
+    let sentinel = staking_node.read().await;
+    let node_metrics = sentinel.get_node_metrics(node.id()).await.ok();
+
+    // Time-boxed: get_network_metrics reads a lock whose writer used to be held
+    // across slow chain reads for the length of a reorg — the "info prints the
+    // Network Status divider then hangs forever" bug. The lock ordering is fixed in
+    // bpos too; the timeout guarantees the console stays responsive regardless.
+    let network_snapshot = tokio::time::timeout(Duration::from_secs(3), async {
+        let health = sentinel.get_network_metrics().await.ok()?;
+        let active_peers = node.peers.read().await.len();
+        let mesh_links = node.mesh_link_count().await;
+        Some((health, active_peers, mesh_links))
+    })
+    .await
+    .ok()
+    .flatten();
+
+    // Chain read. Time-boxed: a long reorg/branch adoption holds the chain WRITE
+    // lock for its whole validation pass, and an unbounded read here parked the
+    // console behind it (the "info hangs mid-print, restart the client" bug).
+    let Ok(blockchain_guard) =
+        tokio::time::timeout(Duration::from_secs(3), blockchain.read()).await
+    else {
+        ui_seg(&mut stdout, &mut color_spec, UI_LABEL, true, "\n Chain busy")?;
+        ui_seg(
+            &mut stdout,
+            &mut color_spec,
+            UI_DIM,
+            false,
+            "  (sync or reorg in progress — try again shortly)\n",
+        )?;
+        stdout.reset()?;
+        continue;
+    };
+
+    let current_height = blockchain_guard.get_latest_block_index();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let network_height = gateway_overview
+        .as_ref()
+        .and_then(|overview| overview.height);
+    let tip_difficulty = blockchain_guard.get_tip_difficulty().await;
+    let next_difficulty = blockchain_guard.get_current_difficulty().await;
+    let (hr_value, hr_unit) = ui_hashrate(blockchain_guard.calculate_network_hashrate().await);
+    let block_target = blockchain_guard.block_time;
+    let block_age = blockchain_guard
+        .get_last_block()
+        .map(|block| now.saturating_sub(block.timestamp));
+    let intervals = blockchain_guard.recent_block_intervals(32);
+    let (cadence, cadence_peak) = ui_cadence(&intervals);
+    let fee_estimate = blockchain_guard.try_fee_estimate();
+    let fee_units = fee_estimate
+        .as_ref()
+        .map_or(FEE_ESTIMATE_ANCHOR_UNITS, |e| e.recommended_units);
+    let fee_floor_units = fee_estimate.as_ref().map_or(MIN_RELAY_FEE_UNITS, |e| e.floor_units);
+    let fee_note = match fee_estimate.as_ref() {
+        Some(e) if e.congested => "(auto · congested)",
+        Some(_) => "(auto)",
+        None => "(auto · anchor)",
+    };
+    let fee_rate = blockchain_guard.transaction_fee * 100.0;
+    let pending_txs = blockchain_guard.get_pending_transactions().await?;
+    let pending_value: f64 = pending_txs.iter().map(|tx| tx.amount()).sum();
+
+    // Everything this screen reads from the chain has been taken. Release the guard BEFORE
+    // rendering: what follows is ~470 lines of blocking styled output, and a reader held
+    // across it blocks the next writer — the publisher-park class this client has been bitten
+    // by before (see the note on background notices above). Dropping here also shortens the
+    // window the 3s acquire timeout above exists to protect.
+    drop(blockchain_guard);
+
+    let gateway_peers = gateway_overview
+        .as_ref()
+        .and_then(|overview| overview.peers)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+    let (health, active_peers, mesh_links) = match network_snapshot.as_ref() {
+        Some((health, peers, mesh)) => (Some(health), *peers, *mesh),
+        None => (None, 0, 0),
+    };
+    let active_nodes = health
+        .map(|h| h.active_nodes.max(active_peers).max(gateway_peers))
+        .unwrap_or(gateway_peers.max(active_peers));
+
+    // Off-nominal is a single, explicit judgement made once and reused: orange
+    // is the only hue allowed to cross pane boundaries, so a slow chain stays
+    // louder than the zoning around it.
+    let block_target_secs = u64::from(block_target);
+    // Gates the "Nx" multiplier annotation only — never the colour of the age
+    // itself. Proof-of-work intervals are exponentially distributed, so past 2x
+    // target is ordinary (~13.5%, e^-2); the multiple is useful context to show,
+    // it just must not repaint the figure as if something were wrong.
+    let stale = block_age.is_some_and(|age| age > block_target_secs.saturating_mul(2));
+    let age_multiple = block_age
+        .filter(|_| block_target_secs > 0)
+        .map(|age| age / block_target_secs)
+        .unwrap_or(0);
+
+    // ── Overview ───────────────────────────────────────────────────────────
+    // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.89 MSRV (raised by redb).
+    #[allow(clippy::unnecessary_map_or)]
+    let synced = network_height.map_or(true, |net| current_height + 1 >= net);
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, "\n ")?;
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, true, "Overview")?;
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+    if synced {
+        ui_seg(&mut stdout, &mut color_spec, UI_GREEN, false, "✓ SYNCED")?;
+        ui_pad(&mut stdout, &mut color_spec, 9, 17)?;
+    } else {
+        ui_seg(&mut stdout, &mut color_spec, UI_ORANGE, false, "▸ SYNCING")?;
+        ui_pad(&mut stdout, &mut color_spec, 10, 17)?;
+    }
+    let local_text = ui_thousands(current_height);
+    ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &local_text)?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " / ")?;
+    let net_text = network_height.map_or_else(|| "unknown".to_string(), ui_thousands);
+    ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &net_text)?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        17 + local_text.chars().count() + 3 + net_text.chars().count(),
+        48,
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "diff ")?;
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        UI_BLUE,
+        false,
+        &tip_difficulty.to_string(),
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " ▸ ")?;
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        UI_BLUE,
+        false,
+        &next_difficulty.to_string(),
+    )?;
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+    let balance_text = format!("{:.8} ♦", total_balance);
+    ui_seg(&mut stdout, &mut color_spec, UI_CYAN, false, &balance_text)?;
+    ui_pad(&mut stdout, &mut color_spec, 1 + balance_text.chars().count(), 17)?;
+    let hr_text = format!("{:.2}", hr_value);
+    ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &hr_text)?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " ")?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, hr_unit)?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        17 + hr_text.chars().count() + 1 + hr_unit.chars().count(),
+        41,
+    )?;
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        UI_BLUE,
+        false,
+        &active_nodes.to_string(),
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " peers")?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        41 + active_nodes.to_string().chars().count() + 6,
+        57,
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "fee ")?;
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        UI_CYAN,
+        false,
+        &format!("{:.8} ♦", Transaction::from_units(fee_units)),
+    )?;
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+    let forks = health.map_or(0, |h| h.fork_count);
+    // Fork count is reported once, in the Status grid below. Repeating it here spent
+    // the most prominent slot on the screen — top-left, the first thing read — on a
+    // figure the reader meets again a few lines down, and on a healthy node it is
+    // always zero. The column is left empty so `load`, `pending tx` and `block` keep
+    // exactly the positions they had.
+    ui_pad(&mut stdout, &mut color_spec, 1, 17)?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "load ")?;
+    let load_text = format!("{:.1}%", health.map_or(0.0, |h| h.network_load * 100.0));
+    ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &load_text)?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        17 + 5 + load_text.chars().count(),
+        41,
+    )?;
+    let pending_text = pending_txs.len().to_string();
+    ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &pending_text)?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " pending tx")?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        41 + pending_text.chars().count() + 11,
+        57,
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "block ")?;
+    match block_age {
+        Some(age) => {
+            ui_seg(
+                &mut stdout,
+                &mut color_spec,
+                // Steady hue: the AGE itself never signals. The multiplier
+                // annotation beside it appears only on a real stall, so nothing
+                // here changes colour on a healthy chain.
+                UI_BLUE,
+                false,
+                &format!("{}s", age),
+            )?;
+            if stale {
+                ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " · ")?;
+                ui_seg(
+                    &mut stdout,
+                    &mut color_spec,
+                    UI_ORANGE,
+                    false,
+                    &format!("{}x", age_multiple),
+                )?;
+            }
+        }
+        None => ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "unknown")?,
+    }
+    writeln!(stdout)?;
+
+    if !cadence.is_empty() {
+        ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "Cadence")?;
+        ui_pad(&mut stdout, &mut color_spec, 8, 17)?;
+        // The peak bar is the excursion, wherever it falls in the window —
+        // colouring the LAST bar instead would disagree with "peak" on any
+        // window whose worst interval is not the most recent block.
+        for (index, bar) in cadence.chars().enumerate() {
+            // ALWAYS mark the peak. It used to be gated on `stale`, so on a healthy
+            // chain every bar was the same colour and the "peak 24s" label beside the
+            // graph pointed at nothing. The marker is a locator, not a warning — it
+            // says WHERE the widest interval sits in the window, which is exactly as
+            // useful when the chain is behaving as when it is not.
+            let color = if Some(index) == cadence_peak {
+                UI_ORANGE
+            } else {
+                UI_BLUE
+            };
+            ui_seg(&mut stdout, &mut color_spec, color, false, &bar.to_string())?;
+        }
+        ui_pad(
+            &mut stdout,
+            &mut color_spec,
+            17 + cadence.chars().count(),
+            57,
+        )?;
+        ui_seg(
+            &mut stdout,
+            &mut color_spec,
+            UI_BLUE,
+            false,
+            &intervals.len().to_string(),
+        )?;
+        ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " blk · peak ")?;
+        ui_seg(
+            &mut stdout,
+            &mut color_spec,
+            UI_BLUE,
+            false,
+            &format!("{}s", intervals.iter().copied().max().unwrap_or(0)),
+        )?;
+        writeln!(stdout)?;
+    }
+
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        UI_DIM,
+        false,
+        UI_RULE,
+    )?;
+    writeln!(stdout)?;
+
+    // ── Wallet │ Network ───────────────────────────────────────────────────
+    ui_grid_header(
+        &mut stdout,
+        &mut color_spec,
+        "Wallet",
+        UI_CYAN,
+        "Network",
+        UI_BLUE,
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Total Wallets:",
+            &[(UI_CYAN, processed_wallets.to_string())],
+        )),
+        Some(("Active Nodes:", &[(UI_BLUE, active_nodes.to_string())])),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Total Balance:",
+            &[(UI_CYAN, format!("{:.8} ♦", total_balance))],
+        )),
+        Some((
+            "Network Peers:",
+            &[
+                (UI_BLUE, gateway_peers.to_string()),
+                (UI_DIM, "  (gateway roster)".to_string()),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Maturing:",
+            &[if total_maturing > 0.0 {
+                (UI_CYAN, format!("{:.8} ♦", total_maturing))
+            } else {
+                (UI_DIM, "none".to_string())
+            }],
+        )),
+        Some((
+            "Direct P2P:",
+            &[
+                (UI_BLUE, active_peers.to_string()),
+                (UI_DIM, " TCP · ".to_string()),
+                (UI_BLUE, mesh_links.to_string()),
+                (UI_DIM, " mesh".to_string()),
+            ],
+        )),
+    )?;
+    ui_grid_row(&mut stdout, &mut color_spec, None, None)?;
+
+    // ── Chain │ Status ─────────────────────────────────────────────────────
+    ui_grid_header(
+        &mut stdout,
+        &mut color_spec,
+        "Chain",
+        UI_GREEN,
+        "Status",
+        UI_PINK,
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Height:",
+            &[(UI_GREEN, ui_thousands(current_height))],
+        )),
+        Some((
+            "Fork Count:",
+            &[
+                (UI_PINK, "●".to_string()),
+                (UI_LABEL, " ".to_string()),
+                (UI_PINK, forks.to_string()),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Network Height:",
+            &[
+                (
+                    UI_GREEN,
+                    network_height.map_or_else(|| "unknown".to_string(), ui_thousands),
+                ),
+                (UI_DIM, "  (gateway)".to_string()),
+            ],
+        )),
+        Some((
+            "Network Load:",
+            &[
+                (
+                    UI_PINK,
+                    format!("{:.1}%", health.map_or(0.0, |h| h.network_load * 100.0)),
+                ),
+                (UI_DIM, "  (mempool fill)".to_string()),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Difficulty:",
+            &[
+                (UI_GREEN, tip_difficulty.to_string()),
+                (UI_DIM, " ▸ ".to_string()),
+                (UI_GREEN, next_difficulty.to_string()),
+            ],
+        )),
+        Some((
+            "Last Block:",
+            &[
+                (
+                    // Same rule as the overview line above, which this used to
+                    // contradict: a HEALTHY age rendered UI_PINK — the outflow /
+                    // attention hue `outbound` uses — so a node that had just caught
+                    // up turned red, and the identical figure was blue at the top of
+                    // the same screen. Steady hue in both places now: the age
+                    // never signals, only the stall annotation does.
+                    UI_BLUE,
+                    block_age.map_or_else(|| "unknown".to_string(), |age| format!("{}s", age)),
+                ),
+                (
+                    UI_ORANGE,
+                    match block_age {
+                        // Past a minute the raw seconds are the "am I stalled?"
+                        // signal but read as a wall of digits (11506s), so the
+                        // multiple gains a human-readable span beside it.
+                        Some(age) if stale && age >= 60 => {
+                            format!("  ({}x · {})", age_multiple, human_duration_secs(age))
+                        }
+                        Some(_) if stale => format!("  ({}x target)", age_multiple),
+                        _ => String::new(),
+                    },
+                ),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Hashrate:",
+            &[
+                (UI_GREEN, format!("{:.2}", hr_value)),
+                (UI_DIM, format!(" {}", hr_unit)),
+            ],
+        )),
+        Some((
+            "Avg Response:",
+            &[match health.map(|h| h.average_response_time) {
+                Some(ms) if ms > 0 => (UI_PINK, format!("{}ms", ms)),
+                _ => (UI_DIM, "not sampled".to_string()),
+            }],
+        )),
+    )?;
+    ui_grid_row(&mut stdout, &mut color_spec, None, None)?;
+
+    // ── Memory Pool │ Fees & Timing ────────────────────────────────────────
+    ui_grid_header(
+        &mut stdout,
+        &mut color_spec,
+        "Memory Pool",
+        UI_LAVENDER,
+        "Fees & Timing",
+        UI_CYAN,
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Pending Txs:",
+            &[(UI_LAVENDER, pending_txs.len().to_string())],
+        )),
+        Some((
+            "Default Fee:",
+            &[
+                (
+                    UI_CYAN,
+                    format!("{:.8} ♦", Transaction::from_units(fee_units)),
+                ),
+                (UI_DIM, format!("  {}", fee_note)),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Mempool Value:",
+            &[
+                (UI_LAVENDER, format!("{:.8}", pending_value)),
+                (UI_CYAN, " ♦".to_string()),
+            ],
+        )),
+        Some((
+            "Fee Floor:",
+            &[
+                (
+                    UI_CYAN,
+                    format!("{:.8} ♦", Transaction::from_units(fee_floor_units)),
+                ),
+                (UI_DIM, "  (min)".to_string()),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some(("Block Target:", &[(UI_LAVENDER, format!("{}s", block_target))])),
+        Some(("Fee Rate:", &[(UI_CYAN, format!("{:.8}%", fee_rate))])),
+    )?;
+
+    // Validator metrics, when this node has them — one line, so the grid above
+    // stays the shape of the screen.
+    if let Some(metrics) = node_metrics {
+        writeln!(stdout)?;
+        ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+        ui_seg(
+            &mut stdout,
+            &mut color_spec,
+            match metrics.current_tier {
+                ValidatorTier::RedDiamond => Color::Rgb(136, 0, 21),
+                ValidatorTier::Diamond => UI_CYAN,
+                ValidatorTier::Emerald => Color::Rgb(141, 203, 129),
+                ValidatorTier::Gold => UI_ORANGE,
+                ValidatorTier::Silver => UI_LABEL,
+                ValidatorTier::Inactive => UI_DIM,
+            },
+            true,
+            &format!("{:?}", metrics.current_tier),
+        )?;
+        ui_seg(
+            &mut stdout,
+            &mut color_spec,
+            UI_DIM,
+            false,
+            &format!(
+                "  ·  {} verified  ·  {:.1}% success  ·  {:.1}% performance",
+                metrics.blocks_verified, metrics.success_rate, metrics.performance_score * 100.0
+            ),
+        )?;
+        writeln!(stdout)?;
+    }
+
+    writeln!(stdout)?;
+    stdout.reset()?;
+},
+
+Some("balance") | Some("bal") | Some("wallet") => {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.get(1).copied() == Some("new") {
+        // `wallet` is a balance alias, so `wallet new` used to print balances and
+        // silently drop `new`. Point at the real command instead.
+        println!("`wallet` shows balances; to create a wallet use the `new` command.");
+    } else {
+        if parts.len() > 1 {
+            println!(
+                "(`{}` takes no arguments — ignoring `{}`)",
+                parts[0],
+                parts[1..].join(" ")
+            );
+        }
+        // Local atomic read of the node's beacon high-water — 0 when no beacon has
+        // been seen. Never a network call, so `balance` stays instant.
+        mgmt.show_balances(&wallets, node.beacon_high_water_height()).await
+    }
+},
+Some("new") => {
+let parts: Vec<&str> = command.split_whitespace().collect();
+if parts.len() > 2 {
+    // A wallet name is a single token; `new a b` used to create `a` and drop `b`.
+    println!(
+        "(`new` takes at most one name — ignoring `{}`; names cannot contain spaces)",
+        parts[2..].join(" ")
+    );
+}
+let wallet_name = parts.get(1).map(|s| s.to_string());
+if let Err(e) = mgmt
+.create_new_wallet(
+    &mut wallets,
+    wallet_encryption_state
+        .as_ref()
+        .map(|passphrase| passphrase.as_slice()),
+    wallet_name,
+)
+.await
+{
+println!("Error creating wallet: {}", e);
+} else {
+// create_new_wallet has already persisted the merged key file (including any wallets that
+// failed to load, e.g. wrong passphrase — they are read from disk and re-written). A follow-up
+// save_wallets here would rewrite the file from the IN-MEMORY map only and erase those skipped
+// wallets, permanently destroying their keys — so it is deliberately omitted.
+{
+    let mut addresses = wallet_addresses.write().await;
+    *addresses = wallets.values().map(|w| w.address.clone()).collect();
+}
+}
+}
+Some("export-seed") => {
+let parts: Vec<&str> = command.split_whitespace().collect();
+if parts.len() != 2 {
+println!("Usage: export-seed <wallet name>");
+} else {
+let wallet_name = parts[1];
+// A zombie `mine --continuous` stop-reader can still be parked on stdin (it outlives
+// its mining session whenever mining ended any way other than Enter). If one is
+// parked while a Password/Confirm prompt is live, both compete for stdin and a line
+// the zombie wins gets echoed to the terminal and into rustyline's history -- exactly
+// what this prompt exists to prevent. Fail closed rather than risk that.
+if STDIN_READERS_PARKED.load(Ordering::SeqCst) > 0 {
+println!(
+    "A previous mining session's input reader is still waiting on a line of input, and it \
+     would compete with this prompt for what you type. Press Enter until this message stops \
+     appearing, then run export-seed again."
+);
+} else if !wallets.contains_key(wallet_name) {
+println!("No wallet named {} is loaded.", wallet_name);
+} else {
+let confirmed = Confirm::new(&format!(
+    "This prints a key that can spend wallet '{}'. Anyone who sees it owns the funds. Continue?",
+    wallet_name
+))
+.with_default(false)
+.prompt()
+.unwrap_or(false);
+
+if !confirmed {
+println!("Cancelled.");
+} else {
+// Ask again for an encrypted wallet's passphrase rather than reusing the session's
+// wallet_encryption_state: this command hands the wallet to whoever is sitting at an
+// open terminal right now, and the passphrase entered once at startup proves nothing
+// about who that is.
+let is_encrypted = wallets
+    .get(wallet_name)
+    .map(|w| w.is_encrypted)
+    .unwrap_or(false);
+let passphrase: Option<zeroize::Zeroizing<Vec<u8>>> = if is_encrypted {
+    match Password::new("Wallet passphrase:")
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .without_confirmation()
+        .prompt()
+    {
+        // Match every other passphrase entry point in the node exactly: wallet creation
+        // (mgmt.rs:1063) and the startup unlock (main.rs:1321) both wrap the raw prompt
+        // String in Zeroizing BEFORE trimming it (so the untrimmed copy is also wiped on
+        // drop), then trim before turning it into bytes. A stray leading/trailing space
+        // must not unlock the wallet at startup and then fail here as "wrong passphrase".
+        Ok(pass) => {
+            let pass = zeroize::Zeroizing::new(pass);
+            Some(zeroize::Zeroizing::new(pass.trim().as_bytes().to_vec()))
+        }
+        Err(_) => None,
+    }
+} else {
+    None
+};
+
+if is_encrypted && passphrase.is_none() {
+println!("Cancelled.");
+} else {
+match mgmt
+    .export_wallet_seed(
+        &wallets,
+        wallet_name,
+        passphrase.as_ref().map(|p| p.as_slice()),
+    )
+    .await
+{
+    // The value goes to the screen once here and touches nothing that logs.
+    Ok(seed) => println!(
+        "\n{}\n\nStore this offline. It restores the wallet on any node.\n",
+        seed.as_str()
+    ),
+    Err(e) => println!("Failed to export seed: {}", e),
+}
+}
+}
+}
+}
+}
+Some("import-seed") => {
+let parts: Vec<&str> = command.split_whitespace().collect();
+// Holds a seed typed at the prompt, and wipes it on the way out of this arm.
+// Declared out here so the `&str` handed to the import outlives the match below.
+let prompted: zeroize::Zeroizing<String>;
+let import: Option<(&str, Option<String>)> = match parts.len() {
+// The documented form: no seed on the command line at all. It is asked for at
+// the same masked `inquire::Password` prompt the startup unlock, wallet
+// creation and `export-seed` use -- rustyline never sees it, so it is never
+// echoed, never recallable with the up arrow and never held in history.
+1 => {
+// A zombie `mine --continuous` stop-reader parked on stdin would compete
+// with this prompt and echo the line it won, straight into the terminal and
+// the history. Fail closed, exactly as `export-seed` does.
+if STDIN_READERS_PARKED.load(Ordering::SeqCst) > 0 {
+println!(
+    "A previous mining session's input reader is still waiting on a line of input, and it \
+     would compete with this prompt for what you type. Press Enter until this message stops \
+     appearing, then run import-seed again."
+);
+None
+} else {
+match Password::new("Wallet seed (64 hex characters):")
+    .with_display_mode(PasswordDisplayMode::Masked)
+    .without_confirmation()
+    .prompt()
+{
+    // Wrapped in Zeroizing BEFORE trimming, so the untrimmed copy is wiped
+    // too -- the same shape as every other secret prompt in this file.
+    Ok(entered) => {
+        prompted = zeroize::Zeroizing::new(entered);
+        Some((prompted.trim(), None))
+    }
+    Err(_) => {
+        println!("Cancelled.");
+        None
+    }
+}
+}
+}
+// The positional form SIGNING_SPEC documents, kept working for scripts. A seed
+// given this way is visible on screen and lives in this process until the
+// command finishes; the prompt above is the form to prefer.
+2 | 3 => Some((parts[1], parts.get(2).map(|s| s.to_string()))),
+_ => {
+println!("Usage: import-seed                              (asks for the seed, unechoed)");
+println!("   or: import-seed <64-character hex seed> [name]");
+None
+}
+};
+if let Some((seed_hex, requested_name)) = import {
+match mgmt
+    .import_wallet_from_seed(
+        &mut wallets,
+        seed_hex,
+        wallet_encryption_state
+            .as_ref()
+            .map(|passphrase| passphrase.as_slice()),
+        requested_name,
+    )
+    .await
+{
+    Ok(wallet) => {
+        println!("Imported wallet address: {}", wallet.address);
+        if wallet.is_encrypted {
+            println!("Encryption: Enabled");
+        } else {
+            println!("Encryption: Disabled");
+        }
+        // As with `new` the key file is already merged and saved by import_wallet_from_seed.
+        // Calling save_wallets here would rewrite it from the in-memory map only and erase
+        // wallets that failed to load.
+        let mut addresses = wallet_addresses.write().await;
+        *addresses = wallets.values().map(|w| w.address.clone()).collect();
+    }
+    Err(e) => println!("Failed to import seed: {}", e),
+}
+}
+}
+Some("rename") => {
+let parts: Vec<&str> = command.split_whitespace().collect();
+if parts.len() != 3 {
+println!("Usage: rename <old_name> <new_name>");
+} else {
+let old_name = parts[1];
+let new_name = parts[2];
+if let Err(e) = mgmt.rename_wallet(&mut wallets, old_name, new_name).await {
+    error!("Wallet rename failed: {}", e);
+    println!("Failed to rename wallet: {}", e);
+} else {
+println!("Wallet renamed successfully");
+}
+}
+                }
+                Some("push") => {
+                    #[cfg(feature = "bootstrap_publisher")]
+                    {
+                        if let Err(e) = handle_push_command(&db_path, &blockchain).await {
+                            println!("Error: {}", e);
+                        }
+                    }
+                    #[cfg(not(feature = "bootstrap_publisher"))]
+                    {
+                        println!(
+                            "Error: push support is not compiled in. Rebuild with `--features bootstrap_publisher`."
+                        );
+                    }
+                }
+                Some("mine") => {
+                    let parts: Vec<&str> = command.split_whitespace().collect();
+                    // Order-independent flags, and the wallet name is OPTIONAL:
+                    // a bare `mine` (or `mine -c --gpu`) mines to the default
+                    // wallet, since naming it every time is pure friction for the
+                    // common single-wallet case. The wallet name is the FIRST
+                    // non-flag token, so `mine -c name` works as well as
+                    // `mine name -c`.
+                    //
+                    // A GPU build (feature gpu_miner) mines on the GPU by DEFAULT —
+                    // that is the whole point of that binary — so `mine <wallet>`
+                    // uses the GPU with no flag; `--cpu` forces CPU. A default
+                    // (CPU-only) build defaults to CPU and refuses `--gpu` below.
+                    // (GPU never runs the CPU grind alongside it; CPU is only the
+                    // fallback if the GPU dies mid-session — see miner.rs.)
+                    let is_flag = |s: &str| {
+                        matches!(s, "--continuous" | "-c" | "--gpu" | "--cpu")
+                    };
+                    let named = parts.iter().skip(1).find(|part| !is_flag(part)).copied();
+                    let flag_count = parts.iter().skip(1).filter(|part| is_flag(part)).count();
+                    let extra = (parts.len() - 1)
+                        .saturating_sub(usize::from(named.is_some()) + flag_count);
+                    if extra > 0 {
+                        println!("Usage: mine [miner_wallet_name] [--continuous] [--gpu|--cpu]");
+                        continue;
+                    }
+                    let mut continuous = false;
+                    let mut use_gpu = cfg!(feature = "gpu_miner");
+                    for flag in parts.iter().skip(1).filter(|part| is_flag(part)) {
+                        match *flag {
+                            "--continuous" | "-c" => continuous = true,
+                            "--gpu" => use_gpu = true,
+                            "--cpu" => use_gpu = false,
+                            _ => {}
+                        }
+                    }
+                    // --gpu only does something in a binary built with the gpu_miner
+                    // feature. In a default build (publisher / VPS / exchange nodes),
+                    // REFUSE instead of demoting to CPU: the old one-line fallback
+                    // scrolled away and the operator mined at ~1/400th of the
+                    // expected rate for a whole session without noticing ("previous
+                    // version found blocks, this one hasn't"). An explicit --gpu on
+                    // a featureless build is a build mistake — say so and stop.
+                    #[cfg(not(feature = "gpu_miner"))]
+                    if use_gpu {
+                        println!(
+                            "This binary was built without GPU support, so `--gpu` cannot work. \
+                             Rebuild with `cargo build --release --features \
+                             bootstrap_publisher,webrtc_mesh,gpu_miner` (or use the GPU beta \
+                             build), or run `mine` without --gpu for CPU mining."
+                        );
+                        continue;
+                    }
+                    let miner_wallet = match named {
+                        Some(name) => {
+                            // Fail a typo NOW: an unknown name used to surface only
+                            // inside handle_mine_command — after discovery spin-up
+                            // and up to the full 24s sync prep (and in continuous
+                            // mode it then backed off and re-prepped for minutes).
+                            let known = wallets.contains_key(name)
+                                || wallets.values().any(|w| w.address == name);
+                            if !known {
+                                let mut names: Vec<&str> =
+                                    wallets.keys().map(|s| s.as_str()).collect();
+                                names.sort_unstable();
+                                println!(
+                                    "No wallet found with name or address: {} (available: {})",
+                                    name,
+                                    names.join(", ")
+                                );
+                                continue;
+                            }
+                            name.to_string()
+                        }
+                        None => match alphanumeric::a9::mgmt::resolve_default_wallet(&wallets, &blockchain).await {
+                            // Name it: rewards landing in a wallet the operator
+                            // forgot about is the failure this guards against.
+                            Some((name, address)) => {
+                                println!("Mining to {} ({})", name, address);
+                                name
+                            }
+                            // Unreachable on a normal start (create_default_wallet
+                            // runs on first launch), but load_wallets returns Ok with
+                            // an empty map when every wallet fails to decrypt — so the
+                            // message must not tell someone whose funds are intact to
+                            // make a new wallet.
+                            None => {
+                                println!(
+                                    "No wallets are loaded. If private.key exists, the passphrase \
+                                     was wrong — restart and re-enter it. Otherwise create a wallet \
+                                     with `new`."
+                                );
+                                continue;
+                            }
+                        },
+                    };
+
+                    // Enter-to-stop for continuous mode: one detached reader consumes a
+                    // single stdin line and flips the flag; the mining loop checks it
+                    // between every wait slice and round.
+                    let stop_flag = Arc::new(AtomicBool::new(false));
+
+                    // Ctrl-C / SIGTERM also stops an in-progress mine: the global handler sets
+                    // shutdown_requested; mirror it into stop_flag so the grind (which observes
+                    // `stop`) halts on signal, not only on Enter — matching `main`, where the
+                    // signal flag and the Enter flag both cancel the grind. Self-exits if Enter
+                    // already stopped it, and is aborted after the loop so it never outlives the
+                    // command.
+                    let signal_bridge = {
+                        let stop_on_signal = Arc::clone(&stop_flag);
+                        let shutdown_watch = Arc::clone(&shutdown_requested);
+                        tokio::spawn(async move {
+                            while !shutdown_watch.load(Ordering::SeqCst) {
+                                if stop_on_signal.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            stop_on_signal.store(true, Ordering::SeqCst);
+                        })
+                    };
+                    if continuous {
+                        println!(
+                            "Continuous mining started. Paced to the network: each block \
+                             waits to propagate before the next round, with jittered \
+                             delays and backoff so miners never hammer the gateway."
+                        );
+                        println!("Press Enter at any time to stop.");
+                        let stop = Arc::clone(&stop_flag);
+                        MINING_READING_STDIN.store(true, Ordering::SeqCst);
+                        STDIN_READERS_PARKED.fetch_add(1, Ordering::SeqCst);
+                        std::thread::spawn(move || {
+                            let mut buf = String::new();
+                            let _ = std::io::stdin().read_line(&mut buf);
+                            // Decrement unconditionally as soon as the blocking read returns --
+                            // Ok or Err, "stop" line or "hand back" line -- so the count can never
+                            // outlive the read that it is guarding against.
+                            STDIN_READERS_PARKED.fetch_sub(1, Ordering::SeqCst);
+                            if MINING_READING_STDIN.swap(false, Ordering::SeqCst) {
+                                // Mining was still running: this line means "stop".
+                                stop.store(true, Ordering::SeqCst);
+                            } else {
+                                // Mining already ended by another route, so this was a
+                                // COMMAND meant for the prompt. Hand it back rather
+                                // than eating it.
+                                let line = buf.trim().to_string();
+                                if !line.is_empty() {
+                                    if let Ok(mut q) = PENDING_INPUT.lock() {
+                                        q.push(line);
+                                    }
+                                }
+                            }
+                            // This buffer holds whatever line this thread won from
+                            // stdin, which can be an `import-seed <hex>` meant for the
+                            // prompt. Wipe it rather than leaving a spendable key in a
+                            // freed allocation when the thread ends. (The queued copy is
+                            // wiped by the REPL after it runs the command.)
+                            buf.zeroize();
+                        });
+                    } else {
+                        // Single-shot grinds one block, which solo can take a
+                        // while. Enter-to-stop needs the continuous reader (a
+                        // stray stdin reader here would corrupt the rustyline
+                        // prompt after the block lands), so point at the two
+                        // real ways out.
+                        println!(
+                            "Mining one block (solo can take a while). Press Ctrl-C to abort, \
+                             or use `--continuous` to keep mining with Enter-to-stop."
+                        );
+                    }
+
+                    // Announce a freshly-mined block the INSTANT it is finalized, ahead
+                    // of the reporting that follows it inside handle_mine_command. Hands
+                    // the block to a task and returns immediately: the miner is blocked
+                    // on this call, so anything that waited here would be spent standing
+                    // between a solved block and the network.
+                    let announce_node = Arc::clone(&node);
+                    let announce = move |block: &Block| {
+                        let publish_node = Arc::clone(&announce_node);
+                        let mined_block = block.clone();
+                        let mined_height = mined_block.index;
+                        tokio::spawn(async move {
+                            const MAX_PUBLISH_ATTEMPTS: u32 = 4;
+                            for attempt in 1..=MAX_PUBLISH_ATTEMPTS {
+                                match publish_node
+                                    .publish_block(mined_block.clone(), "Post-mine")
+                                    .await
+                                {
+                                    Ok(()) => return,
+                                    Err(e) if attempt < MAX_PUBLISH_ATTEMPTS => {
+                                        warn!(
+                                            "Failed to publish mined block (attempt {}/{}): {}",
+                                            attempt, MAX_PUBLISH_ATTEMPTS, e
+                                        );
+                                        tokio::time::sleep(Duration::from_secs(
+                                            2 * attempt as u64,
+                                        ))
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to publish mined block after {} attempts: {}",
+                                            MAX_PUBLISH_ATTEMPTS, e
+                                        );
+                                        // Say it on the CONSOLE: a block that never left
+                                        // this machine looks like a normal success
+                                        // otherwise, then silently orphans.
+                                        println!(
+                                            "\n⚠ Block #{} could not be published to the network ({} attempts). It is saved locally, but until connectivity recovers other miners may overtake it — check your connection.",
+                                            mined_height, MAX_PUBLISH_ATTEMPTS
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    };
+
+                    // The session loop no longer knows how to talk to a person: it
+                    // reports, and this prints. Every string below is the one the loop
+                    // used to print itself — run.node.sh judges this node's startup by
+                    // grepping the console, so they are not free to reword.
+                    let report: Arc<
+                        dyn Fn(alphanumeric::a9::mgmt::MiningProgress) + Send + Sync,
+                    > = Arc::new(|progress| {
+                        use alphanumeric::a9::mgmt::MiningProgress as P;
+                        use std::io::Write as _;
+                        match progress {
+                            P::PreparingStarted => println!(
+                                "Preparing mining: syncing to the network tip so we can compete..."
+                            ),
+                            // ONE line that rewrites itself (\r, no newline) —
+                            // this used to print a fresh line every 5s and bury
+                            // the screen while a long catch-up ran.
+                            P::Preparing {
+                                height,
+                                target,
+                                elapsed,
+                            } => {
+                                match (height, target) {
+                                    (Some(local_tip), Some(known_tip)) => print!(
+                                        "\r\x1b[2K  syncing… {} of {} ({} behind, {}s)",
+                                        local_tip,
+                                        known_tip,
+                                        known_tip - local_tip,
+                                        elapsed.as_secs()
+                                    ),
+                                    _ => print!("\r\x1b[2K  syncing… {}s", elapsed.as_secs()),
+                                }
+                                let _ = std::io::stdout().flush();
+                            }
+                            P::PreparingEnded => {
+                                // Erase the in-place status line before anything else
+                                // prints, or the next message lands on top of it.
+                                print!("\r\x1b[2K");
+                                let _ = std::io::stdout().flush();
+                            }
+                            P::Unminable { reason } => {
+                                println!("Cannot mine right now: {}", reason)
+                            }
+                            P::NotSynced {
+                                retry_in: Some(wait),
+                            } => println!(
+                                "Network tip still syncing; waiting {}s before the next attempt…",
+                                wait.as_secs()
+                            ),
+                            P::NotSynced { retry_in: None } => println!(
+                                "Still syncing to the network tip; it keeps catching up in the background — run `mine` again in a moment."
+                            ),
+                            // handle_mine_command prints the reward summary; there was
+                            // never a second line here.
+                            P::Mined { .. } => {}
+                            P::Absorbing { index } => println!(
+                                "Waiting for the network to absorb block #{} before the next round…",
+                                index
+                            ),
+                            P::LostRace { retrying: true } => println!(
+                                "Lost the race for this block (another miner's was adopted, no reward for this solve) — retargeting the new tip…"
+                            ),
+                            P::LostRace { retrying: false } => println!(
+                                "Lost the race for this block (another miner's was adopted) — no reward for this solve. Run `mine` again to compete for the next one."
+                            ),
+                            P::Failed { error, backoff } => {
+                                println!("Mining error: {}", error);
+                                if let Some(wait) = backoff {
+                                    println!(
+                                        "Backing off {}s before the next attempt…",
+                                        wait.as_secs()
+                                    );
+                                }
+                            }
+                            P::GaveUp { errors } => println!(
+                                "Stopping continuous mining: {} mining errors in a row — fix the issue and run mine again.",
+                                errors
+                            ),
+                            // The run's closing line is printed after the call returns,
+                            // where it still lands after MINING_READING_STDIN is cleared
+                            // — a line typed between the two is a command, not a stop.
+                            P::Stopped { .. } => {}
+                        }
+                    });
+
+                    let mined_count = mgmt
+                        .run_mining_session(
+                            alphanumeric::a9::mgmt::MiningSession {
+                                wallet: miner_wallet,
+                                use_gpu,
+                                continuous,
+                                stop: Arc::clone(&stop_flag),
+                                shutdown: Arc::clone(&shutdown_requested),
+                                mined_log: Some(Arc::clone(&session_mined)),
+                                announce: &announce,
+                                report,
+                            },
+                            &mut wallets,
+                            &blockchain,
+                            &db_arc,
+                            &node,
+                        )
+                        .await;
+                    signal_bridge.abort();
+                    // Mining is over: from here a line typed at the terminal is a
+                    // COMMAND, not a stop signal. Clearing this makes the parked
+                    // stop-reader hand its line back to the prompt instead of eating
+                    // it (see PENDING_INPUT).
+                    MINING_READING_STDIN.store(false, Ordering::SeqCst);
+                    if continuous {
+                        if stop_flag.load(Ordering::SeqCst) {
+                            println!(
+                                "Continuous mining stopped ({} block(s) mined this run).",
+                                mined_count
+                            );
+                        } else {
+                            println!(
+                                "Continuous mining ended ({} block(s) mined this run) — press Enter to return to the console.",
+                                mined_count
+                            );
+                        }
+                    }
+                }
+Some("whisper") => {
+    let mut stdout = StandardStream::stdout(ColorChoice::Always);
+    let whisper = whisper_module.read().await;
+
+    // Split command into parts, handling quoted messages
+    let parts: Vec<String> = if command.contains('"') {
+        let mut parts = Vec::new();
+        let mut in_quotes = false;
+        let mut current = String::new();
+
+        for c in command.chars() {
+            match c {
+                '"' => {
+                    if !in_quotes && !current.is_empty() {
+                        parts.push(current.clone());
+                        current.clear();
+                    }
+                    in_quotes = !in_quotes;
+                }
+                ' ' if !in_quotes => {
+                    if !current.is_empty() {
+                        parts.push(current.clone());
+                        current.clear();
+                    }
+                }
+                _ => current.push(c),
+            }
+        }
+
+        if !current.is_empty() {
+            parts.push(current);
+        }
+
+        parts
+    } else {
+        command.split_whitespace()
+            .map(String::from)
+            .collect()
+    };
+
+if parts.len() == 1 {
+    // Whisper ledger. Same table grammar as `account` and `history`: a glyph+word
+    // direction token, middle-truncated counterparty, decimal-aligned value, age,
+    // height and depth. The old screen printed a five-line vertical block per
+    // message with a "SENT:"/"RECEIVED:" banner, showed the sender's fee on rows
+    // the recipient never paid, and carried pending status inside the message text
+    // as a literal "[PENDING] " prefix.
+    let mut all_messages = Vec::new();
+    let mut tip = 0u64;
+    for wallet in wallets.values() {
+        // Short-lived per-wallet read guard (mirrors the whisper sync loop and the `info`
+        // handler). scan_blockchain_for_messages walks tip->cutoff with a get_block per height
+        // (~tens of thousands of reads over the 48h window), repeated for every wallet. Holding
+        // ONE guard across the whole batch would park a queued block-save writer — and then every
+        // reader behind it — on tokio's write-preferring RwLock for the entire scan.
+        let blockchain_guard = blockchain.read().await;
+        tip = tip.max(blockchain_guard.get_latest_block_index());
+        let blockchain_messages = whisper
+            .scan_blockchain_for_messages(&blockchain_guard, &wallet.address)
+            .await;
+        all_messages.extend(blockchain_messages);
+        let pending_messages = whisper
+            .get_unconfirmed_messages(&blockchain_guard, &wallet.address)
+            .await;
+        all_messages.extend(pending_messages);
+    }
+    drop(whisper);
+
+    all_messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    all_messages.dedup_by(|a, b| a.tx_hash == b.tx_hash);
+
+    let mine: Vec<&String> = wallets.values().map(|w| &w.address).collect();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let spec = &mut ColorSpec::new();
+
+    let selfed = all_messages
+        .iter()
+        .filter(|m| mine.contains(&&m.from) && mine.contains(&&m.to))
+        .count();
+    let sent = all_messages
+        .iter()
+        .filter(|m| mine.contains(&&m.from) && !mine.contains(&&m.to))
+        .count();
+    let received = all_messages
+        .iter()
+        .filter(|m| !mine.contains(&&m.from))
+        .count();
+    let pending = all_messages
+        .iter()
+        .filter(|m| m.content.starts_with("[PENDING]"))
+        .count();
+
+    writeln!(stdout)?;
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_PINK, true, "Whispers")?;
+    let note = format!("last 48h · tip {}", ui_thousands(tip));
+    ui_pad(&mut stdout, spec, 9, 78usize.saturating_sub(note.chars().count()))?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, &note)?;
+    writeln!(stdout)?;
+    if !all_messages.is_empty() {
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_GREEN, false, &format!("▾ {} in", received))?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, "    ")?;
+        ui_seg(&mut stdout, spec, UI_PINK, false, &format!("▴ {} out", sent))?;
+        if selfed > 0 {
+            ui_seg(&mut stdout, spec, UI_LABEL, false, "    ")?;
+            ui_seg(&mut stdout, spec, UI_BLUE, false, &format!("↔ {} self", selfed))?;
+        }
+        if pending > 0 {
+            ui_seg(&mut stdout, spec, UI_LABEL, false, "    ")?;
+            ui_seg(&mut stdout, spec, UI_ORANGE, false, &format!("{} pending", pending))?;
+        }
+        writeln!(stdout)?;
+    }
+    ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+    writeln!(stdout)?;
+
+    if all_messages.is_empty() {
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_DIM, false,
+            "no whispers in the last 48 hours — send one with  whisper <address> \"<code>\"")?;
+        writeln!(stdout)?;
+        writeln!(stdout)?;
+        stdout.reset()?;
+        continue;
+    }
+
+    // Column right edges, shared with the account/history tables.
+    const W_PARTY: usize = 16;
+    const W_VALUE_END: usize = 48;
+    const W_AGE_END: usize = 55;
+    // Status, not height: WhisperMessage carries no block height, so claiming a
+    // height column would mean inventing one. 66 keeps a two-space gutter after
+    // the age column for the widest word ("confirmed").
+    const W_STATUS_END: usize = 66;
+
+    ui_pad(&mut stdout, spec, 0, 9)?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "code")?;
+    ui_pad(&mut stdout, spec, 13, W_PARTY)?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "counterparty")?;
+    let mut col = W_PARTY + 12;
+    col = ui_right(&mut stdout, spec, col, W_VALUE_END, UI_DIM, false, "value")?;
+    col = ui_right(&mut stdout, spec, col, W_AGE_END, UI_DIM, false, "age")?;
+    ui_right(&mut stdout, spec, col, W_STATUS_END, UI_DIM, false, "status")?;
+    writeln!(stdout)?;
+
+    // Oldest first so the newest sits nearest the prompt.
+    all_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    for msg in &all_messages {
+        let is_sender = mine.contains(&&msg.from);
+        let is_recipient = mine.contains(&&msg.to);
+        // Whispering yourself is the natural way to test the feature, and it is
+        // neither in nor out: the amount leaves and returns to the same wallet.
+        let is_self = is_sender && is_recipient;
+        let is_pending = msg.content.starts_with("[PENDING]");
+        let code = msg.content.trim_start_matches("[PENDING]").trim().to_uppercase();
+        let (token, hue) = if is_self {
+            ("↔ self", UI_BLUE)
+        } else if is_sender {
+            ("▴ out ", UI_PINK)
+        } else {
+            ("▾ in  ", UI_GREEN)
+        };
+        // What actually moved for THIS wallet. An inbound whisper credits the
+        // amount; an outbound one debits amount plus fee. A SELF whisper debits
+        // the fee alone — the amount lands back in the same wallet, so charging
+        // it too overstated the cost of every self-test by the amount sent.
+        // (The old screen printed the sender's fee on received rows as well, so
+        // a recipient read money they never spent.)
+        let value = if is_self {
+            -msg.fee
+        } else if is_sender {
+            -(msg.amount + msg.fee)
+        } else {
+            msg.amount
+        };
+
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, hue, false, token)?;
+        ui_pad(&mut stdout, spec, 6, 9)?;
+        ui_seg(&mut stdout, spec, UI_CYAN, true, &code)?;
+        let party = ui_address(if is_sender { &msg.to } else { &msg.from });
+        ui_pad(&mut stdout, spec, 9 + code.chars().count(), W_PARTY)?;
+        ui_text(&mut stdout, spec, false, &party)?;
+        let mut col = W_PARTY + party.chars().count();
+        let value_text = format!("{}{:.8} ♦", if value < 0.0 { "-" } else { "+" }, value.abs());
+        col = ui_right(&mut stdout, spec, col, W_VALUE_END, hue, false, &value_text)?;
+        let age = ui_age(now_secs.saturating_sub(msg.timestamp));
+        col = ui_right(&mut stdout, spec, col, W_AGE_END, UI_DIM, false, &age)?;
+        let (status, status_hue) = if is_pending {
+            ("pending", UI_ORANGE)
+        } else {
+            ("confirmed", UI_BLUE)
+        };
+        ui_right(&mut stdout, spec, col, W_STATUS_END, status_hue, false, status)?;
+        writeln!(stdout)?;
+    }
+
+    ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+    writeln!(stdout)?;
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_DIM, false,
+        "the code IS the fee — anyone can decode it straight off the public ledger")?;
+    writeln!(stdout)?;
+    writeln!(stdout)?;
+    stdout.reset()?;
+    continue;
+
+    } else {
+        let (recipient, amount, message) = match parts.len() {
+            3 => {
+                let msg = parts[2].trim_matches('"');
+                if msg.chars().count() > alphanumeric::a9::whisper::MAX_WHISPER_CHARS {
+                    let mut error_style = ColorSpec::new();
+                    error_style.set_fg(Some(Color::Red)).set_bold(true);
+                    stdout.set_color(&error_style)?;
+                    println!("Whisper carries a 4-letter (a-z) code only; shorten the message.");
+                    stdout.reset()?;
+                    continue;
+                }
+                // In the 2-arg form the second token is the CODE, and the amount
+                // defaults. A user who meant it as the amount would be surprised — and a
+                // number can't even be a code (the encoder keeps only a-z), so flag it.
+                if msg.parse::<f64>().is_ok() {
+                    println!(
+                        "note: read '{}' as the whisper code, not an amount — codes are up to {} a-z letters (a number isn't sent as text). To send an amount, use `whisper <recipient> <amount> <code>`.",
+                        msg,
+                        alphanumeric::a9::whisper::MAX_WHISPER_CHARS
+                    );
+                }
+                (&parts[1], alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT, msg)
+            },
+            4 => {
+                let amount = match parts[2].parse::<f64>() {
+                    Ok(a) if a.is_finite() && a >= alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT => a,
+                    _ => {
+                        // The 4-token form is `whisper <recipient> <amount> <code>`, so
+                        // parts[2] is read as the AMOUNT. A stray word (a two-word
+                        // message, or a --fee borrowed from `send`) lands here and used
+                        // to draw a bare "minimum token" error that named neither the
+                        // real problem nor the offending token. Name it and show usage.
+                        let mut error_style = ColorSpec::new();
+                        error_style.set_fg(Some(Color::Red)).set_bold(true);
+                        stdout.set_color(&error_style)?;
+                        println!(
+                            "'{}' is not an amount. Usage: whisper <recipient> [amount] <code>  —  the code is one word up to {} a-z letters, and whisper takes no --fee (the code IS the fee).",
+                            parts[2],
+                            alphanumeric::a9::whisper::MAX_WHISPER_CHARS
+                        );
+                        stdout.reset()?;
+                        continue;
+                    }
+                };
+
+                let msg = parts[3].trim_matches('"');
+                if msg.chars().count() > alphanumeric::a9::whisper::MAX_WHISPER_CHARS {
+                    let mut error_style = ColorSpec::new();
+                    error_style.set_fg(Some(Color::Red)).set_bold(true);
+                    stdout.set_color(&error_style)?;
+                    println!("Whisper carries a 4-letter (a-z) code only; shorten the message.");
+                    stdout.reset()?;
+                    continue;
+                }
+                (&parts[1], amount, msg)
+            },
+            _ => {
+
+let mut section_style = ColorSpec::new();
+section_style.set_fg(Some(Color::Rgb(147, 124, 184))) // A softer color for section titles
+             .set_bold(true);
+
+let mut description_style = ColorSpec::new();
+description_style.set_fg(Some(Color::Rgb(165, 251, 255))); // Light blue for descriptions
+
+let mut stdout = StandardStream::stdout(ColorChoice::Always);
+
+stdout.set_color(&section_style)?;
+write!(&mut stdout, "\n Usage")?;
+stdout.reset()?;
+    writeln!(stdout, "\n───────────────────")?;
+
+
+writeln!(&mut stdout, "whisper (Displays recent whispers.)")?;
+writeln!(&mut stdout, "whisper <recipient> [amount] <code> Send a new whisper to <recipient> (code = up to 4 a-z letters).")?;
+
+stdout.set_color(&section_style)?;
+write!(&mut stdout, "\n Whisper Code")?;
+stdout.reset()?;
+    writeln!(stdout, "\n───────────────────")?;
+
+writeln!(&mut stdout, "Embed a short alphabetic message, 4-character (4-byte) code.")?;
+writeln!(&mut stdout, "This optional feature provides a vanity fee code that can be seen by decoding the fee with a cipher.")?;
+stdout.set_color(&description_style)?;
+write!(&mut stdout, "Whisper codes can be decoded from the public ledger so do not share sensitive information.\n\n")?;
+
+stdout.flush()?;
+continue;
+}
+        };
+
+        // Validate the recipient BEFORE drafting/signing, exactly as `send` does — a
+        // wallet name, an uppercase address, or a wrong-length string used to be carried
+        // all the way through the "draft · confirm" preview and only rejected at
+        // admission with an opaque "fields are not canonically encoded", after the user
+        // had already confirmed a doomed broadcast.
+        if !alphanumeric::a9::blockchain::is_canonical_user_address(recipient) {
+            let mut error_style = ColorSpec::new();
+            error_style.set_fg(Some(Color::Red)).set_bold(true);
+            stdout.set_color(&error_style)?;
+            println!(
+                "recipient '{}' is not a valid address — it must be exactly 40 lowercase hexadecimal characters (whisper takes an address, not a wallet name).",
+                recipient
+            );
+            stdout.reset()?;
+            continue;
+        }
+
+        // Fund the whisper from the SAME wallet everything else spends from —
+        // resolve_default_wallet (the `default_wallet` key, else the highest-balance
+        // wallet), matching `send`, `mine`, and the quick-transfer shorthand. The old
+        // code picked the lowest-ADDRESS wallet, so a whisper could silently debit a
+        // different wallet than every other spend, invisible until the receipt. The
+        // chosen wallet is announced before the draft, exactly as the send shorthand does.
+        let sender_wallet =
+            match alphanumeric::a9::mgmt::resolve_default_wallet(&wallets, &blockchain).await {
+                Some((name, address)) => match wallets.values().find(|w| w.address == address) {
+                    Some(w) => {
+                        println!("Sending from {} ({})", name, address);
+                        w
+                    }
+                    None => {
+                        // Resolved an address with no matching loaded wallet — should not
+                        // happen (the address came from `wallets`), but never sign blind.
+                        println!("error: could not resolve a wallet to send this whisper from");
+                        continue;
+                    }
+                },
+                None => {
+                    let mut error_style = ColorSpec::new();
+                    error_style.set_fg(Some(Color::Red)).set_bold(true);
+                    stdout.set_color(&error_style)?;
+                    print!("error");
+                    stdout.reset()?;
+                    println!(": No wallet available to send message");
+                    continue;
+                }
+            };
+
+        let blockchain_guard = blockchain.read().await;
+        let sender_balance = match blockchain_guard.get_wallet_balance(&sender_wallet.address).await {
+            Ok(b) => b,
+            Err(e) => {
+                let mut error_style = ColorSpec::new();
+                error_style.set_fg(Some(Color::Red)).set_bold(true);
+                stdout.set_color(&error_style)?;
+                print!("error");
+                stdout.reset()?;
+                println!(": Failed to check balance: {}", e);
+                continue;
+            }
+        };
+
+        let Some(payment_ledger) = ledger.as_ref() else {
+            drop(blockchain_guard);
+            println!("error: payment ledger unavailable; refusing to sign a whisper without collision-safe reservation");
+            continue;
+        };
+
+        let base_tx = Transaction::new(
+            sender_wallet.address.clone(),
+            recipient.to_string(),
+            amount,
+            0.0,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            None,
+        );
+
+match whisper.create_whisper_transaction(
+    base_tx,
+    recipient,
+    message,
+    sender_wallet,
+    sender_balance,
+    payment_ledger,
+).await {
+Ok(whisper_tx) => {
+    // Drop blockchain guard before getting write lock
+    drop(blockchain_guard);
+
+    // PREVIEW BEFORE BROADCAST. The message rides in the FEE, and the encoder
+    // silently normalises it: characters outside a-z are dropped, and a code
+    // shorter than MAX_WHISPER_CHARS has its empty slots filled by the decoder
+    // — so `c4fe` lands on chain as CFEM and `hey` reads back as HEYM. The old
+    // flow printed the string the USER typed, after broadcasting, so nobody
+    // ever saw what the chain would actually carry. Decode the signed fee and
+    // show the round-trip while it can still be cancelled.
+    {
+        let amount = whisper_tx.amount();
+        let total_fee = whisper_tx.fee();
+        let network_fee = amount * alphanumeric::a9::blockchain::FEE_PERCENTAGE;
+        let code_fee = total_fee - network_fee;
+        let reads_back = whisper
+            .decode_message_from_fee(total_fee, whisper_tx.timestamp, amount)
+            .unwrap_or_default()
+            .to_uppercase();
+        let typed = message.trim().to_lowercase();
+        let round_trip_ok = reads_back.eq_ignore_ascii_case(&typed);
+
+        let mut out = StandardStream::stdout(ColorChoice::Auto);
+        let spec = &mut ColorSpec::new();
+        writeln!(out)?;
+        ui_seg(&mut out, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut out, spec, UI_CYAN, true, "Whisper")?;
+        ui_pad(&mut out, spec, 8, 64)?;
+        ui_seg(&mut out, spec, UI_ORANGE, false, "draft · not sent")?;
+        writeln!(out)?;
+        ui_seg(&mut out, spec, UI_DIM, false, " to    ")?;
+        ui_text(&mut out, spec, false, recipient)?;
+        writeln!(out)?;
+        ui_seg(&mut out, spec, UI_DIM, false, UI_RULE)?;
+        writeln!(out)?;
+
+        ui_grid_row(
+            &mut out,
+            spec,
+            Some((" Typed:", &[(UI_LABEL, typed.clone())])),
+            Some(("Amount:", &[(UI_CYAN, format!("{:.8} ♦", amount))])),
+        )?;
+        ui_grid_row(
+            &mut out,
+            spec,
+            Some((
+                " Reads back:",
+                &[(
+                    if round_trip_ok { UI_GREEN } else { UI_ORANGE },
+                    if reads_back.is_empty() {
+                        "(undecodable)".to_string()
+                    } else {
+                        reads_back.clone()
+                    },
+                )],
+            )),
+            Some(("Network fee:", &[(UI_DIM, format!("{:.8} ♦", network_fee))])),
+        )?;
+        ui_grid_row(
+            &mut out,
+            spec,
+            Some((
+                " Round-trip:",
+                &[if round_trip_ok {
+                    (UI_GREEN, "matches".to_string())
+                } else {
+                    (UI_ORANGE, "CHANGED".to_string())
+                }],
+            )),
+            Some(("Code fee:", &[(UI_CYAN, format!("{:.8} ♦", code_fee))])),
+        )?;
+        ui_grid_row(
+            &mut out,
+            spec,
+            None,
+            Some((
+                "Total:",
+                &[(UI_CYAN, format!("{:.8} ♦", amount + total_fee))],
+            )),
+        )?;
+        ui_seg(&mut out, spec, UI_DIM, false, UI_RULE)?;
+        writeln!(out)?;
+        if !round_trip_ok {
+            ui_seg(&mut out, spec, UI_ORANGE, false, " ")?;
+            ui_seg(
+                &mut out,
+                spec,
+                UI_ORANGE,
+                false,
+                &format!(
+                    "the chain will carry {} — only a-z survives, and short codes get padded",
+                    if reads_back.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        reads_back.clone()
+                    }
+                ),
+            )?;
+            writeln!(out)?;
+        }
+        ui_seg(&mut out, spec, UI_DIM, false,
+            " the message IS the fee — a plain payment of this amount would cost only the network fee\n")?;
+        writeln!(out)?;
+        // Enter is the confirm: the draft above IS the review, so once it reads back
+        // as typed the decision has already been made and a second keystroke adds
+        // nothing. `y` still works for the old reflex and for piped input. The one
+        // exception is a CHANGED round-trip — there the chain would carry something
+        // other than what was typed, so that case keeps the fail-safe and demands an
+        // explicit `y`. Anything unrecognised cancels either way: an unsent whisper
+        // costs a retype, a wrongly-sent one is permanent.
+        ui_seg(&mut out, spec, UI_LABEL, false, " send?  ")?;
+        ui_seg(
+            &mut out,
+            spec,
+            UI_DIM,
+            false,
+            if round_trip_ok {
+                "enter sends · n cancels: "
+            } else {
+                "type y to send it CHANGED · n cancels: "
+            },
+        )?;
+        out.flush()?;
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        out.reset()?;
+        let answer = answer.trim();
+        let confirmed = if round_trip_ok {
+            answer.is_empty()
+                || answer.eq_ignore_ascii_case("y")
+                || answer.eq_ignore_ascii_case("yes")
+        } else {
+            answer.eq_ignore_ascii_case("y")
+        };
+        if !confirmed {
+            let ledger = Arc::clone(payment_ledger);
+            let tx_id = whisper_tx.get_tx_id();
+            match tokio::task::spawn_blocking(move || ledger.release_local_reservation(&tx_id)).await {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => eprintln!("warning: cancelled whisper reservation was already finalized"),
+                Ok(Err(error)) => eprintln!("warning: could not release cancelled whisper reservation: {error}"),
+                Err(error) => eprintln!("warning: cancelled whisper ledger task failed: {error}"),
+            }
+            println!("Cancelled — nothing was broadcast.");
+            continue;
+        }
+    }
+    // Scope the WRITE guard to the submit itself: the success arm below does console
+    // IO and (since v7.6.8) network gossip, and holding a chain write guard across
+    // awaits is the known wedge class.
+    let submit_res = {
+        let blockchain_guard = blockchain.read().await;
+        // No wallet registry needed - transactions are self-contained with public keys
+        blockchain_guard.admit_transaction(whisper_tx.clone()).await
+    };
+    match submit_res {
+        Ok(alphanumeric::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
+let ledger = Arc::clone(payment_ledger);
+let tx_id = whisper_tx.get_tx_id();
+let state_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+match tokio::task::spawn_blocking(move || ledger.update_state(&tx_id, EntryState::Pending, state_time)).await {
+    Ok(Ok(())) => {}
+    Ok(Err(error)) => eprintln!("warning: whisper is pending but its payment-ledger update failed: {error}"),
+    Err(error) => eprintln!("warning: whisper is pending but its payment-ledger state task failed: {error}"),
+}
+// Announce like any other tx: whispers ride the same mempool/gossip path, and
+// without this only the sender could ever mine the whisper into a block.
+node.gossip_transaction(&whisper_tx).await;
+let mut stdout = StandardStream::stdout(ColorChoice::Always);
+let mut style = ColorSpec::new();
+
+style.set_fg(Some(Color::Rgb(132, 132, 132))).set_bold(false);
+stdout.set_color(&style)?;
+writeln!(stdout, "\n    ...ML-DSA-87 verification complete")?;
+writeln!(stdout, "    ...Establishing secure atomic lock for transaction")?;
+stdout.reset()?;
+
+style.set_fg(Some(Color::Rgb(59, 242, 173))).set_bold(true);
+stdout.set_color(&style)?;
+writeln!(stdout, "\nWhisper message sent successfully")?;
+
+stdout.reset()?;
+
+style.set_fg(Some(Color::Rgb(132, 132, 132))).set_bold(false);
+stdout.set_color(&style)?;
+writeln!(stdout, "\n  Receipt:")?;
+stdout.reset()?;
+style.set_fg(Some(Color::Rgb(180, 219, 210)));
+stdout.set_color(&style)?;
+writeln!(stdout, "  From: {}", sender_wallet.address)?;
+writeln!(stdout, "  Amount: {:.8}", whisper_tx.amount())?;
+writeln!(stdout, "  Fee: {:.8}", whisper_tx.fee())?;
+writeln!(stdout, "  Message: {}\n", message)?;
+stdout.reset()?;
+
+        },
+        Ok(alphanumeric::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending) => {
+            let ledger = Arc::clone(payment_ledger);
+            let tx_id = whisper_tx.get_tx_id();
+            let state_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let _ = tokio::task::spawn_blocking(move || {
+                ledger.update_state(&tx_id, EntryState::AmbiguousExisting, state_time)
+            }).await;
+            println!("error: an identical whisper transaction already exists; do not create a replacement until it is reconciled");
+        }
+        Ok(alphanumeric::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(height)) => {
+            let ledger = Arc::clone(payment_ledger);
+            let tx_id = whisper_tx.get_tx_id();
+            let state_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let _ = tokio::task::spawn_blocking(move || {
+                ledger.update_state(&tx_id, EntryState::Confirmed { height }, state_time)
+            }).await;
+            println!("The identical whisper transaction is already confirmed at block {height}; it was not submitted again.");
+        }
+        Err(e) => {
+            let presence = {
+                let chain = blockchain.read().await;
+                chain.transaction_presence(&whisper_tx.get_tx_id()).await
+            };
+            let ledger = Arc::clone(payment_ledger);
+            let tx_id = whisper_tx.get_tx_id();
+            let state_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let state = match presence {
+                Ok(alphanumeric::a9::blockchain::TransactionPresence::Pending) => {
+                    eprintln!("warning: whisper submission returned an error but the transaction is pending; do not re-sign it");
+                    Some(EntryState::AmbiguousExisting)
+                }
+                Ok(alphanumeric::a9::blockchain::TransactionPresence::Confirmed(height)) => {
+                    eprintln!("warning: whisper submission returned an error but the transaction is confirmed at block {height}; do not retry it");
+                    Some(EntryState::Confirmed { height })
+                }
+                Ok(alphanumeric::a9::blockchain::TransactionPresence::Absent) => {
+                    Some(EntryState::Rejected { reason: e.to_string() })
+                }
+                Err(state_error) => {
+                    eprintln!("warning: whisper submission outcome could not be reconciled ({state_error}); do not create a replacement");
+                    None
+                }
+            };
+            if let Some(state) = state {
+            let _ = tokio::task::spawn_blocking(move || {
+                ledger.update_state(&tx_id, state, state_time)
+            }).await;
+            }
+            let mut error_style = ColorSpec::new();
+            error_style.set_fg(Some(Color::Red)).set_bold(true);
+            stdout.set_color(&error_style)?;
+            print!("error");
+            stdout.reset()?;
+            println!(": Failed to send message: {}", e);
+        }
+    }
+},
+    Err(e) => {
+        let mut error_style = ColorSpec::new();
+        error_style.set_fg(Some(Color::Red)).set_bold(true);
+        stdout.set_color(&error_style)?;
+        print!("error");
+        stdout.reset()?;
+        println!(": Failed to create whisper transaction: {}", e);
+    }
+        }
+    }
+},
+
+Some("history") => {
+    // Moved out of the REPL: the inline version reached through the whisper
+    // module, which flattened away height, position and the direction flag
+    // bits the address index had already decoded.
+    if let Err(e) = mgmt
+        .handle_history_command(&command, &blockchain, &wallets)
+        .await
+    {
+        println!("Error: {}", e);
+    }
+},
+    Some("--sync") if command.split_whitespace().nth(1) == Some("bootstrap") => {
+        // Typed consent for the in-place snapshot heal: writes the same durable
+        // marker the watchdog writes, then restarts this terminal into a boot
+        // that re-bootstraps unconditionally. Lives here rather than in
+        // handle_network_commands because the store handle and db path do.
+        println!("Re-bootstrapping from a fresh verified snapshot; restarting in place...");
+        let marker = force_rebootstrap_marker_path(&db_path);
+        if let Err(e) = alphanumeric::a9::node::write_durable(
+            &marker,
+            b"operator-requested re-bootstrap (--sync bootstrap)\n",
+        ) {
+            println!("Could not write the re-bootstrap marker ({}); nothing was changed.", e);
+        } else {
+            alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+            let _ = db.flush();
+            let _ = remove_db_lock(&format!("{}.lock", db_path));
+            let _ = remove_instance_lock();
+            let err = restart_in_place();
+            // Do NOT fall back into the menu: the pid locks are already removed and
+            // the wipe marker is armed, so a session that keeps running here is a
+            // second-instance hazard and a surprise wipe waiting for the next boot.
+            // The marker is durable and the store is flushed — exiting IS the safe
+            // state, exactly like the watchdog's own fallback.
+            println!(
+                "In-place restart unavailable ({}); exiting — relaunch the app and the snapshot will be applied at boot.",
+                err
+            );
+            std::process::exit(3);
+        }
+    },
+    Some(cmd) if cmd.starts_with("--") => {
+        if let Err(e) = handle_network_commands(&command, &node).await {
+            println!("Network command error: {}", e);
+        }
+    },
+    Some("account") => {
+        if let Err(e) = mgmt
+            .handle_account_command(&command, &blockchain, &wallets)
+            .await
+        {
+            println!("Error displaying account info: {}", e);
+        }
+    },
+
+Some("contacts") => {
+    if let Err(e) = mgmt
+        .handle_contacts_command(&command, &blockchain, &wallets)
+        .await
+    {
+        println!("Error: {}", e);
+    }
+},
+
+Some("debug") => {
+    let blockchain_guard = blockchain.read().await;
+    // Populate diagnostics from the canonical chain. A fresh, empty oracle
+    // returns fallback constants intended for calculation callers; displaying
+    // those as live network measurements made every `debug` invocation claim
+    // the same variance/load/entropy/stability regardless of chain history.
+    let mut oracle = DifficultyOracle::new();
+    for block in blockchain_guard.get_recent_blocks(50) {
+        oracle.record_block_metrics(block.timestamp, block.difficulty);
+    }
+
+    if let Some(last_block) = blockchain_guard.get_last_block() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let timestamp_diff = now.saturating_sub(last_block.timestamp);
+        let tip_difficulty = blockchain_guard.get_tip_difficulty().await;
+        let next_difficulty = blockchain_guard.get_current_difficulty().await;
+
+        if let Err(e) = oracle
+            .display_difficulty_metrics(tip_difficulty, next_difficulty, timestamp_diff)
+            .await
+        {
+            error!("Failed to display diagnostics: {}", e);
+            println!("Error displaying diagnostics: {}", e);
+        }
+    } else {
+        println!("No blocks available for diagnostics");
+    }
+
+    println!("Consensus Fingerprint: {}", consensus_fingerprint);
+    println!("Consensus Descriptor:  {}", consensus_descriptor);
+},
+
+Some("help") => {
+    // Task-first cheatsheet: rows are indexed by the goal you arrive with
+    // ("what I hold", "send coins"), not by command name, so you find your line
+    // without already knowing the verb. Every run goes through the termcolor
+    // handle — the old arm mixed println! with set_color, which puts the colour
+    // attribute on one handle and the text on another (bold rendered on Windows
+    // only). Weight is set explicitly on every run.
+    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+    let spec = &mut ColorSpec::new();
+    // Column where every command keyword starts. Wide enough for the LONGEST
+    // goal plus its gutter; the rail glyph and its space occupy the first two
+    // cells of every row, so goals start at 3 and the keyword column accounts
+    // for that lead-in rather than fighting it.
+    const CMD: usize = 19;
+
+    // A row carries a rail in its section hue. The rail is what makes section
+    // membership survive scrolling: a colour on the keyword alone disappears the
+    // moment the header scrolls off, and the eye then has to re-derive which
+    // group a line belongs to.
+    macro_rules! row {
+        ($hue:expr, $goal:expr, $cmd:expr, $args:expr) => {{
+            let goal: &str = $goal;
+            // No rail glyph: the section header and the command's own colour already
+            // say which group a row belongs to, and a per-row marker on every line
+            // was one signal too many. The indent is kept so the columns are
+            // unchanged.
+            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+            // Goals sit in MUTED, a step brighter than the old DIM: they are the
+            // index you read down, not incidental text.
+            ui_seg(&mut stdout, spec, UI_MUTED, false, goal)?;
+            let goal_end = 1 + goal.chars().count();
+            ui_pad(&mut stdout, spec, goal_end, CMD.max(goal_end + 2))?;
+            ui_seg(&mut stdout, spec, $hue, false, $cmd)?;
+            let cmd_end = CMD.max(goal_end + 2) + $cmd.chars().count();
+            let args: &str = $args;
+            if !args.is_empty() {
+                // Two kinds of trailing text, told apart by a leading space:
+                //   "account " + "<address>"        syntax — part of the command
+                //   "mine"     + "   rewards go…"   a description of it
+                // Syntax stays welded to the keyword in LABEL (it is typed); a
+                // description is a second column in FAINT and lines up like one.
+                if args.starts_with(' ') {
+                    ui_pad(&mut stdout, spec, cmd_end, cmd_end + 2)?;
+                    ui_seg(&mut stdout, spec, UI_FAINT, false, args.trim_start())?;
+                } else {
+                    ui_seg(&mut stdout, spec, UI_LABEL, false, args)?;
+                }
+            }
+            writeln!(stdout)?;
+        }};
+    }
+
+    // Section header: name in the section hue, then the dim subtitle that says
+    // what the group is for. The subtitle is what turns a colour into a category.
+    macro_rules! section {
+        ($hue:expr, $name:expr, $subtitle:expr) => {{
+            let name: &str = $name;
+            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+            ui_seg(&mut stdout, spec, $hue, true, name)?;
+            ui_seg(&mut stdout, spec, UI_DIM, false, "  ")?;
+            ui_seg(&mut stdout, spec, UI_FAINT, false, $subtitle)?;
+            writeln!(stdout)?;
+        }};
+    }
+
+    writeln!(stdout)?;
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_CYAN, true, "Help")?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "   command reference · ")?;
+    // Colour the COUNT, never part of the word: splitting "wallet" from its
+    // plural "s" put a colour boundary mid-word and read as a rendering fault.
+    ui_seg(&mut stdout, spec, UI_CYAN, false, &wallets.len().to_string())?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_DIM,
+        false,
+        if wallets.len() == 1 {
+            " wallet loaded"
+        } else {
+            " wallets loaded"
+        },
+    )?;
+    // Pad from where the header text ACTUALLY ends: the wallet count is variable
+    // width, and a hardcoded origin drifts the hint (and overflows 80 columns once
+    // the count reaches four digits).
+    // 28 = " Help" + "   command reference · "; then the variable-width count and
+    // its noun. Measured, not guessed: ui_pad emits (end - start) spaces, so an
+    // origin that is off by n shifts the whole hint by n.
+    let header_end = 28
+        + wallets.len().to_string().chars().count()
+        + if wallets.len() == 1 {
+            " wallet loaded".chars().count()
+        } else {
+            " wallets loaded".chars().count()
+        };
+    ui_pad(&mut stdout, spec, header_end, header_end.max(62))?;
+    // The arrow is the only orange on this screen: it is the one thing here you can
+    // press rather than read, and a key you can press is worth exactly one accent.
+    ui_seg(&mut stdout, spec, UI_ORANGE, false, "\u{2191}")?;
+    ui_seg(&mut stdout, spec, UI_FAINT, false, " recalls previous")?;
+    writeln!(stdout)?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+    writeln!(stdout)?;
+
+    // Column legend. Every row below reads "goal, then the thing you type", and
+    // with the typed token on the RIGHT there was nothing saying so — the left
+    // column reads like a command list until you notice it isn't.
+    {
+        let legend = " operation";
+        ui_seg(&mut stdout, spec, UI_DIM, false, legend)?;
+        ui_pad(&mut stdout, spec, legend.chars().count(), CMD)?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, "command")?;
+        writeln!(stdout)?;
+    }
+    writeln!(stdout)?;
+
+    section!(UI_CYAN, "Wallet", "account overview");
+    row!(UI_CYAN, "balances", "balance", "");
+    row!(UI_CYAN, "address lookup", "account ", "<address>");
+    // `history 50` already worked and was documented nowhere, so the default 12
+    // looked like a hard cap. The range is part of the row, not a footnote.
+    row!(UI_CYAN, "transactions", "history ", "[rows]");
+    row!(UI_CYAN, "address book", "contacts ", "[all]");
+    row!(UI_CYAN, "new wallet", "new ", "[name]");
+    row!(UI_CYAN, "rename wallet", "rename ", "<name> <new name>");
+    row!(UI_CYAN, "export seed", "export-seed ", "<name>");
+    row!(
+        UI_CYAN,
+        "import seed",
+        "import-seed",
+        "   asks for the seed, never echoed"
+    );
+    row!(UI_CYAN, "import (script)", "import-seed ", "<hex> [name]");
+    // Section notes carry no rail: the rail marks a row you can type, and a
+    // note is not one. Flush with the goals column so it reads as a caption
+    // under the section rather than another entry in it.
+    ui_pad(&mut stdout, spec, 0, 1)?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_FAINT,
+        false,
+        "history shows 1-50 rows (default 12) \u{b7} contacts shows your top 10, or all",
+    )?;
+    writeln!(stdout)?;
+    writeln!(stdout)?;
+
+    section!(UI_BLUE, "Transfers", "move coins \u{b7} addresses are 40-hex, not wallet names");
+    row!(UI_BLUE, "transfer", "create ", "<from> <to> <amount> [--fee <amount>]");
+    row!(UI_BLUE, "quick transfer", "<to> <amount>", "   from your default wallet");
+    row!(UI_BLUE, "send a whisper", "whisper ", "<address> [amount] <code>");
+    // Section notes carry no rail: the rail marks a row you can type, and a
+    // note is not one. Flush with the goals column so it reads as a caption
+    // under the section rather than another entry in it.
+    ui_pad(&mut stdout, spec, 0, 1)?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_FAINT,
+        false,
+        "fees are automatic \u{b7} a whisper rides in its fee, so it costs more",
+    )?;
+    writeln!(stdout)?;
+    writeln!(stdout)?;
+
+    section!(UI_GREEN, "Mining", "rewards mature after 100 blocks");
+    row!(UI_GREEN, "start mining", "mine", "   to your default wallet");
+    row!(UI_GREEN, "mine to a wallet", "mine ", "<wallet name>");
+    row!(UI_GREEN, "keep mining", "mine ", "[wallet] --continuous  (-c)");
+    // Section notes carry no rail: the rail marks a row you can type, and a
+    // note is not one. Flush with the goals column so it reads as a caption
+    // under the section rather than another entry in it.
+    ui_pad(&mut stdout, spec, 0, 1)?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_FAINT,
+        false,
+        "one block unless --continuous; Enter stops it",
+    )?;
+    writeln!(stdout)?;
+    #[cfg(feature = "gpu_miner")]
+    {
+        ui_pad(&mut stdout, spec, 0, 1)?;
+        ui_seg(
+            &mut stdout,
+            spec,
+            UI_FAINT,
+            false,
+            "this build mines on the GPU by default; add --cpu to use the CPU instead",
+        )?;
+        writeln!(stdout)?;
+    }
+    writeln!(stdout)?;
+
+    section!(UI_LAVENDER, "Network", "node and peer status");
+    row!(UI_LAVENDER, "network status", "info", "");
+    row!(UI_LAVENDER, "connectivity", "--status", "");
+    row!(UI_LAVENDER, "peer discovery", "--getpeers", "   or --discover");
+    row!(UI_LAVENDER, "add peer", "--connect ", "<ip:port>");
+    row!(UI_LAVENDER, "resynchronise", "--sync ", "[bootstrap]");
+    row!(UI_LAVENDER, "diagnostics", "debug", "");
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+    writeln!(stdout)?;
+    // Aliases earn their line because a user who typed one needs to know it is
+    // the same command, not a different one.
+    {
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, "aliases  ")?;
+        ui_seg(&mut stdout, spec, UI_BLUE, false, "create = send = transfer")?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, " · ")?;
+        ui_seg(&mut stdout, spec, UI_CYAN, false, "balance = bal = wallet")?;
+        writeln!(stdout)?;
+    }
+    // Pasting an address is the most natural thing a newcomer does with one. It
+    // resolves to `account`, so it takes the Wallet hue.
+    row!(UI_CYAN, "paste an address", "<address>", "   looks it up");
+    row!(UI_BLUE, "shorthand", "<from> <to> <amount>", "   starts a transfer");
+    row!(UI_PINK, "end session", "exit", "");
+    writeln!(stdout)?;
+    stdout.reset()?;
+}
+
+Some("version") => {
+print_ascii_intro();
+},
+Some("exit") => {
+use std::process::Command;
+ // Avoid spawning `cmd.exe` (common heuristic trigger). If you really want pause-on-exit
+ // for double-click runs, opt in with `ALPHANUMERIC_PAUSE_ON_EXIT=true`.
+ if cfg!(windows) && std::env::var("ALPHANUMERIC_PAUSE_ON_EXIT").ok().as_deref() == Some("true") {
+     let _ = Command::new("cmd").args(["/C", "pause"]).status();
+ }
+// Flush before exit, for the same reason the ^C / EOF / read-error arms above do: sled is
+// opened with flush_every_ms(1000) and the signal handler does not run for a TYPED command,
+// so returning here discards up to ~1s of writes. `exit` is the documented way to end a
+// session and was the only one of these paths that skipped it.
+alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+let _ = db.flush();
+let _ = remove_db_lock(&format!("{}.lock", db_path));
+let _ = remove_instance_lock();
+return Ok(());
+},
+
+Some(_) => {
+                    // Bare-transfer shorthand: "<from_addr> <to_addr> <amount>" with no
+                    // "create" keyword is treated as a create transaction — two 40-hex
+                    // addresses followed by a positive amount has no other meaning, so
+                    // accept it instead of rejecting as an invalid command.
+                    let parts: Vec<&str> = command.split_whitespace().collect();
+                    let is_addr =
+                        |s: &str| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit());
+                    let is_amount =
+                        |s: &str| s.parse::<f64>().map(|a| a > 0.0).unwrap_or(false);
+                    // A pasted address on its own is a LOOKUP. One 40-hex token can be
+                    // nothing else — no command is 40 hex characters, and every transfer
+                    // form needs at least an amount beside it — so this is unambiguous.
+                    // It resolves to `account`, which is READ-ONLY: the shorthand that
+                    // moves money still requires an explicit amount, and no amount can be
+                    // inferred from a bare address. Handled before the transfer forms
+                    // below so the two can never interact.
+                    if parts.len() == 1 && is_addr(parts[0]) {
+                        if let Err(e) = mgmt
+                            .handle_account_command(
+                                &format!("account {}", parts[0]),
+                                &blockchain,
+                                &wallets,
+                            )
+                            .await
+                        {
+                            println!("Error: {}", e);
+                        }
+                        continue;
+                    }
+                    // Two forms, both unambiguous because a 40-hex string followed
+                    // by a positive number has no other meaning:
+                    //   <from> <to> <amount>   explicit sender
+                    //   <to> <amount>          sender is the default wallet
+                    let quick = parts.len() == 2 && is_addr(parts[0]) && is_amount(parts[1]);
+                    let sender = if quick {
+                        match alphanumeric::a9::mgmt::resolve_default_wallet(&wallets, &blockchain).await {
+                            // Always name the wallet being spent from. The
+                            // shorthand's whole risk is sending from one you did
+                            // not mean, so the choice is never silent.
+                            Some((name, address)) => {
+                                println!("Sending from {} ({})", name, address);
+                                Some(address)
+                            }
+                            // Unreachable on a normal start (create_default_wallet
+                            // runs on first launch), but load_wallets returns Ok with
+                            // an empty map when every wallet fails to decrypt — so the
+                            // message must not tell someone whose funds are intact to
+                            // make a new wallet.
+                            None => {
+                                println!(
+                                    "No wallets are loaded. If private.key exists, the passphrase \
+                                     was wrong — restart and re-enter it. Otherwise create a wallet \
+                                     with `new`."
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if quick || (parts.len() == 3
+                        && is_addr(parts[0])
+                        && is_addr(parts[1])
+                        && is_amount(parts[2]))
+                    {
+                        let synthesized = match sender.as_deref() {
+                            Some(from) => format!("create {} {} {}", from, parts[0], parts[1]),
+                            None => format!("create {} {} {}", parts[0], parts[1], parts[2]),
+                        };
+                        match mgmt
+                            .handle_create_transaction(
+                                &synthesized,
+                                &mut wallets,
+                                &blockchain,
+                                &db_arc,
+                            )
+                            .await
+                        {
+                            Ok(CreateTransactionOutcome::Submitted(tx)) => {
+                                // Same as the explicit create arm: announce or nobody mines it.
+                                node.gossip_transaction(&tx).await;
+                            }
+                            Ok(CreateTransactionOutcome::AlreadyPending)
+                            | Ok(CreateTransactionOutcome::AlreadyConfirmed(_)) => {}
+                            Err(e) => {
+                                println!("Failed to create transaction: {}", e);
+                            }
+                        }
+                    } else if (2..=3).contains(&parts.len()) && is_amount(parts[parts.len() - 1]) {
+                        // A `<x> <amount>` or `<x> <y> <amount>` line that didn't match the
+                        // transfer shorthand above means an address slot is a wallet name or
+                        // otherwise not 40-hex. Say that, instead of a bare "unknown command".
+                        println!(
+                            "That looks like a transfer, but addresses must be 40 lowercase hex characters, not wallet names. Use `send <recipient-address> <amount>`, or `account <name>` to find an address."
+                        );
+                    } else {
+                        println!("Unknown command. Type `help` for the command list, or `info` for chain status.");
+                    }
+                }
+None => println!("Type `help` for the command list."),
+}
+
+            // The live copy of any seed that arrived on the line -- as an argument, or
+            // pasted bare. The borrows the match held on `command` have ended here, so
+            // it is wiped in place rather than left in a freed allocation when the next
+            // iteration overwrites it. The
+            // intermediates it was built from are wiped at the read sites above, and
+            // nothing else kept it: history and `last_console_command` are skipped
+            // for this command, and there is no `save_history`/`load_history` anywhere
+            // in this file, so the history never reaches disk either way. What this
+            // cannot reach is rustyline's own internal line buffer and its per-line
+            // undo history -- which is the reason the masked prompt, and not this, is
+            // the documented way to hand this node a seed. (The masked prompt has the
+            // same shape of caveat one layer down: `inquire` holds the input in a
+            // buffer of its own, as it does for the startup unlock and `export-seed`.)
+            if carries_a_seed {
+                command.zeroize();
+            }
+}
+// Ensure this block properly closes the `async move {` scope
+})
+.await
+}
+
+async fn handle_chain_sync(
+    node: &Node,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Beacon-driven sync. Across NAT the p2p peer table is empty, so the authoritative
+    // network tip is the signed beacon — NOT a peer-reported height. The old code read
+    // `peers.values().map(|i| i.blocks).max().unwrap_or(0)`, which with no peers always
+    // concluded "already at current height" and no-oped, so `--sync` never actually
+    // synced. converge_to_canonical drives us to the beacon tip from ANY state: forward-
+    // stream when merely behind, incremental reorg when our tip has diverged.
+    let mp = MultiProgress::new();
+    let status_pb = mp.add(ProgressBar::new_spinner());
+    status_pb.enable_steady_tick(Duration::from_millis(120));
+    status_pb.set_message("Syncing to the network tip...");
+
+    let local_height = { node.blockchain.read().await.get_latest_block_index() as u32 };
+    let outcome = node.sync_to_beacon().await;
+    let tip_now = { node.blockchain.read().await.get_latest_block_index() as u32 };
+
+    match outcome {
+        Converge::Converged => {
+            status_pb.finish_with_message(format!("Synced to the network tip: {}", tip_now));
+            Ok(())
+        }
+        Converge::AtTipAhead => {
+            status_pb.finish_with_message(format!(
+                "At or ahead of the network tip ({}) — ready to mine",
+                tip_now
+            ));
+            Ok(())
+        }
+        Converge::Progressed => {
+            status_pb.finish_with_message(format!(
+                "Synced from {} to {} — run --sync again to finish catching up",
+                local_height, tip_now
+            ));
+            Ok(())
+        }
+        Converge::NeedsBootstrap => {
+            // Overloaded verdict: a genuine fork below finality AND a gap too deep
+            // for the committed-span heal both land here. Either way the snapshot
+            // is the fix, so say so and name the command instead of leaving the
+            // operator with a diagnosis and no verb.
+            status_pb.finish_with_message(
+                "Cannot reach the tip over peer sync (forked below finality, too far behind to heal over peers, or peer sync stalled repeatedly). Type --sync bootstrap to pull a fresh verified snapshot now.",
+            );
+            Ok(())
+        }
+        Converge::BeaconStale => {
+            status_pb
+                .finish_with_message("Network tip beacon unavailable; try --sync again shortly");
+            Ok(())
+        }
+        Converge::BranchInvalid => {
+            status_pb.finish_with_message(
+                "Canonical branch failed local validation; staying on the local chain — try --sync again shortly",
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn handle_network_commands(
+    command: &str,
+    node: &Node,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Changed from Result<(), NodeError>
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    let cmd = parts.first().copied().unwrap_or("");
+
+    match cmd {
+        "--status" => {
+            let mut stdout = StandardStream::stdout(ColorChoice::Always);
+            let mut header_style = ColorSpec::new();
+            header_style.set_fg(Some(Color::Cyan)).set_bold(true);
+
+            stdout.set_color(&header_style)?;
+            writeln!(stdout, "\nNetwork Status")?;
+            stdout.reset()?;
+            println!("───────────────────");
+
+            let peers = node.peers.read().await;
+
+            // Calculate uptime
+            let uptime_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(node.start_time);
+
+            let uptime_days = uptime_secs / 86400;
+            let uptime_hours = (uptime_secs % 86400) / 3600;
+            let uptime_minutes = (uptime_secs % 3600) / 60;
+
+            // Connection Status reflects DIRECT p2p only. An empty direct-peer table is
+            // the NORMAL relay-mode case for a NAT'd node — it participates over the
+            // gateway relay, as `--getpeers` and `info` both show — so 0 direct peers
+            // must not read as "Offline", which sent operators troubleshooting a healthy
+            // node.
+            println!(
+                "Connection Status: {}",
+                if !peers.is_empty() {
+                    "Online (direct p2p)"
+                } else {
+                    "relay mode (no direct peers — normal for NAT'd nodes)"
+                }
+            );
+            println!("Direct P2P peers: {}", peers.len());
+            println!("Node Address: {}", node.get_public_key());
+            // The port actually BOUND, not the compile-time default — this line
+            // is read while debugging NAT/firewall issues, which is exactly when an
+            // overridden ALPHANUMERIC_PORT made the old constant actively misleading.
+            println!("P2P Port: {}", node.bind_addr.port());
+            println!(
+                "Uptime: {}d {}h {}m",
+                uptime_days, uptime_hours, uptime_minutes
+            );
+            println!();
+        }
+
+        "--connect" => {
+            if let Some(addr) = parts.get(1) {
+                let test_mode = parts.get(2).map(|s| *s == "--test").unwrap_or(false);
+                println!("\nStarting connection process");
+                println!("Target: {}", addr);
+                println!("Test mode: {}", test_mode);
+                println!("Local bind address: {}", node.bind_addr);
+
+                match addr.parse::<SocketAddr>() {
+                    Ok(socket_addr) => {
+                        println!("✓ Address parsed successfully: {}", socket_addr);
+
+                        if !test_mode && socket_addr == node.bind_addr {
+                            println!("Attempted self-connection without test mode");
+                            println!("Use --test flag to allow self-connection");
+                            return Ok(());
+                        }
+
+                        let mut attempts = 0;
+                        const MAX_ATTEMPTS: u32 = 3;
+
+                        while attempts < MAX_ATTEMPTS {
+                            attempts += 1;
+                            println!("\nConnection attempt {}/{}", attempts, MAX_ATTEMPTS);
+
+                            // First try TCP connection
+                            println!("Step 1: Testing TCP connection...");
+                            // Bound the raw connect: verify_peer below has its own 10s timeout,
+                            // but an untimed TcpStream::connect against a black-holing firewall
+                            // can hang for the OS SYN-retry default (tens of seconds), freezing
+                            // this diagnostic far longer than the retry logic assumes.
+                            match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                TcpStream::connect(socket_addr),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => println!("✓ TCP connection successful"),
+                                Ok(Err(e)) => {
+                                    println!("✗ TCP connection failed: {}", e);
+                                    println!(
+                                        "  - Check if port {} is open on target",
+                                        socket_addr.port()
+                                    );
+                                    println!("  - Verify no firewall blocking connection");
+                                    println!("  - Ensure target node is running");
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    continue;
+                                }
+                                Err(_) => {
+                                    println!("✗ TCP connection timed out after 10s");
+                                    println!("  - Target unreachable or packets filtered/dropped");
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    continue;
+                                }
+                            }
+
+                            // Try full peer verification
+                            println!("Step 2: Attempting peer verification...");
+                            match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                node.verify_peer(socket_addr),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => {
+                                    println!("✓ Peer verification successful!");
+                                    println!("✓ Successfully connected to {}", addr);
+
+                                    // Show peer details (guard dropped BEFORE the long
+                                    // sync below — never hold the peers lock across
+                                    // network work).
+                                    {
+                                        let peers = node.peers.read().await;
+                                        if let Some(peer_info) = peers.get(&socket_addr) {
+                                            println!("\nPeer Details:");
+                                            println!("Version: {}", peer_info.version);
+                                            println!("Blocks: {}", peer_info.blocks);
+                                            println!("Latency: {}ms", peer_info.latency);
+                                        }
+                                    }
+
+                                    println!("\nAttempting initial sync...");
+                                    if let Err(e) = handle_chain_sync(node).await {
+                                        println!("Initial sync failed: {}", e);
+                                    } else if let Err(e) = node.publish_local_tip().await {
+                                        warn!("Post-sync publish failed: {}", e);
+                                    }
+                                    // No blanket "Initial sync completed": handle_chain_sync
+                                    // already printed the true outcome (which may be "run
+                                    // --sync again to finish catching up"), and overwriting
+                                    // that with success misled the operator. Mirrors --discover.
+                                    return Ok(());
+                                }
+                                Ok(Err(e)) => {
+                                    println!("✗ Peer verification failed:");
+                                    println!("  Error: {}", e);
+                                    println!("  - Check if both nodes are running same version");
+                                    println!("  - Verify network IDs match");
+                                    println!("  - Check for failed handshake");
+                                }
+                                Err(_) => {
+                                    println!("✗ Peer verification timed out");
+                                    println!("  - Handshake may have stalled");
+                                    println!("  - Network might be congested");
+                                }
+                            }
+
+                            if attempts < MAX_ATTEMPTS {
+                                println!("\n⟳ Retrying in 2 seconds...");
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                            }
+                        }
+
+                        println!("\n✗ Connection failed after {} attempts", MAX_ATTEMPTS);
+                        println!("Try running with --test flag for local connections");
+                        println!("Check target node is running and accessible");
+                        return Err(Box::new(NodeError::Network(
+                            "Connection failed".to_string(),
+                        )));
+                    }
+                    Err(e) => {
+                        println!("✗ Failed to parse address: {}", e);
+                        println!("Format should be: <ip>:<port>");
+                        println!("Example: --connect 192.168.1.100:7177");
+                        return Err(Box::new(NodeError::Network(
+                            "Invalid address format".to_string(),
+                        )));
+                    }
+                }
+            } else {
+                println!("Usage: --connect <ip:port> [--test]");
+                println!("Example: --connect 192.168.1.100:7177");
+                println!("Add --test to allow self-connection for testing");
+                return Ok(());
+            }
+        }
+
+        "--discover" => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_message("Discovering peers...");
+
+            // Use the existing peer count as baseline
+            let initial_peers = node.peers.read().await.len();
+
+            // Call the comprehensive discover_network_nodes implementation
+            match node.discover_network_nodes().await {
+                Ok(_) => {
+                    // Snapshot peer stats and DROP the guard before the sync below —
+                    // never hold the peers lock across network work.
+                    let (final_peers, connected_subnets) = {
+                        let peers = node.peers.read().await;
+                        let mut subnets = HashSet::new();
+                        for (addr, info) in peers.iter() {
+                            if let Some(subnet) = info.get_subnet(addr.ip()) {
+                                subnets.insert(subnet);
+                            }
+                        }
+                        (peers.len(), subnets)
+                    };
+                    let new_peers = final_peers.saturating_sub(initial_peers);
+
+                    // Show detailed peer information
+                    if new_peers > 0 {
+                        pb.finish_with_message(format!(
+                            "Found {} new peers (total: {}) across {} subnets",
+                            new_peers,
+                            final_peers,
+                            connected_subnets.len()
+                        ));
+
+                        // If we have peers, try to sync
+                        if final_peers > 0 {
+                            if let Err(e) = handle_chain_sync(node).await {
+                                warn!("Initial sync with discovered peers failed: {}", e);
+                            } else if let Err(e) = node.publish_local_tip().await {
+                                warn!("Post-sync publish failed: {}", e);
+                            }
+                        }
+                    } else {
+                        pb.finish_with_message(format!(
+                            "No new peers found. Connected to {} peers",
+                            final_peers
+                        ));
+                    }
+                }
+                Err(e) => {
+                    pb.finish_with_message(format!("Peer discovery failed: {}", e));
+                    return Err(Box::new(e));
+                }
+            }
+        }
+
+        "--getpeers" => {
+            let peers = node.peers.read().await;
+            println!("\nNetwork Participants");
+            println!("--------------------");
+
+            if peers.is_empty() {
+                // Direct p2p is expected to be empty for NAT'd nodes — the network runs
+                // over the gateway relay, not a p2p mesh — so this is normal, not a fault.
+                println!("Direct p2p peers: 0 (relay mode — normal for NAT'd nodes)");
+            } else {
+                for (addr, info) in peers.iter() {
+                    let last_seen = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .saturating_sub(info.last_seen);
+
+                    println!(
+                        "  p2p {} (latency: {}ms, last seen: {}s ago)",
+                        addr, info.latency, last_seen
+                    );
+                }
+            }
+            drop(peers);
+
+            // Real network participation: the gateway roster of live nodes + the tip.
+            if let Some(overview) = fetch_gateway_overview().await {
+                if let Some(p) = overview.peers {
+                    println!("Network peers (gateway): {}", p);
+                }
+                if let Some(h) = overview.height {
+                    println!("Network height:          {}", h);
+                }
+            }
+        }
+
+        "--sync" => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_message("Syncing with the network...");
+
+            // First try to discover peers if needed. Snapshot the count in a scoped
+            // block so the peers read guard is ALWAYS released before handle_chain_sync.
+            // The old code only drop()ed it inside the `< 3` branch, so a node with >= 3
+            // peers (the common case) held the read guard across the entire sync — and
+            // the moment sync needs peers.write() the task self-deadlocks (a read guard
+            // held by the same task that is awaiting the write), wedging the node.
+            let peer_count = { node.peers.read().await.len() };
+            if peer_count < 3 {
+                if let Err(e) = node.discover_network_nodes().await {
+                    warn!("Peer discovery during sync failed: {}", e);
+                }
+            }
+
+            match handle_chain_sync(node).await {
+                Ok(_) => {
+                    if let Err(e) = node.publish_local_tip().await {
+                        warn!("Post-sync publish failed: {}", e);
+                    }
+                    // handle_chain_sync already printed the authoritative per-outcome
+                    // message (Synced / "run --sync again to finish" / "re-bootstrap
+                    // required" / …). Don't stamp a blanket "Sync completed" over it —
+                    // for a partial or deferred convergence that flatly contradicted the
+                    // truthful line. Clear the redundant outer spinner instead.
+                    pb.finish_and_clear();
+                }
+                Err(e) => {
+                    pb.finish_with_message(format!("Sync failed: {}", e));
+                    return Err(e);
+                }
+            }
+        }
+
+        _ => {
+            println!("Available commands:");
+            println!("--status            Show network status");
+            println!("--sync              Start blockchain sync");
+            println!("--connect <ip:port> Connect to specific node");
+            println!("--getpeers          List connected peers");
+            println!("--discover          Search for nodes");
+        }
+    }
+
+    Ok(())
+}
+
+// ASCII Art - version
+fn interpolate_channel(start: u8, end: u8, t: f32) -> u8 {
+    (start as f32 + t * (end as f32 - start as f32)) as u8
+}
+
+fn interpolate_color(start: (u8, u8, u8), end: (u8, u8, u8), t: f32) -> Color {
+    Color::Rgb(
+        interpolate_channel(start.0, end.0, t),
+        interpolate_channel(start.1, end.1, t),
+        interpolate_channel(start.2, end.2, t),
+    )
+}
+
+fn print_ascii_intro() {
+    // Version is templated from Cargo.toml at compile time so the banner never drifts
+    // out of sync with the actual build (it previously hardcoded an older version).
+    let ascii_art = r#"
+
+                        -++-    -++-                                  alphanumeric v__VERSION__
+                       -+++.   .+++
+                .++++++++++++++++++++++-                              Architecture: Rust
+                -####++++#####++++#####+                              Algorithm: SHA-256
+                    -++++-   --+++.                                              BLAKE3
+             .++++++++++++++++++++++++-                               Database: redb
+             +#####+++######++++######+                               Encryption: AES-256-GCM
+                 -+++++----++++-                                      Key derivation: Argon2id
+                .+++++.  .-+++-                                       Quantum DSS: ML-DSA-87
+                ++++     ++++.
+
+"#
+    .replace("__VERSION__", env!("CARGO_PKG_VERSION"));
+
+    let start_color = (42, 93, 253); // White
+    let end_color = (190, 252, 233); // Neon Green
+
+    let lines: Vec<&str> = ascii_art.lines().collect();
+    let mut stdout = StandardStream::stdout(ColorChoice::Always);
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        let t = line_idx as f32 / (lines.len() as f32 - 1.0); // Normalize between 0 and 1
+        let line_color = interpolate_color(start_color, end_color, t);
+
+        let mut color_spec = ColorSpec::new();
+        color_spec.set_fg(Some(line_color));
+
+        let _ = stdout.set_color(&color_spec);
+        let _ = writeln!(&mut stdout, "{}", line);
+    }
+
+    let _ = stdout.reset();
+}
+
+/// Explicit, bounded page-cache size (bytes) for the chain sled DB. sled 0.34 otherwise defaults to
+/// a 1 GiB cache no operator chose, so making it explicit and conservative bounds a large share of
+/// steady-state RSS with no consensus or wire effect. `ALPHANUMERIC_DB_CACHE_MIB` raises it for heavy
+/// roles (the publisher, a busy explorer, initial sync); the default is validated against a real
+/// workload soak before any release lowers it further.
+fn clamp_db_cache_mib(raw: Option<&str>, default_mib: u64) -> u64 {
+    const MIN_MIB: u64 = 64;
+    const MAX_MIB: u64 = 8192;
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(MIN_MIB, MAX_MIB))
+        .unwrap_or(default_mib)
+}
+
+const CHAIN_DB_CACHE_DEFAULT_MIB: u64 = 512;
+
+/// One-time, offline sled -> redb conversion: copy every tree (sled's default
+/// tree maps to the store's default table), then verify BOTH sides tree-by-tree
+/// with entry counts and a SHA-256 over every length-prefixed key/value before
+/// declaring success. The source is opened exclusively (sled's own flock) and
+/// never modified; the destination is written into `{out}/chain.redb` and
+/// durably sealed. Any mismatch fails loudly and leaves the source untouched.
+#[cfg(feature = "sled-convert")]
+fn run_sled_conversion(sled_dir: &str, out_dir: &str) -> std::result::Result<(), String> {
+    use alphanumeric::a9::store::DEFAULT_TREE;
+
+    fn digest_pairs(acc: &mut Sha256, count: &mut u64, k: &[u8], v: &[u8]) {
+        acc.update((k.len() as u64).to_le_bytes());
+        acc.update(k);
+        acc.update((v.len() as u64).to_le_bytes());
+        acc.update(v);
+        *count += 1;
+    }
+
+    let src = sled::Config::new()
+        .path(sled_dir)
+        .cache_capacity(64 * 1024 * 1024)
+        .open()
+        .map_err(|e| format!("open sled source (is the node stopped?): {e}"))?;
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let dst_path = std::path::Path::new(out_dir).join(CHAIN_DB_FILE);
+    if dst_path.exists() {
+        // A launch-time data PROBE creates an empty store file as a side
+        // effect; tolerate exactly that (every table empty) instead of
+        // sending the operator on a confusing manual-delete errand. Anything
+        // with data refuses, hard.
+        let existing = Store::open(&dst_path, 64 * 1024 * 1024).map_err(|e| e.to_string())?;
+        let mut has_data = false;
+        for name in existing.tree_names().map_err(|e| e.to_string())? {
+            let t = existing.open_tree(&name).map_err(|e| e.to_string())?;
+            if !t.is_empty().map_err(|e| e.to_string())? {
+                has_data = true;
+                break;
+            }
+        }
+        drop(existing);
+        if has_data {
+            return Err(format!(
+                "{} already exists and contains data — refusing to overwrite; remove it to re-convert",
+                dst_path.display()
+            ));
+        }
+        println!("  (replacing an empty probe-created store file)");
+        std::fs::remove_file(&dst_path).map_err(|e| e.to_string())?;
+    }
+    // Crash-safe output: build under a temp name, durably seal, then rename
+    // into place — a converter crash can never leave a plausible partial
+    // store at the final path.
+    let work_path = std::path::Path::new(out_dir).join("chain.redb.converting");
+    let _ = std::fs::remove_file(&work_path);
+    let dst = Store::open(&work_path, 256 * 1024 * 1024).map_err(|e| e.to_string())?;
+
+    let mut names: Vec<Vec<u8>> = src.tree_names().into_iter().map(|n| n.to_vec()).collect();
+    names.sort();
+    let mut total_entries = 0u64;
+    for name in &names {
+        let src_tree = src.open_tree(name).map_err(|e| e.to_string())?;
+        // sled's default tree keeps its data under the store's default table.
+        let dst_name: &[u8] = if name.as_slice() == b"__sled__default" {
+            DEFAULT_TREE.as_bytes()
+        } else {
+            name.as_slice()
+        };
+        let dst_tree = dst.open_tree(dst_name).map_err(|e| e.to_string())?;
+
+        let mut src_hash = Sha256::new();
+        let mut src_count = 0u64;
+        let mut batch = store::Batch::default();
+        for item in src_tree.iter() {
+            let (k, v) = item.map_err(|e| e.to_string())?;
+            digest_pairs(&mut src_hash, &mut src_count, &k, &v);
+            batch.insert(k.as_ref(), v.as_ref());
+            if batch.len() >= 10_000 {
+                dst_tree
+                    .apply_batch(std::mem::take(&mut batch))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if !batch.is_empty() {
+            dst_tree.apply_batch(batch).map_err(|e| e.to_string())?;
+        }
+
+        let mut dst_hash = Sha256::new();
+        let mut dst_count = 0u64;
+        dst_tree
+            .for_each(|k, v| {
+                digest_pairs(&mut dst_hash, &mut dst_count, k, v);
+                true
+            })
+            .map_err(|e| e.to_string())?;
+
+        if src_count != dst_count || src_hash.finalize() != dst_hash.finalize() {
+            return Err(format!(
+                "verification FAILED for tree {:?}: {} source entries vs {} converted — \
+                 output discarded, source untouched",
+                String::from_utf8_lossy(name),
+                src_count,
+                dst_count
+            ));
+        }
+        total_entries += src_count;
+        println!(
+            "  converted {:40} {:>9} entries, digest verified",
+            String::from_utf8_lossy(name),
+            src_count
+        );
+    }
+    dst.flush().map_err(|e| e.to_string())?;
+    drop(dst);
+    std::fs::rename(&work_path, &dst_path).map_err(|e| e.to_string())?;
+    // Directory fsync is POSIX-only (see fsync_parent_dir); on Windows the
+    // rename is already journaled by NTFS and this would error spuriously.
+    #[cfg(not(windows))]
+    std::fs::File::open(out_dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
+    println!(
+        "Conversion complete: {} trees, {} entries, byte-verified. New store: {}",
+        names.len(),
+        total_entries,
+        dst_path.display()
+    );
+    println!(
+        "The sled source at {} was not modified — keep it as rollback until a \
+         healthy restart, then remove it.",
+        sled_dir
+    );
+    Ok(())
+}
+
+fn chain_db_cache_bytes() -> u64 {
+    clamp_db_cache_mib(
+        std::env::var("ALPHANUMERIC_DB_CACHE_MIB").ok().as_deref(),
+        CHAIN_DB_CACHE_DEFAULT_MIB,
+    ) * 1024
+        * 1024
+}
+
+/// The chain database file inside the (directory-shaped) `db_path`. Keeping
+/// `db_path` a directory preserves every existing path assumption — quarantine
+/// renames, snapshot zips, bootstrap extraction — while the engine's single
+/// file lives inside it. Legacy sled files in the same directory are inert;
+/// they survive an in-place upgrade (rollback = old binary reading them), but
+/// NOT a re-bootstrap, which replaces the whole directory. The chain DB holds
+/// only public, re-derivable data, so that loss is acceptable by design.
+const CHAIN_DB_FILE: &str = "chain.redb";
+
+fn chain_db_file(db_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_path).join(CHAIN_DB_FILE)
+}
+
+/// The single place the chain store is configured, so cache sizing and
+/// durability cannot drift across the primary open and the recovery reopens.
+fn open_chain_db(db_path: &str) -> std::result::Result<Store, store::StoreError> {
+    let cache_bytes = chain_db_cache_bytes();
+    // Effective-value visibility the plan requires: once per process, not per
+    // reopen attempt, and never anything secret.
+    static LOG_EFFECTIVE_ONCE: std::sync::Once = std::sync::Once::new();
+    LOG_EFFECTIVE_ONCE.call_once(|| {
+        log::info!(
+            "chain DB page cache: {} MiB (override: ALPHANUMERIC_DB_CACHE_MIB)",
+            cache_bytes / (1024 * 1024)
+        );
+    });
+    std::fs::create_dir_all(db_path)?;
+    let db = Store::open(chain_db_file(db_path), cache_bytes as usize)?;
+    // Physical footprint at boot: the raw input to the space-amplification
+    // invariant. Watched for redb exactly as it was for sled.
+    static LOG_SIZE_ONCE: std::sync::Once = std::sync::Once::new();
+    LOG_SIZE_ONCE.call_once(|| {
+        if let Ok(bytes) = db.size_on_disk() {
+            log::info!(
+                "chain DB physical size: {} MiB on disk",
+                bytes / (1024 * 1024)
+            );
+        }
+    });
+    Ok(db)
+}
+
+/// SHA-256 and exact size of a file through a bounded read, so hashing a snapshot
+/// never requires the whole archive in memory. The 1 MiB buffer is the entire
+/// memory footprint regardless of archive size.
+#[cfg(any(feature = "bootstrap_publisher", test))]
+async fn hash_file_streaming(
+    path: &std::path::Path,
+) -> std::result::Result<(String, u64), std::io::Error> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((hex::encode(hasher.finalize()), total))
+}
+
+/// Short-lived maintenance opens of the chain DB: pre-launch health checks, bootstrap
+/// verification, and gap probes. These handles live for seconds and mostly scan cold
+/// data, so a large page cache only balloons launch RSS; durability settings are
+/// identical to `open_chain_db`.
+const AUX_DB_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn open_chain_db_aux(db_path: &str) -> std::result::Result<Store, store::StoreError> {
+    Store::open(chain_db_file(db_path), AUX_DB_CACHE_BYTES as usize)
+}
+
+/// Set a database directory aside for diagnosis instead of deleting it.
+///
+/// KEEPS AT MOST ONE, and keeps the FIRST. A chain directory is gigabytes, and a node that
+/// fails to open one usually fails again on the next boot — so retaining every attempt turns
+/// a recoverable fault into a full disk, and a full disk turns a self-healing re-bootstrap
+/// into a permanent outage. Keeping the earliest copy rather than the latest is deliberate:
+/// the first failure is the one that carries the original cause, while later ones are just
+/// copies of a fresh download that failed the same way.
+///
+/// When a quarantine already exists the new directory is removed rather than kept, which is
+/// what the caller would otherwise have done anyway.
+fn quarantine_db(path: &str) -> std::io::Result<()> {
+    let dir = std::path::Path::new(path);
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let prefix = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|base| format!("{}.corrupt.", base));
+    if let (Some(prefix), Ok(entries)) = (prefix, std::fs::read_dir(parent)) {
+        let already_held = entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+        });
+        if already_held {
+            std::fs::remove_dir_all(dir)?;
+            return Ok(());
+        }
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let quarantine_path = format!("{}.corrupt.{}", path, ts);
+    std::fs::rename(dir, &quarantine_path)?;
+    // The rename is only crash-durable once the parent's dirents are synced;
+    // an un-fsynced quarantine that reappears as the live path after power
+    // loss would re-feed the corrupt DB to the next boot.
+    fsync_parent_dir(std::path::Path::new(&quarantine_path))?;
+    Ok(())
+}
+
+/// Directory-entry durability: on POSIX, renames/unlinks are only
+/// crash-durable once the parent directory itself is fsynced, and the storage
+/// engine never does it — so the repo's own directory-level milestones must.
+/// On Windows the operation does not exist (opening a directory as a file
+/// fails, and NTFS journals directory metadata itself) — a propagated error
+/// here would fail every fresh bootstrap right AFTER its successful
+/// rename-into-place, so it is a deliberate no-op there.
+fn fsync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::File::open(parent)?.sync_all()
+    }
+}
+
+fn ensure_db_lock(path: &str) -> std::io::Result<()> {
+    let lock_path = format!("{}.lock", path);
+    ensure_pid_lock(&lock_path, "ALPHANUMERIC_IGNORE_DB_LOCK")
+}
+
+struct StartupLockGuard {
+    db_lock_path: String,
+}
+
+impl Drop for StartupLockGuard {
+    fn drop(&mut self) {
+        let _ = remove_db_lock(&self.db_lock_path);
+        let _ = remove_instance_lock();
+        // This guard outlives the REPL, so it is the one place that runs on every
+        // normal way the session ends. A line a parked mining reader queued but the
+        // REPL never ran can carry a seed; wipe it rather than drop it.
+        wipe_pending_input();
+    }
+}
+
+fn acquire_startup_locks(db_path: &str) -> std::io::Result<StartupLockGuard> {
+    ensure_instance_lock()?;
+    if let Err(err) = ensure_db_lock(db_path) {
+        let _ = remove_instance_lock();
+        return Err(err);
+    }
+    Ok(StartupLockGuard {
+        db_lock_path: format!("{}.lock", db_path),
+    })
+}
+
+fn ensure_instance_lock() -> std::io::Result<()> {
+    ensure_pid_lock(INSTANCE_LOCK_PATH, "ALPHANUMERIC_IGNORE_INSTANCE_LOCK")
+}
+
+/// Budget guarding in-place restarts: carried through the environment so it
+/// survives the exec boundary. Three generations is far past any legitimate
+/// heal (one restart re-bootstraps and lands at the tip); if a third respawn is
+/// still stranded, something is wrong that restarting will not fix, and the
+/// process falls back to the supervised exit path.
+const RESPAWN_DEPTH_ENV: &str = "ALPHANUMERIC_RESPAWN_DEPTH";
+
+/// Restart this process in place, same terminal, same arguments. Unix: exec —
+/// the image is replaced and this function does not return on success. Any
+/// return value is the reason it could not happen, and the caller falls back
+/// to the plain exit it would have done anyway. Callers must have flushed the
+/// store and removed the db/instance locks first: exec does not run Drop, by
+/// design — the durable marker written before this is the recovery contract,
+/// exactly as it is for the supervised exit(3).
+/// True once THIS generation has verifiably reached the network tip (the idle
+/// loop's Converged/AtTipAhead verdicts). A generation that healed completely is
+/// a finished incident, so the next in-place restart starts a fresh respawn
+/// budget instead of inheriting the lineage's count — without this, three
+/// successful heals spread over weeks of one terminal session would exhaust a
+/// budget that exists only to stop a restart LOOP.
+static LINEAGE_HEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn restart_in_place() -> std::io::Error {
+    let depth: u32 = std::env::var(RESPAWN_DEPTH_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if depth >= 3 {
+        return std::io::Error::other("in-place restart budget (3) exhausted");
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // A healed generation closes its incident: the child starts a fresh budget.
+    let next_depth = if LINEAGE_HEALED.load(std::sync::atomic::Ordering::Acquire) {
+        1
+    } else {
+        depth + 1
+    };
+    // Exec preserves TERMINAL state, not just process state: if this fires while
+    // rustyline holds the tty raw (ECHO/ICANON/ISIG off — true whenever the user
+    // is sitting at the prompt), the next generation boots with Ctrl-C dead and
+    // typing invisible, and its rustyline then adopts raw as "original", making
+    // the wedge permanent. Hand the child a sane line discipline first.
+    // Best-effort by design: a missing stty must not block the restart.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let _ = std::process::Command::new("stty").arg("sane").status();
+    }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(std::env::args_os().skip(1))
+        .env(RESPAWN_DEPTH_ENV, next_depth.to_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.exec()
+    }
+    #[cfg(not(unix))]
+    {
+        std::io::Error::other("in-place restart is unix-only; relaunch the app manually")
+    }
+}
+
+fn remove_instance_lock() -> std::io::Result<()> {
+    remove_db_lock(INSTANCE_LOCK_PATH)
+}
+
+fn ensure_pid_lock(lock_path: &str, ignore_env: &str) -> std::io::Result<()> {
+    if let Some(parent) = std::path::Path::new(lock_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    if std::path::Path::new(&lock_path).exists() {
+        let allow = std::env::var(ignore_env)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if allow {
+            let _ = std::fs::remove_file(lock_path);
+        } else if let Ok(pid_str) = std::fs::read_to_string(lock_path) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                // A lock naming OUR OWN pid is stale by definition: exec keeps the
+                // pid, so a failed unlink before an in-place restart would otherwise
+                // make the fresh image refuse to boot against itself. No live
+                // FOREIGN process can hold our pid.
+                if pid == std::process::id() || !is_process_alive(pid) {
+                    let _ = std::fs::remove_file(lock_path);
+                } else {
+                    // Name the file, the PID, and the escape hatch: the old
+                    // one-size message left the operator of a SIGKILLed node
+                    // with nothing to act on.
+                    return Err(std::io::Error::other(format!(
+                        "Another instance appears to be running (pid {} holds {}). If that process is NOT alphanumeric (PID reuse after a crash), delete the lock file or set {}=true.",
+                        pid, lock_path, ignore_env
+                    )));
+                }
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "Lock file {} exists but holds no readable PID. If no other instance is running, delete it or set {}=true.",
+                    lock_path, ignore_env
+                )));
+            }
+        } else {
+            return Err(std::io::Error::other(format!(
+                "Lock file {} exists but could not be read. If no other instance is running, delete it or set {}=true.",
+                lock_path, ignore_env
+            )));
+        }
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(lock_path)?;
+    let pid = std::process::id();
+    use std::io::Write;
+    writeln!(file, "{}", pid)?;
+    Ok(())
+}
+
+fn remove_db_lock(path: &str) -> std::io::Result<()> {
+    if std::path::Path::new(path).exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_processes();
+    sys.process(sysinfo::Pid::from_u32(pid)).is_some()
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
+/// 헤드리스 채굴 설정. `None` 이면 채굴하지 않는다 — 오류가 아니라 지금까지의
+/// 헤드리스 동작이다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessMining {
+    pub wallet: String,
+    pub use_gpu: bool,
+}
+
+/// `ALPHANUMERIC_MINE` / `ALPHANUMERIC_MINE_BACKEND` 를 읽는다. `headless` 는
+/// `ALPHANUMERIC_HEADLESS` 다 — 채굴 변수를 받았는데 헤드리스가 아니면
+/// 거절한다(조용히 무시하면 채굴하지 않는 노드로 뜬다).
+///
+/// 환경변수를 직접 읽지 않고 인자로 받는 이유는 테스트다 — 프로세스 전역
+/// 환경을 건드리는 테스트는 병렬 실행에서 서로를 깨뜨린다.
+fn parse_headless_mining(
+    mine: Option<&str>,
+    backend: Option<&str>,
+    gpu_built: bool,
+    headless: bool,
+) -> std::result::Result<Option<HeadlessMining>, String> {
+    let Some(wallet) = mine else {
+        return Ok(None);
+    };
+    let wallet = wallet.trim();
+    if wallet.is_empty() {
+        return Err(
+            "ALPHANUMERIC_MINE is set but empty. Give it a wallet name or address, or unset it \
+             to run without mining."
+                .to_string(),
+        );
+    }
+    if !headless {
+        // 채굴하라는 변수를 받고도 대화형 메뉴를 띄우면, 그 노드는 아무것도
+        // 캐지 않으면서 아무 말도 하지 않는다 — `screen` 아래에서는 그대로
+        // 며칠 간다. 이 기능의 다른 네 거절과 같은 판단이다: 조용히 무시하지
+        // 않는다.
+        return Err(
+            "ALPHANUMERIC_MINE is set, but ALPHANUMERIC_HEADLESS is not: mining from an \
+             environment variable only happens in headless mode, so this node would start \
+             the interactive menu and mine nothing. Add ALPHANUMERIC_HEADLESS=1, or unset \
+             ALPHANUMERIC_MINE and use the `mine` command interactively."
+                .to_string(),
+        );
+    }
+    let use_gpu = match backend.map(str::trim) {
+        None => gpu_built,
+        Some("gpu") => {
+            if !gpu_built {
+                // CPU 로 강등하지 않는다. REPL 이 같은 판단을 하는 이유가
+                // 그대로 여기에도 적용된다 — 강등된 줄은 스크롤로 사라지고,
+                // 운영자는 기대치의 400분의 1로 한 세션을 통째로 채굴한다.
+                return Err(
+                    "ALPHANUMERIC_MINE_BACKEND=gpu, but this binary was built without GPU \
+                     support. Rebuild with `--features gpu_miner`, or set \
+                     ALPHANUMERIC_MINE_BACKEND=cpu."
+                        .to_string(),
+                );
+            }
+            true
+        }
+        Some("cpu") => false,
+        Some(other) => {
+            return Err(format!(
+                "ALPHANUMERIC_MINE_BACKEND must be 'gpu' or 'cpu'; got '{other}'. Set it to \
+                 'cpu', or 'gpu' on a binary built with `--features gpu_miner`."
+            ))
+        }
+    };
+    Ok(Some(HeadlessMining {
+        wallet: wallet.to_string(),
+        use_gpu,
+    }))
+}
+
+// ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES and ALPHANUMERIC_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES,
+// with their parse-and-clamp helpers, used to live here. Both were read ONLY behind
+// `if !verified_manifest` in ensure_bootstrap_db, and that flag became unconditionally true when
+// the unverified bootstrap path was removed (a manifest either verifies or the function returns
+// Err). So the variables were inert: an operator could set one, have it parsed and clamped by a
+// unit-tested helper, and see it silently ignored. Deleted rather than left as a promise the code
+// does not keep. The download and extraction remain bounded by the SIGNED compressed_bytes /
+// extracted_bytes / file_count in the manifest, which is the stronger check anyway.
+
+/// Removes a partial bootstrap archive when it goes out of scope.
+///
+/// Every error return between creating the zip and extracting it — a body-read failure, a size
+/// mismatch, the SHA-256 mismatch, the disk-space recheck — used to leave a ~125 MB file behind
+/// FOREVER. The caller falls back to P2P reconstruction and boots, so `has_local_block_data` is
+/// true on every later start and `ensure_bootstrap_db` returns long before the `File::create`
+/// could truncate it. The orphan also made the next attempt's preflight pessimistic:
+/// `ensure_bootstrap_disk_space` runs BEFORE that truncate, so it measured free space with the
+/// stale archive still occupying `compressed_bytes` and could refuse a bootstrap that would
+/// actually have fit.
+///
+/// Deliberately always armed — never disarmed on success. By the time extraction finishes it has
+/// already deleted the archive itself, so the removal here is a harmless no-op.
+struct BootstrapZipCleanup<'a>(&'a str);
+
+impl Drop for BootstrapZipCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+fn ensure_bootstrap_zip_size(size: u64, limit: u64, context: &str) -> Result<()> {
+    if size > limit {
+        return Err(format!(
+            "Bootstrap download too large: {} is {} bytes, limit is {} bytes",
+            context, size, limit
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn ensure_bootstrap_download_progress(
+    size: u64,
+    expected_size: Option<u64>,
+    fallback_limit: Option<u64>,
+    context: &str,
+) -> Result<()> {
+    if let Some(expected_size) = expected_size {
+        if size > expected_size {
+            return Err(format!(
+                "Bootstrap download too large for signed manifest: {} is {} bytes, expected {} bytes",
+                context, size, expected_size
+            )
+            .into());
+        }
+        return Ok(());
+    }
+
+    if let Some(limit) = fallback_limit {
+        ensure_bootstrap_zip_size(size, limit, context)?;
+    }
+    Ok(())
+}
+
+fn ensure_bootstrap_download_complete(
+    size: u64,
+    expected_size: Option<u64>,
+    fallback_limit: Option<u64>,
+    context: &str,
+) -> Result<()> {
+    if let Some(expected_size) = expected_size {
+        if size != expected_size {
+            return Err(format!(
+                "Bootstrap download size mismatch: {} is {} bytes, signed manifest expected {} bytes",
+                context, size, expected_size
+            )
+            .into());
+        }
+        return Ok(());
+    }
+
+    if let Some(limit) = fallback_limit {
+        ensure_bootstrap_zip_size(size, limit, context)?;
+    }
+    Ok(())
+}
+
+fn bootstrap_disk_buffer_bytes(extracted_bytes: u64) -> u64 {
+    (extracted_bytes / 20).max(BOOTSTRAP_MIN_DISK_BUFFER_BYTES)
+}
+
+fn bootstrap_required_disk_bytes(compressed_bytes: Option<u64>, extracted_bytes: u64) -> u64 {
+    compressed_bytes
+        .unwrap_or(0)
+        .saturating_add(extracted_bytes)
+        .saturating_add(bootstrap_disk_buffer_bytes(extracted_bytes))
+}
+
+fn nearest_existing_path(path: &Path) -> Option<std::path::PathBuf> {
+    let mut candidate = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    };
+
+    loop {
+        if candidate.exists() {
+            return std::fs::canonicalize(&candidate).ok();
+        }
+        if !candidate.pop() {
+            return None;
+        }
+    }
+}
+
+fn available_disk_space_for_path(path: &Path) -> Option<u64> {
+    let target = nearest_existing_path(path)?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|disk| target.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| disk.available_space())
+}
+
+fn ensure_bootstrap_disk_space(
+    db_path: &Path,
+    compressed_bytes: Option<u64>,
+    extracted_bytes: Option<u64>,
+) -> Result<()> {
+    let Some(extracted_bytes) = extracted_bytes else {
+        return Ok(());
+    };
+    let required = bootstrap_required_disk_bytes(compressed_bytes, extracted_bytes);
+    let Some(available) = available_disk_space_for_path(db_path) else {
+        debug!(
+            "Bootstrap disk preflight skipped: could not determine available space for {}",
+            db_path.display()
+        );
+        return Ok(());
+    };
+    if available < required {
+        return Err(format!(
+            "Insufficient disk space for bootstrap: available {} bytes, need at least {} bytes for signed snapshot extraction",
+            available, required
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn update_bootstrap_archive_stats(
+    stats: &mut BootstrapArchiveStats,
+    copied_bytes: u64,
+    expectations: BootstrapArchiveExpectations,
+) -> std::result::Result<(), String> {
+    stats.file_count = stats
+        .file_count
+        .checked_add(1)
+        .ok_or_else(|| "Bootstrap archive file count overflow".to_string())?;
+    stats.extracted_bytes = stats
+        .extracted_bytes
+        .checked_add(copied_bytes)
+        .ok_or_else(|| "Bootstrap archive extracted byte count overflow".to_string())?;
+
+    if let Some(expected_file_count) = expectations.expected_file_count {
+        if stats.file_count > expected_file_count {
+            return Err(format!(
+                "Bootstrap archive has more files than signed manifest: saw {}, expected {}",
+                stats.file_count, expected_file_count
+            ));
+        }
+    }
+    if let Some(expected_extracted_bytes) = expectations.expected_extracted_bytes {
+        if stats.extracted_bytes > expected_extracted_bytes {
+            return Err(format!(
+                "Bootstrap archive extracted more data than signed manifest: saw {} bytes, expected {} bytes",
+                stats.extracted_bytes, expected_extracted_bytes
+            ));
+        }
+    } else if let Some(limit) = expectations.unverified_extract_limit {
+        if stats.extracted_bytes > limit {
+            return Err(format!(
+                "Unverified bootstrap archive extraction exceeded limit: saw {} bytes, limit is {} bytes",
+                stats.extracted_bytes, limit
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn finalize_bootstrap_archive_stats(
+    stats: BootstrapArchiveStats,
+    expectations: BootstrapArchiveExpectations,
+) -> std::result::Result<(), String> {
+    if let Some(expected_file_count) = expectations.expected_file_count {
+        if stats.file_count != expected_file_count {
+            return Err(format!(
+                "Bootstrap archive file count mismatch: extracted {}, signed manifest expected {}",
+                stats.file_count, expected_file_count
+            ));
+        }
+    }
+    if let Some(expected_extracted_bytes) = expectations.expected_extracted_bytes {
+        if stats.extracted_bytes != expected_extracted_bytes {
+            return Err(format!(
+                "Bootstrap archive extracted size mismatch: extracted {} bytes, signed manifest expected {} bytes",
+                stats.extracted_bytes, expected_extracted_bytes
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bootstrap_manifest_http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()?)
+}
+
+// Fetch the signed bootstrap manifest: gateway first, R2 recovery mirror second. Both
+// payloads pass through the same verify_bootstrap_manifest(), so the fallback adds a
+// second place to READ the manifest, never a second authority. A verification failure on
+// the primary also falls through — the mirror may hold a good copy while the gateway
+// serves a corrupt one, and a forged mirror copy cannot pass the pinned-key check anyway.
+// Returns the manifest plus which source served it, for the boot log.
+async fn fetch_verified_bootstrap_manifest(
+    client: &reqwest::Client,
+) -> Result<(BootstrapManifestPointer, &'static str)> {
+    let primary: Result<BootstrapManifestPointer> =
+        match client.get(BOOTSTRAP_MANIFEST_URL).send().await {
+            Ok(r) if r.status().is_success() => match r.bytes().await {
+                Ok(body) => match serde_json::from_slice::<BootstrapManifestResponse>(&body) {
+                    Ok(parsed) if parsed.ok => {
+                        // Prefer the redb-generation slot; fall back to the
+                        // legacy slot (still valid for tip reconcile — the
+                        // format gate at the download site governs artifacts).
+                        match parsed.manifest_redb.or(parsed.manifest) {
+                            Some(manifest) => {
+                                verify_bootstrap_manifest(&manifest).map(|()| manifest)
+                            }
+                            None => Err("Bootstrap manifest response has no manifest".into()),
+                        }
+                    }
+                    Ok(_) => Err("Bootstrap manifest response is not ok".into()),
+                    Err(e) => Err(format!("Bootstrap manifest payload parse failed: {}", e).into()),
+                },
+                Err(e) => Err(format!("Bootstrap manifest body read failed: {}", e).into()),
+            },
+            Ok(r) => Err(format!("Bootstrap manifest endpoint failed: {}", r.status()).into()),
+            Err(e) => Err(format!("Bootstrap manifest request failed: {}", e).into()),
+        };
+    let primary_err = match primary {
+        Ok(manifest) => return Ok((manifest, "gateway")),
+        Err(e) => e,
+    };
+    let fallback: Result<BootstrapManifestPointer> =
+        match client.get(BOOTSTRAP_MANIFEST_FALLBACK_URL).send().await {
+            Ok(r) if r.status().is_success() => match r.bytes().await {
+                Ok(body) => match serde_json::from_slice::<RecoveryManifestFile>(&body) {
+                    Ok(parsed) => verify_bootstrap_manifest(&parsed.latest).map(|()| parsed.latest),
+                    Err(e) => Err(format!("Recovery manifest payload parse failed: {}", e).into()),
+                },
+                Err(e) => Err(format!("Recovery manifest body read failed: {}", e).into()),
+            },
+            Ok(r) => Err(format!("Recovery manifest endpoint failed: {}", r.status()).into()),
+            Err(e) => Err(format!("Recovery manifest request failed: {}", e).into()),
+        };
+    match fallback {
+        Ok(manifest) => Ok((manifest, "recovery mirror")),
+        Err(fallback_err) => Err(format!(
+            "gateway: {} / recovery mirror: {}",
+            primary_err, fallback_err
+        )
+        .into()),
+    }
+}
+
+fn bootstrap_download_http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(30))
+        .build()?)
+}
+
+#[cfg(feature = "bootstrap_publisher")]
+fn env_u64_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(windows)]
+    {
+        // A private key MUST NOT be world-readable. Restricting NTFS access needs ACLs
+        // (winapi), which we don't apply here — and `set_readonly` restricts WRITE, not
+        // READ, so the previous code was a security no-op that pretended the key was
+        // protected. Warn loudly instead of silently lying about protection.
+        let _ = path;
+        eprintln!(
+            "WARNING: key file {} cannot be permission-restricted on Windows without ACLs; \
+             protect it manually (its directory should be user-only).",
+            path
+        );
+    }
+    Ok(())
+}
+
+/// Write secret bytes to `path` such that the file is 0600 from the instant it is CREATED,
+/// closing the TOCTOU window in which a plain write-then-chmod leaves a freshly-created key
+/// briefly world/group-readable. For a pre-existing file we also re-assert 0600.
+async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
+    // Atomic replace: write to a sibling temp file, fsync it, then rename over the
+    // target. A crash / power loss / ENOSPC mid-write leaves either the intact old
+    // file or the complete new one — never a truncated key that fails to parse and
+    // bricks the wallet / node identity on next launch. mode(0o600) on creation keeps
+    // the temp (and thus the renamed target) from ever being world-readable.
+    use tokio::io::AsyncWriteExt;
+    let tmp = format!("{}.tmp", path);
+    #[cfg(unix)]
+    {
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .await?;
+        f.write_all(data).await?;
+        f.flush().await?;
+        f.sync_all().await?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        f.write_all(data).await?;
+        f.flush().await?;
+        f.sync_all().await?;
+    }
+    tokio::fs::rename(&tmp, path).await?;
+    // Best-effort: fsync the parent directory so the rename itself survives power loss.
+    #[cfg(unix)]
+    {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if let Ok(dir) = tokio::fs::File::open(&parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+    // Belt-and-suspenders: re-assert perms for a file that pre-existed this write.
+    // No-op-with-warning on Windows.
+    let _ = set_restrictive_file_permissions(path);
+    Ok(())
+}
+
+async fn load_or_create_node_identity_key(path: &str) -> Result<Vec<u8>> {
+    if std::path::Path::new(path).exists() {
+        let key_bytes = fs::read(path).await?;
+        let _ = Ed25519KeyPair::from_pkcs8(&key_bytes)
+            .map_err(|_| format!("Invalid node identity key bytes at {}", path))?;
+        let _ = set_restrictive_file_permissions(path);
+        return Ok(key_bytes);
+    }
+
+    let rng = SystemRandom::new();
+    let key_pair_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|e| format!("Failed to generate node identity key pair: {}", e))?;
+    write_secret_file(path, key_pair_pkcs8.as_ref()).await?;
+    Ok(key_pair_pkcs8.as_ref().to_vec())
+}
+
+/// Route a one-off boot status line ABOVE a live progress bar so it never bakes a
+/// stale bar copy into the scrollback; falls back to a plain println when no bar
+/// is visible (headless / non-tty — where pb.println would be swallowed).
+fn boot_note(status: Option<&ProgressBar>, line: String) {
+    let line = format!("  {}", line);
+    match status {
+        Some(pb) if !pb.is_finished() && !pb.is_hidden() => pb.println(line),
+        _ => println!("{}", line),
+    }
+}
+
+/// 압축 해제 진행률을 바이트로 재는 쓰기 래퍼.
+///
+/// 파일 개수로 재면 안 된다: 실제 스냅샷 아카이브는 엔트리가 **하나**이고
+/// (`chain.redb`, ~1 GB), 파일 단위 십분위는 0 에서 움직이지 않는다.
+/// 2026-09-11 실측에서 그렇게 30~45초가 통째로 침묵했다.
+///
+/// 진행 바가 있는 대화형 실행에서는 조용히 지나간다 -- 그쪽은 바가 화면을
+/// 갖고 있고, 여기서 또 찍으면 바를 망가뜨린다.
+struct ExtractProgress<'a, W: std::io::Write> {
+    inner: W,
+    quiet: bool,
+    /// 엔트리를 가로질러 누적된다. 분모가 아카이브 전체이기 때문이다.
+    written: &'a mut u64,
+    last_decile: &'a mut u64,
+    total: Option<u64>,
+}
+
+impl<W: std::io::Write> std::io::Write for ExtractProgress<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        *self.written = self.written.saturating_add(n as u64);
+        if self.quiet {
+            if let Some(total) = self.total.filter(|t| *t > 0) {
+                let decile = self.written.saturating_mul(10) / total;
+                if decile > *self.last_decile {
+                    *self.last_decile = decile;
+                    // println! 인 이유: env_logger 가 LevelFilter::Error 라
+                    // (main.rs:727) log::info! 는 어디에도 나타나지 않는다.
+                    println!(
+                        "  extracting snapshot {}% ({} / {} MB)",
+                        decile.saturating_mul(10),
+                        *self.written / 1_048_576,
+                        total / 1_048_576
+                    );
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// 4751 -> "4,751" for boot-status messages.
+fn fmt_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        // `is_multiple_of` requires a newer compiler than the crate's Rust 1.89 MSRV.
+        #[allow(clippy::manual_is_multiple_of)]
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Result<()> {
+    let force_bootstrap = env_flag_enabled("ALPHANUMERIC_FORCE_BOOTSTRAP");
+    // Whether this run was demanded by the runtime divergence marker — captured
+    // before the decision (remove_local_db deletes the marker with the dir), so
+    // a successful restore can stamp the bootstrap-cycle cooldown.
+    let was_marker_forced = force_rebootstrap_marker_path(db_path).exists();
+
+    // Fetch and verify the signed bootstrap manifest up front. It carries the
+    // canonical tip (height + hash) we reconcile a genesis-valid local DB against,
+    // and the download URL if we do end up (re)bootstrapping. Gateway first, R2
+    // recovery mirror second — same pinned-key verification either way.
+    let manifest_client = bootstrap_manifest_http_client()?;
+    let manifest_result: Result<BootstrapManifestPointer> = match fetch_verified_bootstrap_manifest(
+        &manifest_client,
+    )
+    .await
+    {
+        Ok((manifest, source)) => {
+            if source != "gateway" {
+                boot_note(
+                        status.as_ref(),
+                        format!("gateway unreachable; using the signed manifest from the {} (verified against the pinned publisher key)", source),
+                    );
+            }
+            Ok(manifest)
+        }
+        Err(e) => Err(e),
+    };
+
+    if !force_bootstrap {
+        match local_launch_db_status(db_path) {
+            LaunchDbStatus::Valid => {
+                // Genesis is correct — but is this chain actually canonical? Compare
+                // our tip against the signed manifest tip. If we hold the canonical
+                // block (or are ahead of it on the same chain) we are in sync. If we
+                // forked or fell behind, re-bootstrap to the canonical chain rather
+                // than keep running on a stale/losing chain. Unreachable manifest =>
+                // keep the local DB (fail-open, so an offline start still works).
+                // Best-effort live tip beacon: the freshest canonical height for the
+                // behind/in-sync decision (the manifest can lag by its publish
+                // cadence — or by hours when snapshot publishing is broken).
+                let live_beacon_height: Option<u32> = async {
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_millis(2500))
+                        .build()
+                        .ok()?;
+                    let body = client
+                        .get(TIP_URL)
+                        .send()
+                        .await
+                        .ok()?
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()?;
+                    if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                        return None;
+                    }
+                    body.get("height")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|h| u32::try_from(h).ok())
+                }
+                .await;
+                // Canonical anchor at-or-below our tip: only needed (and only
+                // fetched) when we are behind the manifest height, i.e. when the
+                // manifest-height hash comparison inside the decision can't run.
+                // One tip scan for both consumers: local_tip_height is a full
+                // block_-prefix scan plus a sled open/close (~0.5-5s on a
+                // multi-GB DB), and canonical_reconcile_decision used to
+                // recompute it internally — two identical scans per boot.
+                let boot_local_tip = local_tip_height(db_path);
+                let canonical_anchor: Option<(u32, String)> =
+                    match (&manifest_result, boot_local_tip) {
+                        (Ok(m), Some(tip)) if m.height.map(|h| h as u32 > tip).unwrap_or(false) => {
+                            fetch_canonical_anchor_at_or_below(tip).await
+                        }
+                        _ => None,
+                    };
+                match canonical_reconcile_decision(
+                    db_path,
+                    &manifest_result,
+                    live_beacon_height,
+                    canonical_anchor,
+                    boot_local_tip,
+                ) {
+                    CanonicalReconcile::InSyncOrUnknown => {
+                        boot_note(
+                            status.as_ref(),
+                            "local chain is on the canonical network".to_string(),
+                        );
+                        log::info!("bootstrap skipped: canonical DB at {}", db_path);
+                        return Ok(());
+                    }
+                    CanonicalReconcile::Diverged {
+                        local,
+                        canonical_height,
+                        canonical_hash,
+                    } => {
+                        // Short human line up front (the old hash-dump wrapped
+                        // mid-word under the boot bar); full detail to the log.
+                        let behind = boot_local_tip
+                            .map(|tip| canonical_height.saturating_sub(u64::from(tip)))
+                            .unwrap_or(0);
+                        let reason = if behind > 0 {
+                            format!(
+                                "local chain is {} blocks behind the network — downloading the current snapshot",
+                                fmt_thousands(behind)
+                            )
+                        } else {
+                            "local chain diverged from the network — restoring the canonical chain"
+                                .to_string()
+                        };
+                        boot_note(status.as_ref(), reason);
+                        log::info!(
+                            "re-bootstrap: canonical tip {}={}…, local had {}",
+                            canonical_height,
+                            &canonical_hash[..canonical_hash.len().min(16)],
+                            local
+                        );
+                        remove_local_db(db_path).await?;
+                    }
+                }
+            }
+            LaunchDbStatus::Missing | LaunchDbStatus::Empty => {
+                // 기존 체인을 고치는 분기들은 전부 무슨 일을 하는지 말하는데
+                // 처음 설치하는 이 분기만 말이 없었다. 새 기계의 첫 실행에서
+                // 가장 긴 구간이 통째로 침묵이었다 (2026-09-10 실측).
+                boot_note(
+                    status.as_ref(),
+                    "no local chain yet — fetching the current snapshot".to_string(),
+                );
+            }
+            LaunchDbStatus::WrongGenesis(actual) => {
+                boot_note(
+                    status.as_ref(),
+                    format!("replacing local database (wrong genesis {})", actual),
+                );
+                remove_local_db(db_path).await?;
+            }
+            LaunchDbStatus::Unreadable(err) => {
+                // SET ASIDE, don't destroy. Every sled open failure lands here — a lock held
+                // by another instance, a transient I/O error, a genuinely corrupt page — and
+                // the answer was an unconditional recursive delete of the whole chain
+                // directory. Renaming clears the path just as effectively (the node
+                // re-bootstraps either way) while keeping the bytes for diagnosis, which is
+                // the same call the reopen-failure path already makes. Nothing irreplaceable
+                // is lost either way — keys live in private.key — but "unreadable to sled
+                // right now" is not the same claim as "worthless", and only one of these two
+                // actions can be taken back.
+                //
+                // Falls back to removal if the rename itself fails, because a node that
+                // cannot clear the path cannot boot at all.
+                match quarantine_db(db_path) {
+                    Ok(()) => boot_note(
+                        status.as_ref(),
+                        format!("set aside unreadable database, re-bootstrapping ({})", err),
+                    ),
+                    Err(q_err) => {
+                        warn!("Could not set aside unreadable database: {}", q_err);
+                        boot_note(
+                            status.as_ref(),
+                            format!("replacing local database ({})", err),
+                        );
+                        remove_local_db(db_path).await?;
+                    }
+                }
+            }
+        }
+    }
+    if force_bootstrap {
+        boot_note(
+            status.as_ref(),
+            "forcing bootstrap download (ALPHANUMERIC_FORCE_BOOTSTRAP=true)".to_string(),
+        );
+        remove_local_db(db_path).await?;
+    }
+
+    let (
+        download_url,
+        expected_sha256,
+        expected_height,
+        expected_tip_hash,
+        expected_compressed_bytes,
+        expected_extracted_bytes,
+        expected_file_count,
+    ) = match manifest_result {
+        Ok(manifest) => {
+            // FORMAT GATE (engine migration window): this build reads redb
+            // snapshots only. A legacy sled-format manifest (no format field)
+            // is still trusted above for tip reconcile, but its artifact is
+            // not downloadable by this binary — treat the snapshot channel as
+            // unavailable, which routes fresh nodes to the peer-sync fallback
+            // exactly like a gateway outage. The upgraded explorer publishes
+            // the redb-format artifact during the migration window.
+            if manifest.format.as_deref() != Some("redb") {
+                return Err(
+                    "published snapshot is the legacy sled format; this build requires a \
+                     redb-format snapshot (published by the upgraded explorer during the \
+                     migration window). Configure a seed peer for P2P bootstrap, or wait \
+                     for the redb snapshot."
+                        .into(),
+                );
+            }
+            let expected_sha256 = manifest
+                .sha256
+                .as_ref()
+                .map(|v| v.trim().to_ascii_lowercase());
+            let expected_tip_hash = manifest
+                .tip_hash
+                .as_ref()
+                .map(|v| v.trim().to_ascii_lowercase());
+            (
+                manifest.url.clone(),
+                expected_sha256,
+                manifest.height,
+                expected_tip_hash,
+                manifest.compressed_bytes,
+                manifest.extracted_bytes,
+                manifest.file_count,
+            )
+        }
+        Err(e) => {
+            // Fail closed: a chain snapshot must always carry a SHA-256-bound, signed manifest.
+            // The old ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP escape hatch is removed — a security
+            // control must not be defeatable by an env var (an attacker who can set env or MITM
+            // the download could otherwise seed a forged chain).
+            return Err(format!("Bootstrap manifest verification failed: {}", e).into());
+        }
+    };
+
+    if !download_url.starts_with("https://") {
+        return Err("Bootstrap manifest URL must use https".into());
+    }
+
+    if let Some(parent) = std::path::Path::new(db_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).await.map_err(|e| {
+                format!(
+                    "Bootstrap parent directory create failed at {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+        }
+    }
+
+    ensure_bootstrap_disk_space(
+        std::path::Path::new(db_path),
+        expected_compressed_bytes,
+        expected_extracted_bytes,
+    )?;
+
+    let zip_path = format!("{}.zip", db_path);
+    let download_client = bootstrap_download_http_client()?;
+    let mut res = download_client
+        .get(&download_url)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "Bootstrap download request failed for {}: {}",
+                download_url, e
+            )
+        })?;
+
+    if !res.status().is_success() {
+        return Err(format!("Bootstrap download failed: {}", res.status()).into());
+    }
+
+    // No fallback cap exists any more: the manifest is verified or this function has already
+    // returned (fail-closed, above), so the download is always bounded by the SIGNED
+    // compressed_bytes. This used to read ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES behind an
+    // `if !verified_manifest` that could never be true, so the variable was inert — an operator
+    // could set it, see it parsed and clamped by a tested helper, and have it silently ignored.
+    // The env var and its helper are gone rather than left as a promise the code does not keep.
+    let fallback_zip_limit: Option<u64> = None;
+    if let Some(content_length) = res.content_length() {
+        ensure_bootstrap_download_complete(
+            content_length,
+            expected_compressed_bytes,
+            fallback_zip_limit,
+            "advertised content length",
+        )?;
+    }
+
+    // Retire the boot step bar before the download bar takes the line — two live
+    // bars clobber each other, and a baked stale copy of the step bar was the
+    // pre-7.8.2 boot artifact. The caller re-creates the step bar afterwards.
+    if let Some(pbb) = status.as_ref() {
+        pbb.finish_and_clear();
+    }
+
+    // REAL download progress: the snapshot is hundreds of MB, and a silent wait reads
+    // as a hang. Interactive runs get a live bytes/total + speed + ETA bar; headless
+    // runs log a line at each 10% so service logs show life. Total comes from the
+    // signed manifest, falling back to the response's content length.
+    let dl_total = expected_compressed_bytes.or(res.content_length());
+    let dl_headless = env_flag_enabled("ALPHANUMERIC_HEADLESS");
+    let dl_pb = if dl_headless {
+        None
+    } else {
+        let bar = match dl_total {
+            Some(t) if t > 0 => {
+                let b = ProgressBar::new(t);
+                b.set_style(
+                    ProgressStyle::with_template(
+                        "  {spinner:.green} downloading snapshot [{bar:32.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})",
+                    )
+                    .unwrap_or_else(|_| ProgressStyle::default_bar())
+                    .progress_chars("█▓░"),
+                );
+                b
+            }
+            _ => {
+                let b = ProgressBar::new_spinner();
+                b.set_style(
+                    ProgressStyle::with_template(
+                        "  {spinner:.green} downloading snapshot {bytes} ({bytes_per_sec})",
+                    )
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+                );
+                b
+            }
+        };
+        bar.enable_steady_tick(std::time::Duration::from_millis(120));
+        Some(bar)
+    };
+    let mut dl_last_decile = 0u64;
+
+    let _zip_cleanup = BootstrapZipCleanup(zip_path.as_str());
+
+    let mut zip_file = fs::File::create(&zip_path)
+        .await
+        .map_err(|e| format!("Bootstrap zip write failed at {}: {}", zip_path, e))?;
+    let mut downloaded_size = 0u64;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = res
+        .chunk()
+        .await
+        .map_err(|e| format!("Bootstrap download body read failed: {}", e))?
+    {
+        let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        downloaded_size = downloaded_size
+            .checked_add(chunk_len)
+            .ok_or("Bootstrap download byte count overflow")?;
+        ensure_bootstrap_download_progress(
+            downloaded_size,
+            expected_compressed_bytes,
+            fallback_zip_limit,
+            "downloaded body",
+        )?;
+        if let Some(b) = dl_pb.as_ref() {
+            b.set_position(downloaded_size);
+        } else if let Some(total) = dl_total.filter(|t| *t > 0) {
+            let decile = downloaded_size.saturating_mul(10) / total;
+            if decile > dl_last_decile {
+                dl_last_decile = decile;
+                // boot_note 로 간다: env_logger 가 Error 레벨이라 log::info!
+                // 는 어디에도 나타나지 않았다. 느린 회선에서는 이 줄이
+                // 유일한 생명 신호다.
+                boot_note(
+                    status.as_ref(),
+                    format!(
+                        "Bootstrap download {}% ({} / {} MB)",
+                        decile.saturating_mul(10),
+                        downloaded_size / 1_048_576,
+                        total / 1_048_576
+                    ),
+                );
+            }
+        }
+        hasher.update(&chunk);
+        zip_file
+            .write_all(&chunk)
+            .await
+            .map_err(|e| format!("Bootstrap zip write failed at {}: {}", zip_path, e))?;
+    }
+    zip_file
+        .flush()
+        .await
+        .map_err(|e| format!("Bootstrap zip flush failed at {}: {}", zip_path, e))?;
+    drop(zip_file);
+    if let Some(b) = dl_pb.as_ref() {
+        b.finish_and_clear();
+        println!(
+            "  snapshot downloaded ({} MB) — verifying and extracting ...",
+            downloaded_size / 1_048_576
+        );
+    } else {
+        boot_note(
+            status.as_ref(),
+            format!(
+                "snapshot downloaded ({} MB) — verifying and extracting ...",
+                downloaded_size / 1_048_576
+            ),
+        );
+    }
+
+    ensure_bootstrap_download_complete(
+        downloaded_size,
+        expected_compressed_bytes,
+        fallback_zip_limit,
+        "downloaded body",
+    )?;
+    ensure_bootstrap_disk_space(
+        std::path::Path::new(db_path),
+        None,
+        expected_extracted_bytes,
+    )?;
+
+    // Every manifest that reaches here is signature-verified and must carry a SHA-256; the
+    // no-hash fallback this once referred to (local/dev unverified recovery) no longer exists.
+    if let Some(expected) = expected_sha256
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+    {
+        let actual = hex::encode(hasher.finalize());
+        if actual != expected {
+            return Err(format!(
+                "Bootstrap SHA-256 mismatch: expected {}, got {}",
+                expected, actual
+            )
+            .into());
+        }
+    }
+
+    let bootstrap_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let temp_extract_path = format!("{}.bootstrap_tmp_{}", db_path, bootstrap_ts);
+    // Sweep temp directories left by an interrupted bootstrap, not just the one about to be
+    // created. The path above carries a fresh timestamp, so an existence check on it can only
+    // ever match itself — a run killed mid-extract left its directory behind permanently, and
+    // every retry added another.
+    //
+    // Matched on the bootstrap_tmp prefix alone: `.corrupt.<ts>` siblings are deliberate
+    // forensic retention and must survive this.
+    {
+        let db = std::path::Path::new(db_path);
+        let parent = db
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        if let (Some(base), Ok(entries)) = (
+            db.file_name().and_then(|n| n.to_str()),
+            std::fs::read_dir(parent),
+        ) {
+            let prefix = format!("{}.bootstrap_tmp_", base);
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix))
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+
+    let extract_path = temp_extract_path.clone();
+    let zip_path_clone = zip_path.clone();
+    let archive_expectations = BootstrapArchiveExpectations {
+        expected_extracted_bytes,
+        expected_file_count,
+        // Always None for the same reason as fallback_zip_limit: the unverified bootstrap path
+        // it belonged to was removed. The field itself stays — it is a live, tested cap in the
+        // extraction path — but nothing can populate it while every manifest is signature-checked.
+        unverified_extract_limit: None,
+    };
+    // Per-file extract progress (interactive only). ProgressBar is thread-safe, so
+    // the blocking extraction ticks the same bar; the true length is set once the
+    // archive is opened inside the closure.
+    let extract_pb = (!dl_headless).then(|| {
+        let b = ProgressBar::new(expected_file_count.unwrap_or(0).max(1));
+        b.set_style(
+            ProgressStyle::with_template(
+                "  {spinner:.green} extracting snapshot [{bar:32.cyan/blue}] {pos}/{len} files",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("█▓░"),
+        );
+        b.enable_steady_tick(std::time::Duration::from_millis(120));
+        b
+    });
+    let extract_pb_worker = extract_pb.clone();
+    // 진행 바가 없는 실행(헤드리스)에서 압축 해제가 통째로 침묵하지 않도록.
+    let extract_quiet = extract_pb.is_none();
+    let extract_result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<BootstrapArchiveStats, String> {
+            let file = std::fs::File::open(&zip_path_clone).map_err(|e| e.to_string())?;
+            let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+            if let Some(b) = extract_pb_worker.as_ref() {
+                b.set_length(archive.len() as u64);
+            }
+            std::fs::create_dir_all(&extract_path).map_err(|e| e.to_string())?;
+            let base_dir = std::fs::canonicalize(&extract_path).map_err(|e| e.to_string())?;
+            let mut stats = BootstrapArchiveStats::default();
+            let mut extracted_so_far: u64 = 0;
+            let mut extract_last_decile: u64 = 0;
+            for i in 0..archive.len() {
+                if let Some(b) = extract_pb_worker.as_ref() {
+                    b.set_position(i as u64);
+                }
+                let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+                let entry_name = file.name();
+                let relative = std::path::Path::new(entry_name);
+                if relative.is_absolute()
+                    || relative
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(format!(
+                        "Unsafe bootstrap archive entry path: {}",
+                        entry_name
+                    ));
+                }
+                let outpath = std::path::Path::new(&extract_path).join(relative);
+                if let Some(parent) = outpath.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let canonical_parent = std::fs::canonicalize(
+                    outpath
+                        .parent()
+                        .ok_or_else(|| "Invalid archive entry parent path".to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                if !canonical_parent.starts_with(&base_dir) {
+                    return Err(format!(
+                        "Blocked bootstrap archive escape path: {}",
+                        entry_name
+                    ));
+                }
+                if file.name().ends_with('/') {
+                    std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
+                } else {
+                    let outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
+                    let mut outfile = ExtractProgress {
+                        inner: outfile,
+                        quiet: extract_quiet,
+                        written: &mut extracted_so_far,
+                        last_decile: &mut extract_last_decile,
+                        total: archive_expectations.expected_extracted_bytes,
+                    };
+                    // Cap the per-entry copy so a single oversized entry can't exhaust disk
+                    // BEFORE the cumulative-size check runs. (This once guarded the unverified,
+                    // non-SHA-pinned path; it is kept as defence in depth for the verified one —
+                    // the archive is only SHA-checked as a whole, so a malformed entry can still
+                    // blow up disk mid-extract before the digest is ever computed.)
+                    // Read at most (budget - already-extracted + 1) bytes; the +1 guarantees
+                    // update_bootstrap_archive_stats sees the overflow and aborts mid-extract.
+                    let budget = archive_expectations
+                        .expected_extracted_bytes
+                        .or(archive_expectations.unverified_extract_limit);
+                    let copied = if let Some(limit) = budget {
+                        let remaining = limit
+                            .saturating_sub(stats.extracted_bytes)
+                            .saturating_add(1);
+                        std::io::copy(&mut std::io::Read::take(&mut file, remaining), &mut outfile)
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?
+                    };
+                    update_bootstrap_archive_stats(&mut stats, copied, archive_expectations)?;
+                }
+            }
+            finalize_bootstrap_archive_stats(stats, archive_expectations)?;
+            std::fs::remove_file(&zip_path_clone).ok();
+            Ok(stats)
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(b) = extract_pb.as_ref() {
+        b.finish_and_clear();
+    }
+
+    if let Err(e) = extract_result {
+        let _ = std::fs::remove_dir_all(&temp_extract_path);
+        let _ = fs::remove_file(&zip_path).await;
+        return Err(Box::<dyn Error>::from(e));
+    }
+
+    if let Err(e) = verify_bootstrap_snapshot_tip(
+        &temp_extract_path,
+        expected_height,
+        expected_tip_hash.as_deref(),
+    ) {
+        let _ = std::fs::remove_dir_all(&temp_extract_path);
+        return Err(e);
+    }
+
+    let final_path = std::path::Path::new(db_path);
+    let backup_path = format!("{}.bootstrap_backup_{}", db_path, bootstrap_ts);
+    let replace_result = (|| -> std::io::Result<()> {
+        if std::path::Path::new(&backup_path).exists() {
+            let _ = std::fs::remove_dir_all(&backup_path);
+        }
+        if final_path.exists() {
+            std::fs::rename(final_path, &backup_path)?;
+        }
+        match std::fs::rename(&temp_extract_path, final_path) {
+            Ok(()) => {
+                // Make the rename durable BEFORE deleting the backup: a crash
+                // that loses the un-fsynced rename but keeps the unlink would
+                // leave neither the new DB nor the old one.
+                fsync_parent_dir(final_path)?;
+                if std::path::Path::new(&backup_path).exists() {
+                    let _ = std::fs::remove_dir_all(&backup_path);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                if std::path::Path::new(&backup_path).exists() {
+                    let _ = std::fs::rename(&backup_path, final_path);
+                }
+                Err(err)
+            }
+        }
+    })();
+    if let Err(e) = replace_result {
+        let _ = std::fs::remove_dir_all(&temp_extract_path);
+        return Err(format!(
+            "Bootstrap DB replace failed: {} -> {}: {}",
+            temp_extract_path, db_path, e
+        )
+        .into());
+    }
+    if was_marker_forced {
+        // Stamp the cooldown into the FRESH db dir: if this chain diverges again
+        // immediately (shattered network), the divergence exit stays up and keeps
+        // retrying converge instead of looping snapshot downloads.
+        // Durable (fsync'd): losing this cooldown stamp to a power cut restores
+        // the snapshot-download loop it exists to prevent.
+        let cooldown = rebootstrap_cooldown_path(db_path);
+        // Report a failed stamp instead of dropping it. This runs immediately after a
+        // multi-hundred-MB extract, so ENOSPC is the realistic error — and a lost stamp leaves
+        // `rebootstrap_hard_cooldown_active` false forever, so the 2-strike divergence path
+        // exits again and the node re-enters the snapshot-download loop this stamp exists to
+        // break, with nothing in the log naming the cause. Every sibling durable write reports.
+        if let Err(e) = alphanumeric::a9::node::write_durable(&cooldown, b"") {
+            warn!(
+                "Could not stamp the re-bootstrap cooldown at {}: {} — a repeated divergence may \
+                 re-download the snapshot instead of retrying convergence",
+                cooldown.display(),
+                e
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum LaunchDbStatus {
+    Valid,
+    Missing,
+    Empty,
+    WrongGenesis(String),
+    Unreadable(String),
+}
+
+fn local_launch_db_status(db_path: &str) -> LaunchDbStatus {
+    let path = std::path::Path::new(db_path);
+    if !path.exists() {
+        return LaunchDbStatus::Missing;
+    }
+    if !path.is_dir() {
+        return LaunchDbStatus::Unreadable("database path is not a directory".to_string());
+    }
+
+    let db = match open_chain_db_aux(db_path) {
+        Ok(db) => db,
+        Err(e) => return LaunchDbStatus::Unreadable(format!("database open failed: {}", e)),
+    };
+
+    let genesis_raw = match db.get(b"block_0") {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            return if db.scan_prefix("block_").next().is_some() {
+                LaunchDbStatus::Unreadable("database has blocks but no genesis block".to_string())
+            } else {
+                LaunchDbStatus::Empty
+            }
+        }
+        Err(e) => return LaunchDbStatus::Unreadable(format!("genesis read failed: {}", e)),
+    };
+
+    let genesis = match Block::from_bytes(genesis_raw.as_ref()) {
+        Ok(block) => block,
+        Err(e) => return LaunchDbStatus::Unreadable(format!("genesis decode failed: {}", e)),
+    };
+
+    let expected = match Blockchain::genesis_launch_block() {
+        Ok(block) => block.hash,
+        Err(e) => {
+            return LaunchDbStatus::Unreadable(format!("launch genesis construction failed: {}", e))
+        }
+    };
+
+    if genesis.hash == expected && genesis.calculate_hash_for_block() == genesis.hash {
+        LaunchDbStatus::Valid
+    } else {
+        LaunchDbStatus::WrongGenesis(hex::encode(genesis.hash))
+    }
+}
+
+/// Hex hash of the local block at `height`, or None if the DB can't be read or has
+/// no block there. Opens the DB in its own short-lived handle (dropped on return).
+fn local_block_hash_at(db_path: &str, height: u32) -> Option<String> {
+    let db = open_chain_db_aux(db_path).ok()?;
+    let raw = db.get(format!("block_{}", height).as_bytes()).ok()??;
+    let block = Block::from_bytes(raw.as_ref()).ok()?;
+    Some(hex::encode(block.hash))
+}
+
+/// Block-interval trace for the Overview banner, plus the index of the worst
+/// interval so the caller can colour that one bar off-nominal. Scaled to the
+/// window's own peak: the shape of the cadence is the signal, not its absolute
+/// height.
+fn ui_cadence(intervals: &[u64]) -> (String, Option<usize>) {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if intervals.is_empty() {
+        return (String::new(), None);
+    }
+    let peak = intervals.iter().copied().max().unwrap_or(0);
+    let peak_at = intervals.iter().rposition(|value| *value == peak);
+    let bars = intervals
+        .iter()
+        .map(|value| {
+            if peak == 0 {
+                BARS[0]
+            } else {
+                let scaled = (*value as f64 / peak as f64) * (BARS.len() - 1) as f64;
+                BARS[(scaled.round() as usize).min(BARS.len() - 1)]
+            }
+        })
+        .collect();
+    (bars, peak_at)
+}
+
+/// Auto-scaled hashrate: a CPU-mined BLAKE3 network lives in MH/s-GH/s, and a
+/// fixed TH/s display read "0.00" even while difficulty climbed past 550.
+fn ui_hashrate(hashrate_ths: f64) -> (f64, &'static str) {
+    let hs = hashrate_ths * 1e12;
+    if hs >= 1e12 {
+        (hs / 1e12, "TH/s")
+    } else if hs >= 1e9 {
+        (hs / 1e9, "GH/s")
+    } else if hs >= 1e6 {
+        (hs / 1e6, "MH/s")
+    } else if hs >= 1e3 {
+        (hs / 1e3, "kH/s")
+    } else {
+        (hs, "H/s")
+    }
+}
+
+// The wallet a bare `mine` or a two-argument send should act as is resolved in
+// mgmt::resolve_default_wallet. Keep its policy rationale there rather than
+// accidentally attaching stale wallet documentation to the duration helper.
+/// Compact human-readable duration for status display, e.g. 11506 -> "3h 11m".
+/// Display-only helper: `info` keeps the raw seconds and appends this so a
+/// stalled node's block age reads at a glance instead of as a wall of seconds.
+fn human_duration_secs(secs: u64) -> String {
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs % 86_400) / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60,
+    );
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m {s}s")
+    }
+}
+
+/// Decision for whether a genesis-valid local DB is actually on the canonical
+/// chain, judged against the signed bootstrap manifest's tip (height + hash).
+enum CanonicalReconcile {
+    /// We hold the canonical tip block (or are ahead of it on the canonical
+    /// chain), or the manifest is unreachable/uninformative — keep the local DB.
+    InSyncOrUnknown,
+    /// The local chain is not the canonical block at the manifest height — it has
+    /// forked or fallen behind — so it must be re-bootstrapped to canonical.
+    Diverged {
+        local: String,
+        canonical_height: u64,
+        canonical_hash: String,
+    },
+}
+
+/// Reconcile a genesis-valid local DB against the signed canonical tip. We are in
+/// sync iff our block at the manifest height equals the manifest tip hash (which
+/// also covers being ahead of it on the same chain). A fork below the tip yields a
+/// different hash there, and being behind yields no block there — both re-bootstrap.
+/// Fail-open: if the manifest didn't verify or lacks a tip, we keep the local DB.
+///
+/// `canonical_anchor` is a known-good canonical `(height, hash)` at or below our
+/// LOCAL tip (see fetch_canonical_anchor_at_or_below). Its job is to tell apart
+/// two states that look identical from height alone:
+///   - BEHIND: our chain is a valid prefix of canonical and just needs the newer
+///     blocks fetched forward ("streaming"; cheap, done by the live sync loop).
+///   - FORKED: at some height we hold a DIFFERENT block than canonical, so we
+///     followed a branch that lost. Streaming can never recover this — the live
+///     catch-up is forward-only (it adopts canonical children onto the tip), but
+///     canonical blocks won't link onto our diverged tip and it never rewinds to
+///     the fork point to rebuild the canonical branch. (A fork older than the
+///     finality window is additionally blocked from reorging by the checkpoint,
+///     but that is not the general reason.) The only cure is a fresh re-bootstrap.
+///
+/// A behind node and a forked node can BOTH lack a block at the manifest tip
+/// height, so without the anchor a forked node reads as merely behind, tries to
+/// stream forever, and never recovers (the stale-client trap seen live
+/// 2026-07-11). The anchor hash-compare catches the fork and re-bootstraps.
+fn canonical_reconcile_decision(
+    db_path: &str,
+    manifest: &Result<BootstrapManifestPointer>,
+    live_beacon_height: Option<u32>,
+    canonical_anchor: Option<(u32, String)>,
+    // Caller-supplied tip from an already-performed scan (boot does one for the
+    // anchor fetch); None falls back to scanning here — tests rely on the
+    // re-open-by-path behavior, and a None from a degenerate DB rescans cheaply.
+    local_tip_hint: Option<u32>,
+) -> CanonicalReconcile {
+    let Ok(m) = manifest else {
+        return CanonicalReconcile::InSyncOrUnknown;
+    };
+    let (Some(height), Some(tip_hash)) = (m.height, m.tip_hash.as_ref()) else {
+        return CanonicalReconcile::InSyncOrUnknown;
+    };
+    let canonical_hash = tip_hash.trim().to_ascii_lowercase();
+    let canonical_height = height as u32;
+    // Runtime divergence exits drop a marker (see the beacon-watch NeedsBootstrap
+    // path): the live loop PROVED this chain cannot converge, which outranks any
+    // boot-time comparison — the manifest lags its publish cadence, so a fork AT
+    // tip height reads as "in sync" against a stale manifest (the 2026-07-10
+    // restart crash-loop). Honoring the marker is also what makes the wide
+    // PEER_HEAL_WINDOW safe: a genuinely stuck node always has a guaranteed way out.
+    // Checked only once the manifest verified (above): with the gateway down a
+    // re-bootstrap is impossible anyway, so offline starts stay fail-open and the
+    // marker simply persists for the next boot. remove_local_db clears it together
+    // with the chain it condemned.
+    if force_rebootstrap_marker_path(db_path).exists() {
+        return CanonicalReconcile::Diverged {
+            local: "forced re-bootstrap (runtime divergence exit)".to_string(),
+            canonical_height: height,
+            canonical_hash,
+        };
+    }
+    // FRESHNESS (v7.6.5, 2026-07-08 night): the manifest height lags by its publish
+    // cadence — and when snapshot publishing broke (413s), it lagged by HOURS, so a
+    // node 150+ blocks behind read as "in sync with the manifest" at boot, skipped
+    // re-bootstrap, and stayed stranded. The live tip beacon is the freshest signed
+    // canonical height (~1-2s), so use it for the AM-I-TOO-FAR-BEHIND decision; the
+    // manifest keeps the checkpoint-hash comparison at ITS height (the snapshot is
+    // what we would download). A wrong/poisoned beacon can at worst trigger one
+    // unnecessary re-bootstrap whose snapshot manifest is still signature-verified.
+    let live_height = live_beacon_height.unwrap_or(0).max(canonical_height);
+
+    // Already holding the canonical tip block (or ahead of it on the same chain)?
+    // Then we are in sync.
+    if let Some(local_hash) = local_block_hash_at(db_path, canonical_height) {
+        if local_hash.eq_ignore_ascii_case(&canonical_hash) {
+            return CanonicalReconcile::InSyncOrUnknown;
+        }
+        // BOOT-TIME SIGNED CHECKPOINT (v7.6.5, from the 2026-07-08 shatter): we HOLD
+        // a block at the canonical height but its hash DIFFERS from the signed
+        // manifest's — this node is on a genuine fork, not merely behind. Treating
+        // "ahead by height" as in-sync here left a forked miner that had out-mined
+        // the canonical tip stranded FOREVER (its fork's history was unservable, so
+        // no one could join it, and no restart could bring it back). At BOOT, the
+        // publisher-signed manifest is the recovery anchor: re-bootstrap onto it.
+        // This never overrides live work-based fork choice — a running node still
+        // follows the heaviest chain; this only makes "restart the node" a reliable
+        // way OUT of a stranded fork. Same-height race blocks are unaffected: their
+        // holder is not at boot mid-race, and losing 1-2 racing blocks on a restart
+        // is normal reorg cost.
+        return CanonicalReconcile::Diverged {
+            local: format!(
+                "forked at {} (local {}…)",
+                canonical_height,
+                &local_hash[..local_hash.len().min(12)]
+            ),
+            canonical_height: height,
+            canonical_hash,
+        };
+    }
+
+    // FORK CHECK (see the behind-vs-forked note on this fn). Having no block at
+    // the manifest tip height, on its own, only means "behind". Before treating
+    // that as a cheap forward catch-up, confirm our tip region is actually ON
+    // canonical: compare the local block we hold at the anchor height to the
+    // known-good canonical hash there. A mismatch means we are on a lost fork
+    // that the forward-only catch-up can never fix (canonical blocks won't link
+    // onto our diverged tip, and it never rewinds to rebuild the branch), so
+    // re-bootstrap now. Without this check a forked node booted "in sync" and
+    // stayed stale until a human forced a bootstrap (2026-07-11, live). No
+    // anchor, or no local block at the anchor height, falls through to the plain
+    // behind path below.
+    let local_tip = local_tip_hint
+        .or_else(|| local_tip_height(db_path))
+        .unwrap_or(0);
+    if let Some((anchor_height, anchor_hash)) = canonical_anchor {
+        if anchor_height <= local_tip {
+            if let Some(local_hash) = local_block_hash_at(db_path, anchor_height) {
+                if !local_hash.eq_ignore_ascii_case(&anchor_hash) {
+                    return CanonicalReconcile::Diverged {
+                        local: format!(
+                            "behind and forked: local block at {} is {}… but canonical is {}…",
+                            anchor_height,
+                            &local_hash[..local_hash.len().min(12)],
+                            &anchor_hash[..anchor_hash.len().min(12)]
+                        ),
+                        canonical_height: height,
+                        canonical_hash,
+                    };
+                }
+            }
+        }
+    }
+
+    // Plain BEHIND (anchor region on canonical, or no anchor to check). If the
+    // gap to the live tip is within the runtime's PROVEN heal window, KEEP the
+    // local DB: the idle-reconcile loop closes the gap in place via the
+    // beacon-committed receipt span (see PEER_HEAL_WINDOW's note — the window is
+    // the verification bound, not a bandwidth preference). Beyond it, take the
+    // verified snapshot NOW: keeping a DB the runtime cannot heal only defers
+    // the same snapshot to a watchdog exit. A near-empty DB has, by
+    // construction, a gap deeper than the window, so it re-bootstraps here too.
+    if local_tip.saturating_add(PEER_HEAL_WINDOW) >= live_height {
+        return CanonicalReconcile::InSyncOrUnknown;
+    }
+
+    CanonicalReconcile::Diverged {
+        local: format!(
+            "tip {} ({} behind live tip {})",
+            local_tip,
+            live_height.saturating_sub(local_tip),
+            live_height
+        ),
+        canonical_height: height,
+        canonical_hash,
+    }
+}
+
+/// How far behind a genesis-valid, on-canonical chain may be at boot and still
+/// be caught up in place (keep the local DB, stream forward) instead of nuking
+/// it and re-downloading the full snapshot. History of this value: it was 96
+/// (≈8 min at 5s blocks), then 1024, because the boot decision had to stay
+/// conservative — a wide window once told a 181-behind node it was in sync at
+/// boot while its live loop couldn't converge either, trapping it with no way
+/// out (2026-07-08). That escape now comes from the force-rebootstrap marker
+/// (the runtime divergence exit drops it and the next boot honors it
+/// unconditionally), so the window no longer carries the recovery burden and can
+/// reflect what streaming is actually good at: any casual close-and-reopen used
+/// to trigger a FULL re-download past the window ("every time I open the client
+/// it re-downloads the whole chain", 2026-07-10 / 2026-07-25).
+///
+/// DECOUPLED from ORPHAN_REORG_DEPTH (was tied to it): the old reason was that
+/// the live catch-up was the converge engine, whose forward adoption is hard-
+/// bounded by ORPHAN_REORG_DEPTH — a wider window booted "in sync" and then
+/// marker-exited ~40s later because the engine could not stream past 1024
+/// (review finding, 2026-07-11; an initial 2000 left the 1025..=2000 band
+/// deterministically taking the exit path).
+///
+/// KEEP THE DB ONLY FOR A GAP THE RUNTIME CAN ACTUALLY HEAL. A previous version
+/// of this window was seven days, on the theory that the peer delta-sync
+/// "closes a gap of ANY size" because GetBlocks serves any range from a full
+/// peer's DB. Blocks are served, but they cannot be VERIFIED: peers retain full
+/// ML-DSA witnesses for only WITNESS_RETENTION_BLOCKS past confirmation, so the
+/// witness path stalls on the first tx-carrying block deeper than that, and the
+/// receipt path built for pruned history — the beacon-committed span — proves
+/// at most COMMITTED_SPAN_MAX_BLOCKS in one anchored walk. Every gap between
+/// that cap and seven days was therefore kept at boot and then deterministically
+/// killed at runtime (strikes -> marker -> exit): the 2026-07-11 band bug
+/// reintroduced one level up. Tying the boot promise to the runtime cap by
+/// construction closes the band: within it we keep the compact DB and stream
+/// the tail; beyond it we take the verified snapshot immediately, which is the
+/// faster tool for a deep gap anyway (fixed-size download, minutes, regardless
+/// of depth).
+const PEER_HEAL_WINDOW: u32 = alphanumeric::a9::node::COMMITTED_SPAN_MAX_BLOCKS;
+
+// Marker + cooldown live in a9::node (single source, shared by the runtime
+// divergence exit, mine-prep scheduling, and this boot-time reconcile):
+// force_rebootstrap_marker_path / rebootstrap_cooldown_path /
+// rebootstrap_cooldown_active — imported above.
+
+/// Whether an idle-reconcile `NeedsBootstrap` warrants the DISRUPTIVE snapshot
+/// re-bootstrap (process exit + boot-time re-bootstrap) instead of staying up
+/// and catching up in place.
+///
+/// Returns TRUE when EITHER:
+///  - `forked` — the local chain is a genuine FORK of canonical (a proven hash
+///    mismatch against a canonical anchor we also hold). This re-bootstraps
+///    PROMPTLY regardless of height gap: a forked service node (exchange / wallet
+///    API) is serving WRONG-chain data, and incremental convergence cannot cross
+///    a below-finality fork. `Converge::NeedsBootstrap` is overloaded — it covers
+///    both "diverged fork" and "behind prefix" — and a genuine fork can sit at a
+///    SMALL height gap, so the caller re-derives the fork/behind distinction the
+///    boot reconcile already uses (a gap check alone would miss the small-gap
+///    fork and leave the service on the wrong chain).
+///  - the node has fallen MORE than `ORPHAN_REORG_DEPTH` blocks behind — too far
+///    to close incrementally (bodies aged out of the relay window), so a fresh
+///    snapshot is the only cure.
+///
+/// Returns FALSE for everything else: a canonical PREFIX that is merely behind
+/// and momentarily body-starved (relay holes / thin mesh). This is the whole
+/// point of the fix — such a SERVICE node must NOT self-terminate. Staying up
+/// lets the in-place converge / Tier-2 peer-sync / gossip paths recover it while
+/// it keeps serving. Recovery is never LOST, only deferred: a stuck prefix keeps
+/// falling behind and crosses the depth threshold on its own, rather than being
+/// nuked every ~minute on a transient stall (which took services offline).
+///
+/// `beacon_height == None` (beacon unreachable) with `forked == false` returns
+/// FALSE: never nuke a node on a gap we cannot confirm against a live tip.
+///
+/// Read-only and mining-neutral: mine-prep re-checks convergence and writes its
+/// own re-bootstrap marker independently of this decision.
+fn idle_reconcile_needs_snapshot(local_tip: u32, beacon_height: Option<u32>, forked: bool) -> bool {
+    if forked {
+        return true;
+    }
+    match beacon_height {
+        Some(bh) => bh.saturating_sub(local_tip) > alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH,
+        None => false,
+    }
+}
+
+/// Highest block index present in the local DB, or None if unreadable/empty.
+fn local_tip_height(db_path: &str) -> Option<u32> {
+    let db = open_chain_db_aux(db_path).ok()?;
+    db.scan_prefix(b"block_")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .and_then(|(k, _)| bootstrap_block_index_from_key(&k))
+        })
+        .max()
+}
+
+/// Best-effort canonical anchor at-or-below `local_tip`: the highest header from
+/// the gateway's verified snapshot history whose height we also hold locally.
+/// This is what lets the boot reconcile distinguish FORKED from merely BEHIND —
+/// a node whose tip is below the manifest height has NO hash to compare against
+/// the manifest, and treating "behind by less than the stream window" as in-sync
+/// left a node forked at its own tip claiming "on the canonical chain" forever
+/// (observed live 2026-07-11: tip 42025 on a dead side branch, canonical 42239+,
+/// boot skipped bootstrap, runtime detector cooldown-suppressed — fully stale).
+/// Trust level matches the boot beacon precedent (main.rs freshness note): a
+/// wrong anchor can at worst trigger one unnecessary re-bootstrap whose snapshot
+/// manifest is still independently signature-verified. Sanity: headers must be
+/// prev_hash-linked within their window before use.
+async fn fetch_canonical_anchor_at_or_below(local_tip: u32) -> Option<(u32, String)> {
+    // Size discipline: this is the one boot-path fetch whose response we parse
+    // wholesale, and at limit=240 a legitimate reply is single-digit MB. Cap it
+    // so a misbehaving/hostile gateway can't balloon boot memory — fail-open to
+    // "no anchor", same as any other fetch trouble.
+    const MAX_ANCHOR_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(2500))
+        .build()
+        .ok()?;
+    let raw = client
+        .get(SNAPSHOT_HISTORY_URL)
+        .send()
+        .await
+        .ok()?
+        .bytes()
+        .await
+        .ok()?;
+    if raw.len() > MAX_ANCHOR_RESPONSE_BYTES {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    // Anchors are only meaningful for OUR network. A gateway serving a
+    // different network (config drift, future testnet) would hand back
+    // guaranteed-mismatching anchors, turning every boot into a spurious
+    // Diverged -> delete-DB -> re-bootstrap cycle (audit finding, 2026-07-11).
+    // Absent network_id (older gateway): fail-open to NO anchor rather than
+    // risk a wrong one.
+    let expected_network = launch_network_id_hex().ok()?;
+    let same_network = body
+        .get("network_id")
+        .and_then(|v| v.as_str())
+        .map(|n| n.eq_ignore_ascii_case(&expected_network));
+    if same_network != Some(true) {
+        return None;
+    }
+    best_anchor_from_history(&body, local_tip)
+}
+
+/// Pure anchor selection from a (network-gated) snapshot-history response: the
+/// highest header height <= local_tip, and among entries that disagree about
+/// that height — which legitimately happens when a short reorg rewrote it
+/// between two snapshots — the hash from the NEWEST snapshot (highest snapshot
+/// tip height) wins, because it reflects the settled chain. Selection is
+/// deliberately independent of the response's array order: the old code kept
+/// whichever entry the gateway sent first, which was only correct because the
+/// route happens to sort newest-first — an ordering nobody promised. Windows
+/// whose headers do not prev_hash-chain are rejected wholesale (a malformed or
+/// tampered entry must not become the fork verdict), as are non-64-hex hashes.
+fn best_anchor_from_history(body: &serde_json::Value, local_tip: u32) -> Option<(u32, String)> {
+    // (anchor height, snapshot tip height it came from, hash)
+    let mut best: Option<(u32, u64, String)> = None;
+    for entry in body.get("history")?.as_array()? {
+        let Some(headers) = entry.get("headers").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let snapshot_height = entry.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+        let mut linked = true;
+        for pair in headers.windows(2) {
+            let child_prev = pair[1].get("prev_hash").and_then(|v| v.as_str());
+            let parent_hash = pair[0].get("hash").and_then(|v| v.as_str());
+            if child_prev.is_none() || parent_hash.is_none() || child_prev != parent_hash {
+                linked = false;
+                break;
+            }
+        }
+        if !linked {
+            continue;
+        }
+        for h in headers {
+            let (Some(height), Some(hash)) = (
+                h.get("height")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| u32::try_from(v).ok()),
+                h.get("hash").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            if height > local_tip
+                || hash.len() != 64
+                || !hash.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some((bh, bsnap, _)) => height > *bh || (height == *bh && snapshot_height > *bsnap),
+            };
+            if better {
+                best = Some((height, snapshot_height, hash.to_ascii_lowercase()));
+            }
+        }
+    }
+    best.map(|(height, _, hash)| (height, hash))
+}
+
+fn local_db_matches_launch_genesis(db_path: &str) -> bool {
+    matches!(local_launch_db_status(db_path), LaunchDbStatus::Valid)
+}
+
+async fn remove_local_db(db_path: &str) -> Result<()> {
+    let path = std::path::Path::new(db_path);
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+            .await
+            .map_err(|e| format!("Failed to remove local DB at {}: {}", db_path, e))?;
+    } else {
+        fs::remove_file(path)
+            .await
+            .map_err(|e| format!("Failed to remove local DB file at {}: {}", db_path, e))?;
+    }
+    Ok(())
+}
+
+fn has_local_block_data(db_path: &str) -> bool {
+    let path = std::path::Path::new(db_path);
+    if !path.exists() || !path.is_dir() {
+        return false;
+    }
+
+    // Only treat DB as initialized when at least one block key exists.
+    // This avoids skipping bootstrap when sled created internal files only.
+    let db = match open_chain_db_aux(db_path) {
+        Ok(db) => db,
+        Err(_) => return false,
+    };
+
+    db.scan_prefix("block_").next().is_some()
+}
+
+#[cfg(feature = "bootstrap_publisher")]
+async fn bootstrap_publish_loop(
+    db_path: String,
+    blockchain: Arc<RwLock<Blockchain>>,
+    token: String,
+) {
+    let publish_url = "https://alphanumeric.blue/api/bootstrap/publish".to_string();
+
+    let db = { blockchain.read().await.db.clone() };
+    let (mut last_published_at, mut last_published_height, mut last_published_network_id) =
+        read_bootstrap_publish_meta(&db).unwrap_or((0, 0, None));
+
+    let mut last_tip_hash: Option<String> = None;
+    let mut last_tip_change = Instant::now();
+    let mut next_attempt_at: u64 = 0;
+
+    loop {
+        // Sample every ~3s, NOT every 30s. Tip stability is measured off last_tip_change,
+        // so a coarse 30s sample quantized "stable for stable_secs" to 30s and would stop
+        // republishing entirely once the block interval drops below ~30s (higher
+        // hashpower) — re-stranding fresh nodes at a stale snapshot. A fine sample keeps
+        // stability real-time; publishing is still gated by the cooldown/min-delta below,
+        // so this does not increase publish frequency, only its responsiveness.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let (height, tip_hash_hex, network_id_hex) = {
+            let bc = blockchain.read().await;
+            let h = bc.get_latest_block_index();
+            let tip = bc.get_latest_block_hash();
+            let network_id = bc
+                .get_block(0)
+                .map(|block| hex::encode(block.hash))
+                .unwrap_or_else(|_| hex::encode(tip));
+            (h, hex::encode(tip), network_id)
+        };
+
+        // NOTE on stability: the snapshot only needs to be a VALID recent canonical
+        // point, not a perfectly-settled tip. On an active chain the tip changes every
+        // few seconds, so a large stability window would keep the snapshot frozen far
+        // behind the tip (the exact failure that stranded fresh nodes — they bootstrap
+        // to a stale snapshot the relay window can no longer bridge). A small window is
+        // enough to avoid snapshotting mid-reorg; if the published height is later
+        // reorged, the next snapshot corrects it and clients reconcile via converge.
+        let (default_cooldown_secs, default_min_delta, default_stable_secs) = if height < 100 {
+            (30, 1, 3)
+        } else if height < 10_000 {
+            (120, 5, 5)
+        } else {
+            (300, 25, 8)
+        };
+        let cooldown_secs = env_u64_or(
+            "ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS",
+            default_cooldown_secs,
+        );
+        let min_delta = env_u64_or(
+            "ALPHANUMERIC_BOOTSTRAP_PUBLISH_MIN_DELTA",
+            default_min_delta,
+        );
+        let stable_secs = env_u64_or(
+            "ALPHANUMERIC_BOOTSTRAP_PUBLISH_STABLE_SECS",
+            default_stable_secs,
+        );
+
+        if last_tip_hash.as_deref() != Some(tip_hash_hex.as_str()) {
+            last_tip_hash = Some(tip_hash_hex.clone());
+            last_tip_change = Instant::now();
+        }
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if now_secs < next_attempt_at {
+            continue;
+        }
+
+        let same_network = last_published_network_id.as_deref() == Some(network_id_hex.as_str());
+
+        if same_network && now_secs.saturating_sub(last_published_at) < cooldown_secs {
+            continue;
+        }
+
+        if same_network && height < last_published_height.saturating_add(min_delta) {
+            continue;
+        }
+
+        if last_tip_change.elapsed().as_secs() < stable_secs {
+            continue;
+        }
+
+        if let Err(e) = publish_bootstrap_snapshot(
+            &db,
+            &blockchain,
+            &db_path,
+            height,
+            &tip_hash_hex,
+            &network_id_hex,
+            &publish_url,
+            &token,
+        )
+        .await
+        {
+            error!("bootstrap publish failed: {}", e);
+            // Backoff: avoid spamming the endpoint if configuration is wrong or transient errors occur.
+            // - Redirect/auth errors: 10 minutes
+            // - Other errors: 2 minutes
+            let msg = e.to_string();
+            let backoff = if msg.contains("redirected")
+                || msg.contains("401")
+                || msg.contains("unauthorized")
+            {
+                600u64
+            } else {
+                120u64
+            };
+            next_attempt_at = now_secs.saturating_add(backoff);
+            continue;
+        }
+
+        last_published_height = height;
+        last_published_at = now_secs;
+        last_published_network_id = Some(network_id_hex.clone());
+        next_attempt_at = 0;
+        let _ = write_bootstrap_publish_meta(
+            &db,
+            last_published_at,
+            last_published_height,
+            &network_id_hex,
+        );
+    }
+}
+
+/// Zip a directory tree (the exported snapshot DB) into `zip_path` with `compression`,
+/// returning the archive stats (file_count + uncompressed/extracted bytes). Only the
+/// publisher builds snapshots (and the round-trip test exercises it), so it is compiled
+/// only for those — a plain client build does not carry it. Split out of
+/// publish_bootstrap_snapshot so the build -> client-extract -> reopen round-trip is unit-
+/// testable and the compression method is a single, reviewable knob. For any given method
+/// the behavior is identical to the former inline logic.
+#[cfg(any(feature = "bootstrap_publisher", test))]
+fn write_bootstrap_archive_zip(
+    source_dir: &std::path::Path,
+    zip_path: &std::path::Path,
+    compression: zip::CompressionMethod,
+) -> std::result::Result<BootstrapArchiveStats, String> {
+    let file = std::fs::File::create(zip_path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::default()
+        .compression_method(compression)
+        .unix_permissions(0o644);
+
+    fn add_dir(
+        zip: &mut zip::ZipWriter<std::fs::File>,
+        base: &std::path::Path,
+        path: &std::path::Path,
+        options: zip::write::SimpleFileOptions,
+        stats: &mut BootstrapArchiveStats,
+    ) -> std::result::Result<(), String> {
+        for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let p = entry.path();
+            let rel = p
+                .strip_prefix(base)
+                .map_err(|e| format!("strip_prefix: {}", e))?;
+            let name = rel.to_string_lossy().replace('\\', "/");
+            if p.is_dir() {
+                let dir_name = if name.ends_with('/') {
+                    name
+                } else {
+                    format!("{}/", name)
+                };
+                zip.add_directory(dir_name, options)
+                    .map_err(|e| e.to_string())?;
+                add_dir(zip, base, &p, options, stats)?;
+            } else if p.is_file() {
+                zip.start_file(name, options).map_err(|e| e.to_string())?;
+                let mut f = std::fs::File::open(&p).map_err(|e| e.to_string())?;
+                let copied = std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
+                update_bootstrap_archive_stats(
+                    stats,
+                    copied,
+                    BootstrapArchiveExpectations::default(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut stats = BootstrapArchiveStats::default();
+    add_dir(&mut zip, source_dir, source_dir, options, &mut stats)?;
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(stats)
+}
+
+/// Attempts for the final pointer POST (see the retry loop in the publish path).
+/// Small on purpose: this covers an edge blip, not an outage. A genuinely down
+/// endpoint should fall through to the caller's backoff, not be hammered here.
+#[cfg(feature = "bootstrap_publisher")]
+const PUBLISH_POINTER_ATTEMPTS: u32 = 3;
+
+#[cfg(feature = "bootstrap_publisher")]
+const PUBLISH_POINTER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(feature = "bootstrap_publisher")]
+// These are distinct authenticated publication capabilities and signed snapshot metadata. A
+// context wrapper would only hide the boundary without reducing ownership or synchronization risk.
+#[allow(clippy::too_many_arguments)]
+async fn publish_bootstrap_snapshot(
+    db: &Store,
+    blockchain: &Arc<RwLock<Blockchain>>,
+    _db_path: &str,
+    height: u64,
+    tip_hash_hex: &str,
+    network_id_hex: &str,
+    publish_url: &str,
+    token: &str,
+) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct PublishLatest {
+        url: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PublishResponse {
+        ok: bool,
+        latest: PublishLatest,
+    }
+
+    #[derive(serde::Serialize)]
+    struct PointerUpdate {
+        url: String,
+        network_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tip_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compressed_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extracted_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<String>,
+        updated_at: u64,
+        publisher_pubkey: String,
+        manifest_sig: String,
+    }
+
+    let tmp = std::env::temp_dir();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // UNIQUE per attempt (timestamp + pid): this used to be keyed on height alone,
+    // so two publisher processes racing the same height (watchdog respawn overlap,
+    // manual-vs-launchd) shared ONE temp file — writer B truncating/rewriting it
+    // under reader A is the standing suspect for the h2727 manifest whose sha/size
+    // didn't match the blob its own url served (2026-07-09 audit finding).
+    let zip_path = tmp.join(format!(
+        "alphanumeric-bootstrap-{}-{}-{}.zip",
+        height,
+        now_secs,
+        std::process::id()
+    ));
+    let zip_path_string = zip_path.to_string_lossy().to_string();
+    let export_dir = tmp.join(format!(
+        "alphanumeric-bootstrap-export-{}-{}-{}",
+        height,
+        now_secs,
+        std::process::id()
+    ));
+    let export_dir_string = export_dir.to_string_lossy().to_string();
+
+    // Remove the temp zip and the re-imported DB export dir on EVERY exit path. Most of the
+    // early returns below propagate with `?` and would otherwise leak them; during a gateway
+    // outage the loop rebuilds and leaks a full-DB-sized zip every cycle, filling the disk shared
+    // with the live chain DB. RAII Drop runs on success and on any error return.
+    struct TempCleanup {
+        zip: std::path::PathBuf,
+        export_dir: std::path::PathBuf,
+    }
+    impl Drop for TempCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.zip);
+            let _ = std::fs::remove_dir_all(&self.export_dir);
+        }
+    }
+    let _temp_cleanup = TempCleanup {
+        zip: zip_path.clone(),
+        export_dir: export_dir.clone(),
+    };
+
+    // Clone DB handle for spawn_blocking.
+    let db_clone = db.clone();
+
+    // BOUNDED QUIESCE (2026-07-16 park fix): hold the chain write lock across the full-DB
+    // export/import so it CANNOT run concurrently with the workers' inline sled ops. The
+    // concurrent export used to bypass this lock (via a cloned Db handle); that true
+    // concurrency on sled 0.34 is what let all 4 tokio workers pin inside sled at once and
+    // freeze the whole runtime (so the in-runtime watchdog was never polled and never exited).
+    // Under the lock, other tasks async-wait (freed — the runtime + watchdog stay alive) and
+    // the export sees an exclusive, internally-consistent DB (also fixes the torn-snapshot
+    // risk). Bounded + cheap: publish cadence is 300s at mainnet height, so the ~seconds pause
+    // is <2% ingest downtime. Released explicitly below, BEFORE any network I/O.
+    let quiesce = blockchain.write().await;
+    let quiesce_started = Instant::now();
+
+    // STEP 1 (UNDER the quiesce lock): seal + copy the store file into a temp
+    // artifact dir shaped exactly like a client DB dir ({dir}/chain.redb), so
+    // the existing zip/extract/verify pipeline carries it unchanged. The store
+    // pauses its own writers and seals with one durable two-phase commit, then
+    // clones the file (APFS clonefile — effectively instant); the chain write
+    // lock is held as the belt on top (the 2026-07-16 park discipline), and
+    // there is no multi-second export/import anymore.
+    let export_dir_for_copy = export_dir_string.clone();
+    tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
+        let export_path = std::path::Path::new(&export_dir_for_copy);
+        if export_path.exists() {
+            std::fs::remove_dir_all(export_path).map_err(|e| e.to_string())?;
+        }
+        std::fs::create_dir_all(export_path).map_err(|e| e.to_string())?;
+        db_clone
+            .snapshot_file_to(&export_path.join(CHAIN_DB_FILE))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("snapshot task failed: {}", e))??;
+
+    // Live-DB work (export/import) is done — release the quiesce lock NOW, BEFORE the
+    // CPU-heavy compression, the zip read, and any network I/O. The temp DB is a standalone
+    // copy, so nothing below needs the lock; ingest resumes immediately.
+    let quiesce_secs = quiesce_started.elapsed().as_secs();
+    drop(quiesce);
+
+    // SCALING GUARD (v7.8.0): the write-lock hold == the export/import wall-time. Compression
+    // is OFF the lock as of 7.8.3, so it no longer counts toward this. If the export/import
+    // ever nears the in-process lock watchdog's 10s read-probe window it could self-exit the
+    // headless publisher every publish (a crash-loop). Warn well before. ~3s at ~266MB logical.
+    if quiesce_secs >= 8 {
+        log::warn!(
+            "bootstrap export held the chain write lock {}s (>=8s; lock-watchdog probe=10s) — \
+             bound/chunk the export/import before the DB grows into a publish-cycle crash-loop",
+            quiesce_secs
+        );
+    }
+
+    // STEP 2 (OFF the lock): DEFLATE-compress the temp DB into the snapshot zip. Deflate of
+    // the full export is far heavier than the former Stored copy, so it MUST run off the
+    // quiesce lock — under it, the compression time would stretch the lock-hold past the
+    // watchdog and crash-loop the publisher (that is the whole reason for the STEP 1/STEP 2
+    // split). The sled export is almost all low-entropy padding, so DEFLATE shrinks the
+    // published snapshot ~15-20x with no change to the extracted bytes; every client decodes
+    // DEFLATE (standard zip, default `deflate` feature; verified byte-identical round-trip),
+    // and the manifest's sha256/compressed_bytes below are computed over THIS zip, with
+    // per-file CRC + genesis/tip validation unchanged.
+    let archive_stats = tokio::task::spawn_blocking(
+        move || -> std::result::Result<BootstrapArchiveStats, String> {
+            let export_path = std::path::Path::new(&export_dir_string);
+            let stats = write_bootstrap_archive_zip(
+                export_path,
+                std::path::Path::new(&zip_path_string),
+                zip::CompressionMethod::Deflated,
+            )?;
+            // Best-effort cleanup of the export dir (RAII TempCleanup is the backstop).
+            let _ = std::fs::remove_dir_all(export_path);
+            Ok(stats)
+        },
+    )
+    .await
+    .map_err(|e| format!("zip task failed: {}", e))??;
+
+    // Manifest hash/size via a bounded streaming pass — the archive itself stays on
+    // disk. Each upload attempt below reopens the file for its body instead of one
+    // buffer being retained (and previously cloned) across both paths, so peak
+    // publisher memory holds at most ONE copy of the zip, and only while an upload
+    // is actually in flight. The path is this attempt's unique temp file; nothing
+    // else writes it between hashing and upload.
+    let (sha256, compressed_bytes) = hash_file_streaming(std::path::Path::new(&zip_path)).await?;
+
+    // Space-amplification invariant, measured once per publish, on the
+    // engine's OWN accounting (review F2: comparing the file against a copy of
+    // itself read exactly 1.0 forever — a dead meter). redb's amplification
+    // mode is freed-page fragmentation: the file only shrinks on clean close,
+    // so a sustained climb in file/stored is the signal, with fragmented bytes
+    // as the direct cause.
+    if let Ok(space) = db.space_stats() {
+        let ratio = space.file_bytes as f64 / space.stored_bytes.max(1) as f64;
+        log::info!(
+            "publisher store: file {} MiB, stored {} MiB, fragmented {} MiB (amplification {:.2}x)",
+            space.file_bytes / (1024 * 1024),
+            space.stored_bytes / (1024 * 1024),
+            space.fragmented_bytes / (1024 * 1024),
+            ratio
+        );
+        if ratio > 3.0 {
+            log::warn!(
+                "chain store space amplification {:.2}x exceeds the 3x alarm — freed-page \
+                 fragmentation is accumulating; a clean restart releases it, and a sustained \
+                 climb after restarts warrants investigation",
+                ratio
+            );
+        }
+    }
+
+    // SOAK SAFETY (env-gated, OFF in production): the upload target is hardcoded to the real
+    // gateway, so an isolated soak node must never push to it. The full build (export/import
+    // under the lock + DEFLATE compression off it) has already run above, so a soak node
+    // still exercises the whole snapshot pipeline; this only skips shipping the result. With
+    // ALPHANUMERIC_SOAK_NO_UPLOAD unset, behavior is identical.
+    if std::env::var("ALPHANUMERIC_SOAK_NO_UPLOAD").is_ok() {
+        log::info!(
+            "soak: bootstrap snapshot built ({} bytes, sha {}…) — skipping upload",
+            compressed_bytes,
+            &sha256[..12.min(sha256.len())]
+        );
+        return Ok(());
+    }
+
+    // Disable auto-redirects so we don't lose Authorization headers on cross-host redirects.
+    // Bound every request so a blackholed/half-open connection (e.g. a tunnel flap) cannot block
+    // the publish loop forever and freeze the manifest: a tight connect timeout catches the common
+    // "can't (re)establish the connection" case fast on all requests, and a generous total timeout
+    // is the backstop for a stalled transfer — sized to comfortably cover the worst-case blob PUT.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(40 * 60))
+        .build()?;
+
+    // Step 1: upload the snapshot zip DIRECTLY to Vercel Blob (v7.6.5). The zip
+    // outgrew the gateway's ~4.5MB platform request-body cap, so shipping it
+    // THROUGH /api/bootstrap/publish 413s before the function even runs — the
+    // manifest then goes stale for hours and stranded/fresh nodes bootstrap
+    // against an ancient snapshot (the 2026-07-08 night incident). The gateway
+    // hands us its Blob credentials over the same bearer-authenticated channel
+    // (upload-grant), we PUT straight to the Blob API (no body cap), and then
+    // publish only the tiny manifest pointer. If the grant endpoint is missing
+    // (older gateway) or the direct PUT fails, fall back to the legacy
+    // through-the-gateway upload, which still works for small snapshots.
+    let publish_base = publish_url
+        .trim_end_matches("/api/bootstrap/publish")
+        .to_string();
+    let mut direct_blob_url: Option<String> = None;
+    'direct: {
+        #[derive(serde::Deserialize)]
+        struct UploadGrant {
+            ok: bool,
+            token: String,
+            api_url: String,
+            api_version: String,
+            store_id: String,
+        }
+        let grant_resp = match client
+            .post(format!("{}/api/bootstrap/upload-grant", publish_base))
+            .header("authorization", format!("Bearer {}", token))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                warn!(
+                    "bootstrap upload-grant unavailable ({}); using legacy upload",
+                    r.status()
+                );
+                break 'direct;
+            }
+            Err(e) => {
+                warn!(
+                    "bootstrap upload-grant request failed ({}); using legacy upload",
+                    e
+                );
+                break 'direct;
+            }
+        };
+        let grant: UploadGrant = match grant_resp.json().await {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
+                    "bootstrap upload-grant parse failed ({}); using legacy upload",
+                    e
+                );
+                break 'direct;
+            }
+        };
+        if !grant.ok || grant.token.trim().is_empty() {
+            warn!("bootstrap upload-grant response invalid; using legacy upload");
+            break 'direct;
+        }
+        let pathname = format!(
+            "bootstrap/{}/blockchain.db-h{}-{}.zip",
+            network_id_hex, height, tip_hash_hex
+        );
+        let put_url = {
+            let mut u =
+                match reqwest::Url::parse(&format!("{}/", grant.api_url.trim_end_matches('/'))) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        warn!(
+                            "bootstrap upload-grant api_url invalid ({}); using legacy upload",
+                            e
+                        );
+                        break 'direct;
+                    }
+                };
+            u.query_pairs_mut().append_pair("pathname", &pathname);
+            u.to_string()
+        };
+        #[derive(serde::Deserialize)]
+        struct BlobPutResponse {
+            url: String,
+        }
+        // Sized body read fresh from disk (wire-identical to the former buffered
+        // clone: same Content-Length, no transfer-encoding change on this
+        // incident-scarred path) and freed as soon as the PUT resolves.
+        let put_body = match fs::read(&zip_path).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    "bootstrap snapshot re-read for blob put failed ({}); using legacy upload",
+                    e
+                );
+                break 'direct;
+            }
+        };
+        match client
+            .put(&put_url)
+            .header("authorization", format!("Bearer {}", grant.token))
+            .header("x-api-version", grant.api_version.as_str())
+            .header("x-vercel-blob-store-id", grant.store_id.as_str())
+            .header("x-vercel-blob-access", "public")
+            .header("x-add-random-suffix", "1")
+            .header("x-content-type", "application/zip")
+            .body(put_body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => match r.json::<BlobPutResponse>().await {
+                Ok(b) if !b.url.trim().is_empty() => {
+                    log::info!(
+                        "bootstrap snapshot uploaded directly to blob ({} bytes): {}",
+                        compressed_bytes,
+                        b.url
+                    );
+                    direct_blob_url = Some(b.url);
+                }
+                Ok(_) => warn!("blob put returned empty url; using legacy upload"),
+                Err(e) => warn!(
+                    "blob put response parse failed ({}); using legacy upload",
+                    e
+                ),
+            },
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                warn!(
+                    "blob put failed ({}: {}); using legacy upload",
+                    status,
+                    body.trim()
+                );
+            }
+            Err(e) => warn!("blob put request failed ({}); using legacy upload", e),
+        }
+    }
+
+    // Step 2: publish through the gateway — manifest-only when the direct blob
+    // upload succeeded (tiny request), full zip body otherwise (legacy).
+    let mut upload_url = format!(
+        "{}?network_id={}&height={}&tip={}&sha256={}&compressed_bytes={}&extracted_bytes={}&file_count={}",
+        publish_url,
+        network_id_hex,
+        height,
+        tip_hash_hex,
+        sha256,
+        compressed_bytes,
+        archive_stats.extracted_bytes,
+        archive_stats.file_count
+    );
+    if let Some(blob_url) = &direct_blob_url {
+        let mut u = reqwest::Url::parse(&upload_url)?;
+        u.query_pairs_mut().append_pair("blob_url", blob_url);
+        upload_url = u.to_string();
+    }
+    // RETRY THE POINTER POST BEFORE THROWING THE ARTIFACT AWAY. In self-host mode
+    // the expensive work is already finished and durable by this point: writers were
+    // quiesced for the snapshot, the archive was built, and the whole zip was uploaded
+    // to the local blob target. All that remains is a few-hundred-byte authenticated
+    // POST — and that is the only part of the publish that traverses Cloudflare, so a
+    // transient edge 5xx there used to discard the finished artifact and force a
+    // complete re-snapshot/re-zip/re-upload cycle (observed ~5x/day). Retry the cheap
+    // request instead. Auth, redirect, and 4xx outcomes are NOT retried: those are
+    // configuration, and repeating them just spams the endpoint.
+    let mut attempt: u32 = 0;
+    let resp = loop {
+        attempt += 1;
+        let request = client
+            .post(&upload_url)
+            .header("authorization", format!("Bearer {}", token))
+            .header("content-type", "application/zip");
+        let sent = if direct_blob_url.is_some() {
+            request.send().await
+        } else {
+            // Legacy full-body publish: replay the archive by reopening the completed
+            // file, not by having retained it in memory across the direct attempt.
+            request.body(fs::read(&zip_path).await?).send().await
+        };
+        // Only the manifest-only shape is cheap enough to be worth replaying; the
+        // legacy full-body path re-reads and re-sends the entire zip, so leave its
+        // single-attempt behavior alone.
+        let retriable_shape = direct_blob_url.is_some();
+        let retries_left = attempt < PUBLISH_POINTER_ATTEMPTS;
+        match sent {
+            Ok(r) => {
+                let retriable_status = r.status().is_server_error();
+                if retriable_shape && retriable_status && retries_left {
+                    warn!(
+                        "bootstrap pointer POST attempt {}/{} failed ({}); retrying in {:?} (artifact retained)",
+                        attempt, PUBLISH_POINTER_ATTEMPTS, r.status(), PUBLISH_POINTER_RETRY_DELAY
+                    );
+                    tokio::time::sleep(PUBLISH_POINTER_RETRY_DELAY).await;
+                    continue;
+                }
+                break r;
+            }
+            Err(e) => {
+                if retriable_shape && retries_left {
+                    warn!(
+                        "bootstrap pointer POST attempt {}/{} errored ({}); retrying in {:?} (artifact retained)",
+                        attempt, PUBLISH_POINTER_ATTEMPTS, e, PUBLISH_POINTER_RETRY_DELAY
+                    );
+                    tokio::time::sleep(PUBLISH_POINTER_RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
+    };
+
+    if resp.status().is_redirection() {
+        let loc = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        return Err(format!(
+            "bootstrap publish URL redirected ({}). Fix your alphanumeric.blue canonical domain routing (no redirect on /api/bootstrap/publish). Location={}",
+            resp.status(),
+            loc
+        )
+        .into());
+    }
+
+    if !resp.status().is_success() {
+        let _ = fs::remove_file(&zip_path).await;
+        // Include response body to make server-side misconfiguration debuggable (Blob/KV/env issues).
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(format!("bootstrap publish failed: {}", status).into());
+        }
+        return Err(format!("bootstrap publish failed: {}: {}", status, body).into());
+    }
+
+    let parsed: PublishResponse = resp.json().await?;
+    if !parsed.ok || parsed.latest.url.trim().is_empty() {
+        let _ = fs::remove_file(&zip_path).await;
+        return Err("bootstrap publish response invalid".into());
+    }
+
+    // Step 2: sign the manifest (with final blob URL) and update pointer in KV.
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let signed_fields = BootstrapManifestSignedFields {
+        url: parsed.latest.url.clone(),
+        network_id: Some(network_id_hex.to_string()),
+        height: Some(height),
+        tip_hash: Some(tip_hash_hex.to_string()),
+        sha256: Some(sha256),
+        compressed_bytes: Some(compressed_bytes),
+        extracted_bytes: Some(archive_stats.extracted_bytes),
+        file_count: Some(archive_stats.file_count),
+        format: Some("redb".to_string()),
+        updated_at,
+    };
+    let msg = serde_json::to_vec(&signed_fields)?;
+
+    // Derive a deterministic ed25519 keypair from the publish token so one secret enables:
+    // - API authorization
+    // - manifest signing
+    let mut t_hasher = Sha256::new();
+    t_hasher.update(token.as_bytes());
+    let seed = t_hasher.finalize();
+    let seed_bytes: [u8; 32] = seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| "failed to derive signing seed")?;
+
+    use ed25519_dalek::{Signer, SigningKey};
+    let signing = SigningKey::from_bytes(&seed_bytes);
+    let pub_hex = hex::encode(signing.verifying_key().to_bytes());
+    let sig = signing.sign(&msg);
+    let sig_hex = hex::encode(sig.to_bytes());
+
+    let pointer_url = if publish_url.contains("/api/bootstrap/publish") {
+        publish_url.replace("/api/bootstrap/publish", "/api/bootstrap/pointer")
+    } else {
+        format!(
+            "{}/api/bootstrap/pointer",
+            publish_url.trim_end_matches('/')
+        )
+    };
+
+    let pointer_update = PointerUpdate {
+        url: signed_fields.url,
+        network_id: network_id_hex.to_string(),
+        height: signed_fields.height,
+        tip_hash: signed_fields.tip_hash,
+        sha256: signed_fields.sha256,
+        compressed_bytes: signed_fields.compressed_bytes,
+        extracted_bytes: signed_fields.extracted_bytes,
+        file_count: signed_fields.file_count,
+        format: signed_fields.format,
+        updated_at: signed_fields.updated_at,
+        publisher_pubkey: pub_hex,
+        manifest_sig: sig_hex,
+    };
+
+    let pointer_resp = client
+        .post(&pointer_url)
+        .header("authorization", format!("Bearer {}", token))
+        .json(&pointer_update)
+        .send()
+        .await?;
+
+    if pointer_resp.status().is_redirection() {
+        let loc = pointer_resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        return Err(format!(
+            "bootstrap pointer URL redirected ({}). Fix your alphanumeric.blue canonical domain routing (no redirect on /api/bootstrap/pointer). Location={}",
+            pointer_resp.status(),
+            loc
+        )
+        .into());
+    }
+
+    // Best-effort cleanup of temp zip file.
+    let _ = fs::remove_file(&zip_path).await;
+
+    if !pointer_resp.status().is_success() {
+        let status = pointer_resp.status();
+        let body = pointer_resp.text().await.unwrap_or_default();
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(format!("bootstrap pointer update failed: {}", status).into());
+        }
+        return Err(format!("bootstrap pointer update failed: {}: {}", status, body).into());
+    }
+
+    // READ-BACK SELF-CONSISTENCY CHECK (2026-07-09). Whatever manifest the gateway
+    // now serves, the blob its `url` points at must actually serve `compressed_bytes`
+    // bytes — the one invariant every bootstrapping node depends on before sha
+    // verification even runs. The audit caught a live manifest violating it (fresh
+    // nodes failed verification until the next publish happened to overwrite it).
+    // FAIL-OPEN on any transient error (a Blob/CDN hiccup must never fail a good
+    // publish — a frozen manifest is its own past incident); fail ONLY on a
+    // confirmed byte-count mismatch, which returns Err WITHOUT writing the publish
+    // meta so the publish loop re-publishes (and overwrites the bad manifest) on
+    // its next cycle instead of sleeping through the full cadence.
+    let manifest_url = pointer_url.replace("/api/bootstrap/pointer", "/api/bootstrap/manifest");
+    let readback: Option<(String, u64, u64)> = async {
+        let resp = client.get(&manifest_url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        let m = v.get("manifest")?;
+        let url = m.get("url")?.as_str()?.to_string();
+        let claimed = m.get("compressed_bytes")?.as_u64()?;
+        let head = client.head(&url).send().await.ok()?;
+        if !head.status().is_success() {
+            return None;
+        }
+        let served = head
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse::<u64>()
+            .ok()?;
+        Some((url, claimed, served))
+    }
+    .await;
+    if let Some((url, claimed, served)) = readback {
+        if claimed != served {
+            return Err(format!(
+                "bootstrap manifest readback INCONSISTENT: manifest claims {} bytes but its blob {} serves {}; retrying publish next cycle to overwrite it",
+                claimed, url, served
+            )
+            .into());
+        }
+    }
+
+    let _ = write_bootstrap_publish_meta(db, updated_at, height, network_id_hex);
+    Ok(())
+}
+
+#[cfg(feature = "bootstrap_publisher")]
+fn read_bootstrap_publish_meta(db: &Store) -> Option<(u64, u64, Option<String>)> {
+    let tree = db.open_tree(BOOTSTRAP_META_TREE).ok()?;
+    let last_at = tree
+        .get(BOOTSTRAP_META_LAST_PUBLISH_AT)
+        .ok()
+        .flatten()
+        .and_then(|v| codec::deserialize::<u64>(&v).ok())
+        .unwrap_or(0);
+    let last_height = tree
+        .get(BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT)
+        .ok()
+        .flatten()
+        .and_then(|v| codec::deserialize::<u64>(&v).ok())
+        .unwrap_or(0);
+    let last_network_id = tree
+        .get(BOOTSTRAP_META_LAST_PUBLISHED_NETWORK_ID)
+        .ok()
+        .flatten()
+        .and_then(|v| String::from_utf8(v.to_vec()).ok())
+        .filter(|v| is_hex_with_len(v, 64));
+    Some((last_at, last_height, last_network_id))
+}
+
+#[cfg(feature = "bootstrap_publisher")]
+fn write_bootstrap_publish_meta(
+    db: &Store,
+    last_at: u64,
+    last_height: u64,
+    network_id: &str,
+) -> std::result::Result<(), store::StoreError> {
+    let tree = db.open_tree(BOOTSTRAP_META_TREE)?;
+    let mut batch = store::Batch::default();
+    batch.insert(
+        BOOTSTRAP_META_LAST_PUBLISH_AT,
+        codec::serialize(&last_at).unwrap_or_default(),
+    );
+    batch.insert(
+        BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT,
+        codec::serialize(&last_height).unwrap_or_default(),
+    );
+    batch.insert(BOOTSTRAP_META_LAST_PUBLISHED_NETWORK_ID, network_id);
+    tree.apply_batch(batch)?;
+    tree.flush()?;
+    Ok(())
+}
+
+#[cfg(feature = "bootstrap_publisher")]
+async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>) -> Result<()> {
+    let token = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN")
+        .map_err(|_| "push requires ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN to be set")?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("push requires ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN to be set".into());
+    }
+
+    let publish_url = "https://alphanumeric.blue/api/bootstrap/publish".to_string();
+
+    let cooldown_secs = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS", 30);
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let (db, height, tip_hash_hex, network_id_hex) = {
+        let bc = blockchain.read().await;
+        let db = bc.db.clone();
+        let height = bc.get_latest_block_index();
+        let tip = bc.get_latest_block_hash();
+        let tip_hash_hex = hex::encode(tip);
+        let network_id_hex = bc
+            .get_block(0)
+            .map(|block| hex::encode(block.hash))
+            .unwrap_or_else(|_| hex::encode(tip));
+        (db, height, tip_hash_hex, network_id_hex)
+    };
+
+    let (last_at, _last_height, last_network_id) =
+        read_bootstrap_publish_meta(&db).unwrap_or((0, 0, None));
+    let same_network = last_network_id.as_deref() == Some(network_id_hex.as_str());
+    if same_network && now_secs.saturating_sub(last_at) < cooldown_secs {
+        let remaining = cooldown_secs.saturating_sub(now_secs.saturating_sub(last_at));
+        return Err(format!("push is rate-limited: wait {}s", remaining).into());
+    }
+
+    publish_bootstrap_snapshot(
+        &db,
+        blockchain,
+        db_path,
+        height,
+        &tip_hash_hex,
+        &network_id_hex,
+        &publish_url,
+        &token,
+    )
+    .await?;
+    println!("Bootstrap snapshot published at height {}", height);
+    Ok(())
+}
+
+// Chain-event notifications (received / whisper / reorged). These print from a
+// BACKGROUND task, so they use inline ANSI rather than the ui.rs StandardStream
+// helpers: interleaving println! with set_color from another task corrupts both
+// streams (the long-standing rule in this client). The colours mirror the ui.rs
+// palette so the language matches every other screen, and the meaning is carried
+// by a left-aligned keyword rather than a symbol.
+const EV_RECEIVED: &str = "\x1b[38;2;59;242;173m"; // UI_GREEN — value in
+const EV_WHISPER: &str = "\x1b[38;2;167;165;198m"; // UI_LAVENDER — message
+const EV_REORG: &str = "\x1b[38;2;237;124;51m"; // UI_ORANGE — attention, not alarm
+const EV_DIM: &str = "\x1b[38;2;128;128;128m"; // UI_DIM — block refs
+const EV_CODE: &str = "\x1b[38;2;40;204;217m"; // UI_CYAN — the code, as in `whisper`
+const EV_OFF: &str = "\x1b[0m";
+
+/// First 10 characters of an address, for the notice lines.
+///
+/// CHARACTERS, not bytes. Chain-sourced strings reach this on a background task
+/// whose panic would silently kill every later notice for the session, and a
+/// byte range that lands mid-codepoint panics. Validated addresses are ASCII
+/// hex, so this is belt-and-braces — but it costs one call and removes the
+/// class.
+fn short_addr(addr: &str) -> String {
+    addr.chars().take(10).collect()
+}
+
+/// Inbound payments in ONE block above which that block collapses to a single
+/// digest line. An ordinary wallet never reaches it; four separate payments in
+/// the same five-second block is already unusual for a person.
+const RECEIPT_BURST_LINES: usize = 4;
+/// Payments seen inside `RECEIPT_RATE_WINDOW` above which we stay collapsed even
+/// when no single block is bursty — the sustained-drip shape a mining pool or an
+/// exchange produces. 20/min is ~1.7 per block, well past personal use.
+const RECEIPT_SUSTAINED_LINES: usize = 20;
+const RECEIPT_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Credits already reported this session, so a reorg re-scan does not announce the same
+/// payment twice.
+///
+/// Bounded and FIFO. Forgetting an old entry can only cost a duplicate line for something
+/// long past; it can never suppress a new credit, which is the direction that would matter.
+/// Identity is the envelope plus the committed sig_hash: the envelope alone is shared by
+/// distinct signings, and two genuinely separate payments differ in it anyway (it carries the
+/// timestamp).
+struct AnnouncedCredits {
+    seen: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+/// How many credits back the notice task remembers. A reorg re-scan only ever revisits the
+/// blocks around the tip, so this is orders of magnitude more history than it needs.
+const ANNOUNCED_CREDIT_MEMORY: usize = 4096;
+
+impl AnnouncedCredits {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// True the first time a given credit is offered, false on every repeat.
+    fn first_sighting(&mut self, tx: &Transaction) -> bool {
+        let id = format!(
+            "{}:{}",
+            tx.get_tx_id(),
+            tx.sig_hash.as_deref().unwrap_or_default()
+        );
+        if self.seen.contains(&id) {
+            return false;
+        }
+        if self.order.len() >= ANNOUNCED_CREDIT_MEMORY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.order.push_back(id.clone());
+        self.seen.insert(id);
+        true
+    }
+}
+
+/// Rolling count of inbound notices of ONE class, so a high-volume operator gets
+/// a digest instead of a firehose while an ordinary wallet keeps the exact output
+/// it has today. Instantiated once per class (payments, whispers) — the classes
+/// never share a budget, so neither can silence the other.
+///
+/// Counts EVENTS OBSERVED, never lines printed. Counting lines would let
+/// coalescing erase the very signal that triggered it: one digest line would
+/// read as "volume is low", the next block would print individually again, and
+/// the display would oscillate between the two modes under steady load.
+///
+/// Entries are (instant, count) per block rather than one per event, so a block
+/// carrying thousands of deposits costs one entry, and the deque is bounded by
+/// the window regardless of volume.
+struct NoticeRate {
+    seen: std::collections::VecDeque<(Instant, usize)>,
+    /// Running sum of `seen`, maintained on insert and eviction. Summing the
+    /// deque per call is O(len), and a catch-up scan puts every scanned block in
+    /// the same window — quadratic over a bootstrap-length replay.
+    total: usize,
+}
+
+impl NoticeRate {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::VecDeque::new(),
+            total: 0,
+        }
+    }
+
+    /// Events observed within the window ending at `now`, dropping older ones.
+    fn recent(&mut self, now: Instant) -> usize {
+        while let Some(&(at, n)) = self.seen.front() {
+            // saturating: a non-monotonic `now` must not panic a display path.
+            if now.saturating_duration_since(at) > RECEIPT_RATE_WINDOW {
+                self.seen.pop_front();
+                self.total = self.total.saturating_sub(n);
+            } else {
+                break;
+            }
+        }
+        self.total
+    }
+
+    fn record(&mut self, now: Instant, count: usize) {
+        if count > 0 {
+            self.seen.push_back((now, count));
+            self.total = self.total.saturating_add(count);
+        }
+    }
+}
+
+/// Whether this block's payments collapse into one digest line. Pure so the
+/// policy is testable without a clock, a chain or a terminal.
+fn should_digest_receipts(in_block: usize, recent: usize) -> bool {
+    in_block > RECEIPT_BURST_LINES || recent > RECEIPT_SUSTAINED_LINES
+}
+
+/// Whispers in ONE block above which they collapse. Lower than the payment
+/// threshold because a whisper is the noisier line of the two and because the
+/// most whispers ever carried by a single block on this chain is two — so a
+/// person's real traffic sits below this with room to spare.
+const WHISPER_BURST_LINES: usize = 2;
+/// Whispers inside `RECEIPT_RATE_WINDOW` above which we stay collapsed even when
+/// no single block is bursty — the sustained drip a spammer produces. Blocks
+/// arrive every ~5.5s, so a 1-per-block drip reaches this inside the window;
+/// setting it at or above the blocks-per-window count would let that drip age
+/// out faster than it accumulates and never collapse at all.
+const WHISPER_SUSTAINED_LINES: usize = 8;
+/// Minimum spacing between rollup lines under a sustained flood. Past the burst
+/// threshold an attacker gains nothing by spending more, so there is no cost
+/// gradient to lean on: without this, one digest line per block is a prompt
+/// repaint every ~5s forever, which is a usability denial rather than noise.
+const WHISPER_ROLLUP_INTERVAL: Duration = Duration::from_secs(30);
+/// The client's line budget, shared by every screen.
+const NOTICE_WIDTH_COLS: usize = 80;
+/// Column budget for the code list, which sits on its own indented line under
+/// the 10-column keyword gutter.
+const WHISPER_CODE_BUDGET_COLS: usize = NOTICE_WIDTH_COLS - 10;
+/// Distinct codes / senders the accumulator will hold. Ordinary traffic never
+/// approaches this; a catch-up scan replays thousands of blocks inside one
+/// wall-clock rollup window, and the code space is 26^4, so the fold needs a
+/// ceiling that does not depend on how far behind the client was.
+const WHISPER_ACCUM_MAX_KEYS: usize = 512;
+
+/// Whether a rollup may be emitted now. `None` means nothing has been emitted
+/// yet, so the first one is due immediately.
+#[allow(clippy::unnecessary_map_or)]
+fn whisper_rollup_due(last_emit: Option<Instant>, now: Instant) -> bool {
+    // map_or, not is_none_or: the latter is 1.82 and this crate holds an MSRV
+    // floor of 1.70.
+    last_emit.map_or(true, |t| {
+        now.saturating_duration_since(t) >= WHISPER_ROLLUP_INTERVAL
+    })
+}
+
+/// Whether this block's whispers collapse. Pure, like `should_digest_receipts`.
+fn should_digest_whispers(in_block: usize, recent: usize) -> bool {
+    in_block > WHISPER_BURST_LINES || recent > WHISPER_SUSTAINED_LINES
+}
+
+/// What to do with the whispers in one block.
+#[derive(Debug, PartialEq, Eq)]
+enum WhisperAction {
+    /// Print each one with its code and amount — the ordinary case.
+    Verbose,
+    /// Add to the pending rollup instead of printing now.
+    Fold,
+}
+
+/// Pure per-block decision, so the state machine is testable without a clock,
+/// a chain or a terminal.
+///
+/// `rollup_pending` is why this is not just `should_digest_whispers`: once a
+/// rollup is waiting to be emitted, a later quiet block must join it rather than
+/// print. Printing it would report the same traffic twice — once verbatim now,
+/// once inside the rollup — and out of order, because the rollup covers blocks
+/// that came first.
+fn whisper_action(in_block: usize, recent: usize, rollup_pending: bool) -> WhisperAction {
+    if rollup_pending || should_digest_whispers(in_block, recent) {
+        WhisperAction::Fold
+    } else {
+        WhisperAction::Verbose
+    }
+}
+
+/// Render `tokens` into at most `budget` COLUMNS, returning the rendered tokens
+/// and how many WHISPERS they do not account for.
+///
+/// The tail is counted in whispers, the same unit as the header's total, and
+/// `total_whispers` is the accumulator's full count — including any whose code
+/// never made it into the map because the key cap was already reached. Counting
+/// distinct codes instead would mix two units and, worse, let the caller print a
+/// wider number than the one this function reserved room for.
+///
+/// Columns, not bytes: `×` is two bytes and one column, so byte length
+/// over-counts and would truncate a line that fits. At least one token is always
+/// returned — a bare "+N more" tells the reader nothing.
+fn fit_code_tokens(
+    tokens: &[(String, usize)],
+    budget: usize,
+    total_whispers: usize,
+) -> (Vec<String>, usize) {
+    const SEP: usize = 2;
+    let render = |(code, n): &(String, usize)| -> String {
+        if *n > 1 {
+            format!("{code} ×{n}")
+        } else {
+            code.clone()
+        }
+    };
+    let width = |s: &str| s.chars().count();
+
+    let mut out: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut shown_whispers = 0usize;
+    for tok in tokens {
+        let text = render(tok);
+        let sep = if out.is_empty() { 0 } else { SEP };
+        // Reserve room for the tail admitting this token would leave behind. The
+        // tail only shrinks as more tokens are admitted, so the worst case after
+        // taking this one is "everything this token does not cover" — reserving
+        // against that is what stops the line overflowing by admitting a token
+        // and then discovering the "+N more" no longer fits.
+        let after = total_whispers.saturating_sub(shown_whispers + tok.1);
+        let tail = if after > 0 {
+            SEP + width(&format!("+{after} more"))
+        } else {
+            0
+        };
+        if !out.is_empty() && used + sep + width(&text) + tail > budget {
+            break;
+        }
+        used += sep + width(&text);
+        shown_whispers += tok.1;
+        out.push(text);
+    }
+    let unshown = total_whispers.saturating_sub(shown_whispers);
+    (out, unshown)
+}
+
+/// Whispers folded across one or more blocks, awaiting a single notice.
+///
+/// Holds the payload (the codes) rather than a count, because for a whisper the
+/// code IS the message — collapsing to "12 whispers" would discard the only
+/// thing worth reading. Amounts are totalled for the same reason the individual
+/// lines carry them: a whisper is also a payment.
+struct WhisperAccum {
+    count: usize,
+    total: f64,
+    codes: std::collections::BTreeMap<String, usize>,
+    senders: std::collections::BTreeSet<String>,
+    /// Set independently by each cap: conflating them would let a code-space
+    /// flood report an exact sender count as a lower bound, which is the
+    /// canonical spam shape (one address, many distinct codes) reading as many
+    /// attackers.
+    codes_saturated: bool,
+    senders_saturated: bool,
+    first_block: u32,
+    last_block: u32,
+}
+
+impl WhisperAccum {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            total: 0.0,
+            codes: std::collections::BTreeMap::new(),
+            senders: std::collections::BTreeSet::new(),
+            codes_saturated: false,
+            senders_saturated: false,
+            first_block: 0,
+            last_block: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    fn merge(&mut self, block: u32, whispers: &[(String, String, f64)]) {
+        // min/max rather than "first wins, last wins": the tip signal re-scans
+        // the tip on a reorg, so a block at or below one already folded can
+        // arrive second. Ordering the span here keeps it readable whatever
+        // order the heights land in.
+        if self.is_empty() {
+            self.first_block = block;
+            self.last_block = block;
+        } else {
+            self.first_block = self.first_block.min(block);
+            self.last_block = self.last_block.max(block);
+        }
+        for (from, code, amount) in whispers {
+            self.count += 1;
+            self.total += *amount;
+            if self.codes.len() < WHISPER_ACCUM_MAX_KEYS || self.codes.contains_key(code) {
+                *self.codes.entry(code.clone()).or_insert(0) += 1;
+            } else {
+                self.codes_saturated = true;
+            }
+            if self.senders.len() < WHISPER_ACCUM_MAX_KEYS {
+                self.senders.insert(from.clone());
+            } else if !self.senders.contains(from) {
+                self.senders_saturated = true;
+            }
+        }
+    }
+
+    /// Codes ordered by count descending, then code ascending. Total and
+    /// deterministic: the order must not depend on hash iteration or arrival.
+    fn ordered_codes(&self) -> Vec<(String, usize)> {
+        let mut v: Vec<(String, usize)> = self.codes.iter().map(|(c, n)| (c.clone(), *n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    fn render(&self) -> String {
+        // The tail is whispers, not codes — the same unit as the header count,
+        // and the same number the fitter reserved room for.
+        let (shown, unshown) =
+            fit_code_tokens(&self.ordered_codes(), WHISPER_CODE_BUDGET_COLS, self.count);
+        let mut codes = shown.join("  ");
+        if unshown > 0 {
+            codes.push_str(&format!("  +{unshown} more"));
+        }
+        let senders = if self.senders_saturated {
+            format!("{}+ senders", self.senders.len())
+        } else if self.senders.len() == 1 {
+            "1 sender".to_string()
+        } else {
+            format!("{} senders", self.senders.len())
+        };
+        let range = if self.first_block == self.last_block {
+            format!("block {}", self.first_block)
+        } else {
+            format!("blocks {}-{}", self.first_block, self.last_block)
+        };
+        // Counts and money are never abbreviated — this line exists so a flood
+        // cannot hide value. When the header would overrun the 80-column budget,
+        // the block SPAN gives way first, then the pointer, in that order: the
+        // pointer is the retrievability guarantee and the span is recoverable
+        // from `whisper` itself.
+        let head = format!(
+            "whispers  {} from {}  +{:.8} ♦  ",
+            self.count, senders, self.total
+        );
+        let last = format!("block {}", self.last_block);
+        let tail = [
+            format!("{range} · whisper"),
+            format!("{last} · whisper"),
+            last,
+        ]
+        .into_iter()
+        .find(|t| head.chars().count() + t.chars().count() <= NOTICE_WIDTH_COLS)
+        .unwrap_or_else(|| format!("block {}", self.last_block));
+
+        format!(
+            "\n{}whispers{}  {} from {}  +{:.8} ♦  {}{}{}\n          {}{}{}",
+            EV_WHISPER,
+            EV_OFF,
+            self.count,
+            senders,
+            self.total,
+            EV_DIM,
+            tail,
+            EV_OFF,
+            EV_CODE,
+            codes,
+            EV_OFF
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The history gate is on the PAYLOAD, not on the verb. Gating on
+    // `import-seed` was a gate on the one spelling that works: a typo, a
+    // different case, or a bare pasted seed all missed it and reached
+    // rustyline's history and `last_console_command` before the line was
+    // rejected as an unknown command -- copies this process owns and could have
+    // wiped, which is the class the masked prompt exists to close.
+    #[test]
+    fn a_seed_is_recognised_by_its_shape_and_not_by_the_verb_beside_it() {
+        let seed = "9e".repeat(32);
+        assert_eq!(seed.len(), 64);
+
+        for line in [
+            format!("import-seed {seed}"),
+            format!("import-seed {seed} vault"),
+            format!("Import-Seed {seed}"),
+            format!("importseed {seed}"),
+            format!("import_seed {seed}"),
+            // No verb at all: a paste that landed on its own line.
+            seed.clone(),
+            format!("  {}  ", seed.to_uppercase()),
+            // One character short under the right verb: a rejected command, and
+            // still most of a spendable key.
+            format!("import-seed {}", &seed[..63]),
+        ] {
+            assert!(
+                line_may_carry_a_seed(&line),
+                "{line:?} carries a seed and must not reach the history"
+            );
+            assert!(
+                !redact_seed_shaped_tokens(&line).contains(&seed.to_lowercase()),
+                "{line:?} must not echo its seed back"
+            );
+            assert!(
+                !redact_seed_shaped_tokens(&line).contains(&seed.to_uppercase()),
+                "{line:?} must not echo its seed back in any case"
+            );
+        }
+
+        // The truncated paste is redacted too, not merely kept out of history:
+        // the echo path prints what a parked mining reader handed back.
+        let truncated = format!("import-seed {}", &seed[..63]);
+        assert_eq!(
+            redact_seed_shaped_tokens(&truncated),
+            "import-seed <seed hidden>"
+        );
+        // An optional wallet name after the seed stays readable.
+        assert_eq!(
+            redact_seed_shaped_tokens(&format!("import-seed {seed} vault")),
+            "import-seed <seed hidden> vault"
+        );
+
+        // Ordinary commands keep their history entry. A false positive costs one
+        // history line; a false negative costs a key -- but the gate still has to
+        // be narrow enough that normal use is unaffected.
+        // A bare `import-seed` carries nothing, so it stays recallable.
+        for line in [
+            "balance",
+            "help",
+            "import-seed",
+            "rename old new",
+            "create 9e1e860361994891b3165e611dc5aefcdd37dfbf 84dab431b53e6522fe2e74914eec99f17758f4e3 1.5",
+            // 63 and 65 hex characters, and 64 characters that are not all hex.
+            &"a".repeat(63),
+            &"a".repeat(65),
+            &format!("{}zz", "a".repeat(62)),
+        ] {
+            assert!(
+                !line_may_carry_a_seed(line),
+                "{line:?} is not a seed and must keep its history entry"
+            );
+            assert_eq!(redact_seed_shaped_tokens(line), line.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+    }
+
+    // The sled caches are now explicit and operator-tunable rather than sled's implicit 1 GiB
+    // default: conservative role-specific defaults, invalid input ignored, and hard clamps so a
+    // typo cannot set a 4 MiB cache that thrashes or a 1 TiB cache that OOMs the box.
+    // The migration-window slot preference: a response carrying both slots
+    // must select the redb manifest; legacy-only falls back (still valid for
+    // tip reconcile); the format gate downstream governs artifacts. Legacy
+    // binaries never see the new field (no deny_unknown_fields anywhere).
+    #[test]
+    fn manifest_response_prefers_the_redb_slot() {
+        let both: BootstrapManifestResponse = serde_json::from_str(
+            r#"{"ok":true,
+                "manifest":{"url":"https://x/legacy.zip","publisher_pubkey":"","manifest_sig":"","updated_at":1},
+                "manifest_redb":{"url":"https://x/redb.zip","format":"redb","publisher_pubkey":"","manifest_sig":"","updated_at":2}}"#,
+        )
+        .unwrap();
+        let chosen = both.manifest_redb.or(both.manifest).unwrap();
+        assert_eq!(chosen.url, "https://x/redb.zip");
+        assert_eq!(chosen.format.as_deref(), Some("redb"));
+
+        let legacy_only: BootstrapManifestResponse = serde_json::from_str(
+            r#"{"ok":true,
+                "manifest":{"url":"https://x/legacy.zip","publisher_pubkey":"","manifest_sig":"","updated_at":1}}"#,
+        )
+        .unwrap();
+        let chosen = legacy_only.manifest_redb.or(legacy_only.manifest).unwrap();
+        assert_eq!(chosen.url, "https://x/legacy.zip");
+        assert_eq!(chosen.format, None, "legacy manifests carry no format");
+
+        let neither: BootstrapManifestResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(neither.manifest_redb.or(neither.manifest).is_none());
+    }
+
+    #[test]
+    fn db_cache_mib_defaults_and_clamps() {
+        assert_eq!(
+            clamp_db_cache_mib(None, CHAIN_DB_CACHE_DEFAULT_MIB),
+            512,
+            "unset -> conservative chain default"
+        );
+        assert_eq!(
+            clamp_db_cache_mib(Some("garbage"), CHAIN_DB_CACHE_DEFAULT_MIB),
+            512,
+            "unparseable -> default"
+        );
+        assert_eq!(
+            clamp_db_cache_mib(Some("  256 "), CHAIN_DB_CACHE_DEFAULT_MIB),
+            256,
+            "trimmed and parsed"
+        );
+        assert_eq!(
+            clamp_db_cache_mib(Some("1"), CHAIN_DB_CACHE_DEFAULT_MIB),
+            64,
+            "clamped up to the floor"
+        );
+        assert_eq!(
+            clamp_db_cache_mib(Some("999999"), CHAIN_DB_CACHE_DEFAULT_MIB),
+            8192,
+            "clamped down to the ceiling"
+        );
+    }
+
+    // The streaming manifest hash must agree exactly with a whole-buffer hash —
+    // it replaces fs::read for snapshot hashing, so any divergence would publish
+    // a manifest whose sha256 no client can verify. The fixture deliberately
+    // crosses the 1 MiB read buffer several times and ends on a partial chunk.
+    #[test]
+    fn streaming_file_hash_matches_buffered_hash() {
+        let mut data = Vec::with_capacity(3 * 1024 * 1024 + 12_345);
+        for i in 0..(3 * 1024 * 1024 + 12_345usize) {
+            data.push((i % 251) as u8);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "an-streamhash-{}-{}.bin",
+            std::process::id(),
+            data.len()
+        ));
+        std::fs::write(&path, &data).expect("write hash fixture");
+
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let expected = hex::encode(hasher.finalize());
+
+        let (streamed, total) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(hash_file_streaming(&path))
+            .expect("streaming hash");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(streamed, expected, "streamed sha256 == buffered sha256");
+        assert_eq!(
+            total,
+            data.len() as u64,
+            "byte count is the exact file size"
+        );
+    }
+
+    // An ordinary wallet must keep the per-payment lines it has today. This is
+    // the half of the behaviour that is NOT allowed to change.
+    #[test]
+    fn ordinary_wallet_volume_never_digests() {
+        assert!(
+            !should_digest_receipts(1, 0),
+            "a single payment stays verbose"
+        );
+        assert!(
+            !should_digest_receipts(RECEIPT_BURST_LINES, RECEIPT_SUSTAINED_LINES),
+            "sitting exactly ON both thresholds is still ordinary use"
+        );
+    }
+
+    // Either shape of high volume collapses: a bursty block, or a sustained drip
+    // that never makes any single block bursty.
+    #[test]
+    fn burst_or_sustained_volume_digests() {
+        assert!(
+            should_digest_receipts(RECEIPT_BURST_LINES + 1, 0),
+            "one bursty block digests even with no history"
+        );
+        assert!(
+            should_digest_receipts(1, RECEIPT_SUSTAINED_LINES + 1),
+            "a steady drip digests even though no single block is bursty"
+        );
+    }
+
+    #[test]
+    fn receipt_rate_only_counts_inside_the_window() {
+        let mut rate = NoticeRate::new();
+        let t0 = Instant::now();
+        rate.record(t0, 5);
+        assert_eq!(rate.recent(t0), 5);
+
+        // Still inside the window.
+        let inside = t0 + RECEIPT_RATE_WINDOW;
+        rate.record(inside, 3);
+        assert_eq!(rate.recent(inside), 8);
+
+        // Past it: the first entry ages out, the second survives.
+        let outside = t0 + RECEIPT_RATE_WINDOW + Duration::from_secs(1);
+        assert_eq!(rate.recent(outside), 3);
+
+        // Long idle — an ordinary wallet returning after a quiet spell must be
+        // back to verbose, not stuck in digest mode.
+        let much_later = outside + RECEIPT_RATE_WINDOW * 10;
+        assert_eq!(rate.recent(much_later), 0);
+        assert!(!should_digest_receipts(1, rate.recent(much_later)));
+    }
+
+    // The reason the counter tracks payments rather than printed lines: under
+    // steady load, counting lines would let one digest read as "volume is low"
+    // and flip the display back to verbose, oscillating every block.
+    #[test]
+    fn sustained_load_stays_digested_rather_than_oscillating() {
+        let mut rate = NoticeRate::new();
+        let mut now = Instant::now();
+        let per_block = RECEIPT_BURST_LINES + 1; // bursty enough to digest on its own
+
+        // First block digests on the burst rule alone.
+        assert!(should_digest_receipts(per_block, rate.recent(now)));
+        rate.record(now, per_block);
+
+        // Ten more blocks at the same rate: each must STAY digested. Had the
+        // counter recorded one line per digest, `recent` would sit near zero and
+        // these would flip back to per-payment output.
+        for _ in 0..10 {
+            now += Duration::from_secs(5); // one block apart
+            let recent = rate.recent(now);
+            assert!(
+                should_digest_receipts(per_block, recent),
+                "sustained load must stay digested (recent={})",
+                recent
+            );
+            rate.record(now, per_block);
+        }
+    }
+
+    // A block carrying thousands of deposits must cost one deque entry, not one
+    // per payment, or the tracker itself becomes the memory problem.
+    #[test]
+    fn receipt_rate_is_bounded_by_blocks_not_payments() {
+        let mut rate = NoticeRate::new();
+        let now = Instant::now();
+        rate.record(now, 10_000);
+        assert_eq!(rate.seen.len(), 1);
+        assert_eq!(rate.recent(now), 10_000);
+    }
+
+    // The running total is an optimisation; if it ever disagrees with the deque
+    // the whole policy silently reads the wrong number.
+    #[test]
+    fn notice_rate_running_total_matches_the_deque_after_eviction() {
+        let mut rate = NoticeRate::new();
+        let t0 = Instant::now();
+        for i in 0..40u64 {
+            let at = t0 + Duration::from_secs(i * 5);
+            rate.record(at, (i as usize % 7) + 1);
+            let observed = rate.recent(at);
+            let summed: usize = rate.seen.iter().map(|(_, n)| *n).sum();
+            assert_eq!(observed, summed, "running total drifted at step {i}");
+        }
+    }
+
+    // ---- whisper flood control -------------------------------------------
+    //
+    // The half that is NOT allowed to change: the whisper is a product feature,
+    // so ordinary use keeps the full per-whisper line with its code.
+
+    // A reorg re-scans the tip, so the notice task sees the same credit twice. It must report
+    // it once — while still reporting a DIFFERENT transaction that arrives at the same height,
+    // which is equally possible after a reorg.
+    #[test]
+    fn a_credit_is_announced_once_across_a_reorg_rescan() {
+        let mut announced = AnnouncedCredits::new();
+        let tx = tx_with_sig_hash("aa", "bb", 100, "sig-one");
+
+        assert!(announced.first_sighting(&tx), "first sighting reports");
+        assert!(
+            !announced.first_sighting(&tx),
+            "the re-scan must not report it again"
+        );
+
+        // Same envelope, different signing: a distinct message, still reported.
+        let resigned = tx_with_sig_hash("aa", "bb", 100, "sig-two");
+        assert!(
+            announced.first_sighting(&resigned),
+            "a different signing is a different credit"
+        );
+
+        // A different payment entirely.
+        let other = tx_with_sig_hash("aa", "bb", 101, "sig-one");
+        assert!(
+            announced.first_sighting(&other),
+            "a distinct payment reports"
+        );
+    }
+
+    // The memory is bounded, and it forgets in the safe direction: an evicted entry may print
+    // twice, but a fresh credit is never suppressed.
+    #[test]
+    fn announced_credit_memory_is_bounded_and_forgets_oldest_first() {
+        let mut announced = AnnouncedCredits::new();
+        for i in 0..ANNOUNCED_CREDIT_MEMORY + 64 {
+            let tx = tx_with_sig_hash("aa", "bb", i as u64, "sig");
+            assert!(
+                announced.first_sighting(&tx),
+                "every distinct credit reports"
+            );
+        }
+        assert!(
+            announced.order.len() <= ANNOUNCED_CREDIT_MEMORY,
+            "the queue must stay bounded"
+        );
+        assert_eq!(
+            announced.seen.len(),
+            announced.order.len(),
+            "the set and the queue must not drift apart"
+        );
+        // The newest are still remembered.
+        let newest = tx_with_sig_hash("aa", "bb", (ANNOUNCED_CREDIT_MEMORY + 63) as u64, "sig");
+        assert!(
+            !announced.first_sighting(&newest),
+            "the most recent credit must still be remembered"
+        );
+    }
+
+    fn tx_with_sig_hash(from: &str, to: &str, timestamp: u64, sig_hash: &str) -> Transaction {
+        Transaction {
+            sender: from.to_string(),
+            recipient: to.to_string(),
+            fee_units: 10_000,
+            amount_units: 100_000_000,
+            timestamp,
+            signature: Some("ab".repeat(80)),
+            pub_key: Some("cd".repeat(32)),
+            sig_hash: Some(sig_hash.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_single_whisper_never_digests() {
+        assert!(!should_digest_whispers(1, 0));
+    }
+
+    #[test]
+    fn sitting_exactly_on_both_whisper_thresholds_is_still_verbose() {
+        assert!(
+            !should_digest_whispers(WHISPER_BURST_LINES, WHISPER_SUSTAINED_LINES),
+            "both comparisons must stay strictly greater-than"
+        );
+    }
+
+    #[test]
+    fn a_bursty_block_of_whispers_digests() {
+        assert!(should_digest_whispers(WHISPER_BURST_LINES + 1, 0));
+    }
+
+    // A drip that never makes any single block bursty still has to collapse —
+    // and the threshold has to be reachable at the real block cadence. Blocks
+    // land every ~5.5s, so ~10 fall inside the 60s window; a threshold at or
+    // above that would let a 1-per-block drip age out as fast as it accrues and
+    // never digest at all.
+    #[test]
+    fn a_sustained_drip_digests_without_any_bursty_block() {
+        assert!(should_digest_whispers(1, WHISPER_SUSTAINED_LINES + 1));
+        let blocks_per_window = RECEIPT_RATE_WINDOW.as_secs_f64() / 5.5;
+        assert!(
+            (WHISPER_SUSTAINED_LINES as f64) < blocks_per_window,
+            "threshold {} is unreachable by a 1-per-block drip ({:.1} blocks/window)",
+            WHISPER_SUSTAINED_LINES,
+            blocks_per_window
+        );
+    }
+
+    // The reason the two classes get separate counters: whisper spam is the
+    // cheapest traffic on the chain, and the payment digest is lossy. If one
+    // budget were shared, a flood of 0.0001 ♦ messages would collapse the credit
+    // lines an exchange needs to see.
+    #[test]
+    fn whisper_and_payment_budgets_are_independent() {
+        let whisper_flood = WHISPER_SUSTAINED_LINES + 1;
+        assert!(should_digest_whispers(1, whisper_flood));
+        assert!(
+            !should_digest_receipts(1, whisper_flood),
+            "whisper volume must never collapse payment lines"
+        );
+        let payment_flood = RECEIPT_BURST_LINES + 1;
+        assert!(
+            !should_digest_whispers(0, 0) && !should_digest_whispers(payment_flood.min(2), 0),
+            "payment volume must never collapse whisper lines"
+        );
+    }
+
+    #[test]
+    fn rollup_is_immediate_when_nothing_was_emitted_yet() {
+        assert!(whisper_rollup_due(None, Instant::now()));
+    }
+
+    #[test]
+    fn rollup_emits_at_most_once_per_interval() {
+        let t0 = Instant::now();
+        assert!(!whisper_rollup_due(
+            Some(t0),
+            t0 + WHISPER_ROLLUP_INTERVAL - Duration::from_secs(1)
+        ));
+        assert!(whisper_rollup_due(Some(t0), t0 + WHISPER_ROLLUP_INTERVAL));
+    }
+
+    fn accum_of(items: &[(&str, &str, f64)]) -> WhisperAccum {
+        let mut a = WhisperAccum::new();
+        let v: Vec<(String, String, f64)> = items
+            .iter()
+            .map(|(f, c, amt)| (f.to_string(), c.to_string(), *amt))
+            .collect();
+        a.merge(1000, &v);
+        a
+    }
+
+    #[test]
+    fn fold_groups_by_code_and_orders_by_count_then_alphabetically() {
+        let a = accum_of(&[
+            ("aa", "ZQQL", 0.1),
+            ("bb", "MSGM", 0.1),
+            ("cc", "BAIT", 0.1),
+            ("dd", "MSGM", 0.1),
+            ("ee", "BAIT", 0.1),
+            ("ff", "MSGM", 0.1),
+        ]);
+        let ordered: Vec<String> = a.ordered_codes().into_iter().map(|(c, _)| c).collect();
+        assert_eq!(ordered, vec!["MSGM", "BAIT", "ZQQL"]);
+    }
+
+    // A digest that shows codes but loses the value would hide real money: the
+    // fee band is not exclusive, so ordinary payments land in it.
+    #[test]
+    fn fold_totals_the_value_so_a_digest_never_hides_money() {
+        let a = accum_of(&[
+            ("aa", "ABCD", 1.5),
+            ("bb", "ABCD", 2.25),
+            ("cc", "EFGH", 0.25),
+        ]);
+        assert_eq!(a.count, 3);
+        assert_eq!(a.senders.len(), 3);
+        assert!((a.total - 4.0).abs() < 1e-9, "total was {}", a.total);
+        assert!(a.render().contains("4.00000000 ♦"));
+    }
+
+    #[test]
+    fn fold_is_deterministic_regardless_of_input_order() {
+        let forward = accum_of(&[
+            ("aa", "ABCD", 0.1),
+            ("bb", "EFGH", 0.1),
+            ("cc", "ABCD", 0.1),
+        ]);
+        let reverse = accum_of(&[
+            ("cc", "ABCD", 0.1),
+            ("bb", "EFGH", 0.1),
+            ("aa", "ABCD", 0.1),
+        ]);
+        assert_eq!(forward.ordered_codes(), reverse.ordered_codes());
+        assert_eq!(forward.render(), reverse.render());
+    }
+
+    #[test]
+    fn fit_never_exceeds_the_budget_and_accounts_for_the_more_tail() {
+        let tokens: Vec<(String, usize)> = (0..40)
+            .map(|i| (format!("C{:03}", i), (i % 5) + 1))
+            .collect();
+        let total: usize = tokens.iter().map(|(_, n)| *n).sum();
+        for budget in 10..=WHISPER_CODE_BUDGET_COLS {
+            let (shown, unshown) = fit_code_tokens(&tokens, budget, total);
+            let mut line = shown.join("  ");
+            if unshown > 0 {
+                line.push_str(&format!("  +{unshown} more"));
+            }
+            assert!(
+                line.chars().count() <= budget || shown.len() == 1,
+                "budget {budget} overflowed: {:?} ({} cols)",
+                line,
+                line.chars().count()
+            );
+        }
+    }
+
+    // The tail counts WHISPERS, the same unit as the header. Mixing units (some
+    // codes omitted by the fitter, some whispers dropped at the key cap) gives a
+    // number that corresponds to no real quantity — and one the fitter never
+    // reserved room for.
+    #[test]
+    fn fit_tail_is_whispers_and_always_reconciles_with_the_total() {
+        let tokens: Vec<(String, usize)> = (0..40)
+            .map(|i| (format!("C{:03}", i), (i % 7) + 1))
+            .collect();
+        let listed: usize = tokens.iter().map(|(_, n)| *n).sum();
+        // 9_000 whispers whose codes never reached the map, as after the key cap.
+        let total = listed + 9_000;
+        for budget in 10..=WHISPER_CODE_BUDGET_COLS {
+            let (shown, unshown) = fit_code_tokens(&tokens, budget, total);
+            let shown_whispers: usize = shown
+                .iter()
+                .map(|s| {
+                    s.split_once(" ×")
+                        .map_or(1, |(_, n)| n.parse::<usize>().unwrap())
+                })
+                .sum();
+            assert_eq!(
+                shown_whispers + unshown,
+                total,
+                "budget {budget}: tail does not reconcile"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_always_shows_at_least_one_code() {
+        let tokens = vec![("ABCD".to_string(), 3), ("EFGH".to_string(), 1)];
+        let (shown, unshown) = fit_code_tokens(&tokens, 1, 4);
+        assert_eq!(shown.len(), 1, "never emit a bare +N more");
+        assert_eq!(unshown, 1);
+    }
+
+    // `×` is two bytes and one column. Measuring bytes would truncate a line
+    // that actually fits.
+    #[test]
+    fn fit_measures_columns_not_bytes() {
+        let tokens = vec![("ABCD".to_string(), 12), ("EFGH".to_string(), 34)];
+        // "ABCD ×12" + "  " + "EFGH ×34" = 18 columns but 20 bytes.
+        let (shown, unshown) = fit_code_tokens(&tokens, 18, 46);
+        assert_eq!(
+            unshown, 0,
+            "both tokens fit in 18 columns and must be shown"
+        );
+        let line = shown.join("  ");
+        assert_eq!(line.chars().count(), 18);
+        assert_eq!(line.len(), 20, "…even though they are 20 BYTES");
+    }
+
+    // One address emitting many distinct codes is the canonical spam shape. The
+    // sender count is EXACT there, and must not be reported as a lower bound —
+    // that would read as many attackers instead of one.
+    #[test]
+    fn a_code_space_flood_from_one_sender_still_reports_one_sender() {
+        let mut a = WhisperAccum::new();
+        let many: Vec<(String, String, f64)> = (0..WHISPER_ACCUM_MAX_KEYS * 4)
+            .map(|i| ("ff9662e312".to_string(), format!("{i:04}"), 0.001))
+            .collect();
+        a.merge(700, &many);
+        assert!(a.codes_saturated, "the code map must be saturated");
+        assert!(
+            !a.senders_saturated,
+            "one sender never saturates the sender cap"
+        );
+        let line = a.render();
+        assert!(line.contains("from 1 sender "), "got: {line}");
+        assert!(
+            !line.contains("1+ sender"),
+            "exact count reported as a bound"
+        );
+    }
+
+    // The tip signal re-scans the tip on a reorg, so a height at or below one
+    // already folded can arrive second. The span must stay readable.
+    #[test]
+    fn the_rollup_span_is_ordered_however_the_heights_arrive() {
+        let mut a = WhisperAccum::new();
+        a.merge(512, &[("aa".into(), "ABCD".into(), 0.1)]);
+        a.merge(500, &[("bb".into(), "EFGH".into(), 0.1)]);
+        assert_eq!((a.first_block, a.last_block), (500, 512));
+        assert!(a.render().contains("blocks 500-512"));
+    }
+
+    // A catch-up scan replays thousands of blocks inside one rollup window and
+    // the code space is 26^4, so the fold needs a ceiling that does not depend
+    // on how far behind the client was. Nothing may be double counted.
+    #[test]
+    fn accumulator_is_bounded_but_still_counts_everything() {
+        let mut a = WhisperAccum::new();
+        let many: Vec<(String, String, f64)> = (0..5_000)
+            .map(|i| (format!("s{i}"), format!("{:04}", i), 0.001))
+            .collect();
+        a.merge(1, &many);
+        assert_eq!(a.count, 5_000, "every whisper stays counted");
+        assert!(a.codes.len() <= WHISPER_ACCUM_MAX_KEYS);
+        assert!(a.senders.len() <= WHISPER_ACCUM_MAX_KEYS);
+        assert!((a.total - 5.0).abs() < 1e-6);
+        assert!(
+            a.render().contains("+ senders"),
+            "saturation must be visible"
+        );
+    }
+
+    // The rollup anchor names a range once it spans blocks, so a reader can find
+    // the traffic in `history`/`whisper`.
+    #[test]
+    fn rollup_anchor_names_the_block_span() {
+        let mut a = WhisperAccum::new();
+        a.merge(500, &[("aa".into(), "ABCD".into(), 0.1)]);
+        assert!(a.render().contains("block 500"));
+        a.merge(512, &[("bb".into(), "EFGH".into(), 0.1)]);
+        assert!(a.render().contains("blocks 500-512"));
+    }
+
+    // Every notice line lives in the same 80-column budget as the rest of the
+    // client. ANSI runs are zero-width, so they are stripped before measuring.
+    #[test]
+    fn every_whisper_notice_line_fits_eighty_columns() {
+        fn plain(s: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            for line in s.split('\n') {
+                let mut clean = String::new();
+                let mut chars = line.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\x1b' {
+                        for e in chars.by_ref() {
+                            if e == 'm' {
+                                break;
+                            }
+                        }
+                    } else {
+                        clean.push(c);
+                    }
+                }
+                out.push(clean);
+            }
+            out
+        }
+
+        // Several saturated shapes. The one that used to overflow is a flood
+        // whose unlisted tail has MORE DIGITS than anything the code map holds —
+        // the reservation and the printed number must be the same quantity.
+        let mut wide_tail = WhisperAccum::new();
+        for round in 0..40u32 {
+            let batch: Vec<(String, String, f64)> = (0..5_000)
+                .map(|i| {
+                    (
+                        format!("sender{i}"),
+                        format!("{:04}", i + round as usize * 5_000),
+                        9.87654321,
+                    )
+                })
+                .collect();
+            wide_tail.merge(291_044 + round, &batch);
+        }
+        // Narrow vocabulary, huge counts — every shown token carries "×N".
+        let mut wide_counts = WhisperAccum::new();
+        let batch: Vec<(String, String, f64)> = (0..60_000)
+            .map(|i| (format!("s{}", i % 3), format!("{:04}", i % 900), 0.001))
+            .collect();
+        wide_counts.merge(1, &batch);
+        wide_counts.merge(9_999_999, &batch);
+
+        // Worst case: a saturated rollup at maximum plausible width.
+        let mut a = WhisperAccum::new();
+        let many: Vec<(String, String, f64)> = (0..3_000)
+            .map(|i| (format!("sender{i}"), format!("{:04}", i), 9.87654321))
+            .collect();
+        a.merge(291_044, &many);
+        a.merge(999_999, &many);
+
+        for (label, rendered) in [
+            ("wide tail", wide_tail.render()),
+            ("wide counts", wide_counts.render()),
+            (
+                "single",
+                format!(
+                    "\n{}whisper{}   {}XKQF{}  {:.8} ♦  from {}…  {}block {}{}",
+                    EV_WHISPER,
+                    EV_OFF,
+                    EV_CODE,
+                    EV_OFF,
+                    12345.6789,
+                    "c3d4e5f6a7",
+                    EV_DIM,
+                    999_999,
+                    EV_OFF
+                ),
+            ),
+            ("rollup", a.render()),
+        ] {
+            for line in plain(&rendered) {
+                assert!(
+                    line.chars().count() <= 80,
+                    "{label} line is {} columns: {:?}",
+                    line.chars().count(),
+                    line
+                );
+            }
+        }
+    }
+
+    // Drives the exact sequence the notice task runs, over a flood that starts,
+    // sustains and stops. Locks the three properties the whole feature exists
+    // for: nothing is printed twice, nothing is lost, and a sustained flood
+    // cannot pin the terminal at one notice per block.
+    #[test]
+    fn a_flood_is_bounded_then_flushes_and_loses_nothing() {
+        let mut rate = NoticeRate::new();
+        let mut accum = WhisperAccum::new();
+        let mut last_emit: Option<Instant> = None;
+        let mut now = Instant::now();
+
+        let mut verbose_printed = 0usize;
+        let mut rollups = 0usize;
+        let mut reported = 0usize; // whispers accounted for in some output
+        let mut offered = 0usize;
+
+        // 60 blocks: 2 quiet, then 40 flooded at 25/block, then 18 quiet.
+        for block in 0u32..60 {
+            let n = match block {
+                0..=1 => 1,
+                2..=41 => 25,
+                _ => 0,
+            };
+            offered += n;
+            let batch: Vec<(String, String, f64)> = (0..n)
+                .map(|i| (format!("s{i}"), format!("C{:03}", i % 97), 0.001))
+                .collect();
+
+            if n > 0 {
+                let recent = rate.recent(now);
+                rate.record(now, n);
+                if whisper_action(n, recent, !accum.is_empty()) == WhisperAction::Verbose {
+                    verbose_printed += n;
+                    reported += n;
+                } else {
+                    accum.merge(block, &batch);
+                }
+            }
+            if !accum.is_empty() && whisper_rollup_due(last_emit, now) {
+                reported += accum.count;
+                rollups += 1;
+                accum.clear();
+                last_emit = Some(now);
+            }
+            now += Duration::from_secs(5); // one block
+        }
+
+        assert_eq!(verbose_printed, 2, "the two quiet blocks stay verbose");
+        assert!(
+            accum.is_empty(),
+            "the rollup must flush once the flood stops"
+        );
+        assert_eq!(
+            reported, offered,
+            "every whisper is accounted for exactly once"
+        );
+
+        // 40 flooded blocks span 200s. Without the cooldown that is 40 notices;
+        // with a 30s interval it must be far fewer, and never more than one per
+        // interval.
+        assert!(
+            rollups <= 200 / WHISPER_ROLLUP_INTERVAL.as_secs() as usize + 2,
+            "flood produced {rollups} notices — cooldown is not bounding output"
+        );
+        assert!(
+            rollups >= 2,
+            "a 200s flood must still report more than once"
+        );
+    }
+
+    // The rule that keeps a rollup from being reported twice: once one is
+    // pending, a quiet block joins it instead of printing ahead of it.
+    #[test]
+    fn a_pending_rollup_absorbs_a_later_quiet_block() {
+        assert_eq!(whisper_action(1, 0, false), WhisperAction::Verbose);
+        assert_eq!(
+            whisper_action(1, 0, true),
+            WhisperAction::Fold,
+            "a quiet block must not print ahead of an older pending rollup"
+        );
+    }
+
+    #[test]
+    fn short_addr_never_panics_on_non_ascii() {
+        assert_eq!(short_addr("ff9662e312afb7e14103"), "ff9662e312");
+        assert_eq!(short_addr("é".repeat(40).as_str()).chars().count(), 10);
+        assert_eq!(short_addr("ab"), "ab");
+    }
+
+    #[test]
+    fn consensus_fingerprint_commits_all_activated_consensus_rules() {
+        let db = store::Store::temporary().expect("temporary fingerprint DB");
+        let blockchain = Blockchain::new(
+            db,
+            0.0005,
+            1.0,
+            10,
+            TARGET_BLOCK_TIME as u32,
+            Arc::new(RateLimiter::new(60, 1_000)),
+            Arc::new(Mutex::new(321)),
+        );
+        let (descriptor, _) = compute_consensus_fingerprint(&blockchain);
+
+        for component in [
+            format!("hdr_rules_ver={CONSENSUS_HEADER_RULES_VERSION}"),
+            format!("hdr_future={MAX_BLOCK_FUTURE_TIME}"),
+            format!("fee_rules_ver={FEE_ACCOUNTING_RULES_VERSION}"),
+            format!("fee_activation={FEE_SYSTEM_ACTIVATION_HEIGHT}"),
+            format!("fee_envelope_units={LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS}"),
+            format!("max_block_weight={MAX_BLOCK_WEIGHT_BYTES}"),
+            format!("network_fee={NETWORK_FEE:.8}"),
+            format!("mint_clip={MINT_CLIP:.8}"),
+            format!("reward_rules_ver={REWARD_CURVE_RULES_VERSION}"),
+            format!("reward_activation={REWARD_CURVE_V2_ACTIVATION_HEIGHT}"),
+            format!(
+                "reward_fee_share={REWARD_V2_MINER_FEE_NUMERATOR}/{REWARD_V2_MINER_FEE_DENOMINATOR}"
+            ),
+        ] {
+            assert!(
+                descriptor.contains(&component),
+                "fingerprint descriptor omitted {component}"
+            );
+        }
+    }
+
+    // Arrow-up recall must fire ONLY for a bare arrow-up escape typed as the whole line in the
+    // raw-stdin fallback — never for a payload that merely contains an ESC byte or "[A", which
+    // the old substring heuristic matched and could use to silently re-fire a funded command.
+    #[test]
+    fn is_recall_line_matches_only_bare_arrow_up_in_fallback() {
+        // Fallback (no editor): the two bare arrow-up escapes recall; nothing else does.
+        assert!(is_recall_line("\u{1b}[A", false));
+        assert!(is_recall_line("\u{1b}OA", false));
+        assert!(!is_recall_line("whisper addr 5 [A]", false));
+        assert!(!is_recall_line("create a b 5", false));
+        assert!(!is_recall_line("a message with an \u{1b} esc byte", false));
+        assert!(!is_recall_line("[A", false));
+        assert!(!is_recall_line("", false));
+
+        // With an editor present, rustyline consumes arrow-up itself, so recall never fires —
+        // not even for the raw escape (it cannot reach `command` in that path).
+        assert!(!is_recall_line("\u{1b}[A", true));
+        assert!(!is_recall_line("\u{1b}OA", true));
+    }
+
+    // Bootstrap snapshot compression: the published zip switched from Stored to
+    // Deflated (7.8.3). This proves the change is (a) LOSSLESS — extracting a
+    // Deflated archive the way a client does reproduces the source DB byte-for-byte
+    // and it reopens with the same keys, and (b) actually smaller than Stored on
+    // low-entropy content (the sled import padding the real snapshot is full of).
+    // Runs entirely on a throwaway temp DB — never touches any live instance.
+    #[test]
+    fn bootstrap_archive_deflate_roundtrips_lossless_and_smaller() {
+        use std::io::Read;
+        let uniq = std::process::id();
+        let src_dir = std::env::temp_dir().join(format!("a9_ziptest_src_{}", uniq));
+        let out_dir = std::env::temp_dir().join(format!("a9_ziptest_out_{}", uniq));
+        let defl_zip = std::env::temp_dir().join(format!("a9_ziptest_defl_{}.zip", uniq));
+        let stor_zip = std::env::temp_dir().join(format!("a9_ziptest_stor_{}.zip", uniq));
+        for p in [&src_dir, &out_dir] {
+            let _ = std::fs::remove_dir_all(p);
+        }
+
+        // Build a throwaway chain store in the NEW artifact shape ({dir}/chain.redb):
+        // block_ keys + low-entropy padding so DEFLATE has something to work with.
+        // Closed (durably flushed) before we zip the directory.
+        {
+            std::fs::create_dir_all(&src_dir).unwrap();
+            let db = store::Store::open(src_dir.join(CHAIN_DB_FILE), 8 * 1024 * 1024).unwrap();
+            for h in 0u32..64 {
+                let b = reconcile_test_block(h, (h % 251) as u8);
+                db.insert(
+                    format!("block_{}", h).as_bytes(),
+                    alphanumeric::a9::codec::serialize(&b).unwrap(),
+                )
+                .unwrap();
+            }
+            for i in 0u32..40 {
+                db.insert(format!("pad_{}", i).as_bytes(), vec![0u8; 32 * 1024])
+                    .unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        let defl =
+            write_bootstrap_archive_zip(&src_dir, &defl_zip, zip::CompressionMethod::Deflated)
+                .unwrap();
+        let stor = write_bootstrap_archive_zip(&src_dir, &stor_zip, zip::CompressionMethod::Stored)
+            .unwrap();
+
+        // Same logical content either way (compression changes only the on-wire size).
+        assert_eq!(defl.file_count, stor.file_count);
+        assert_eq!(defl.extracted_bytes, stor.extracted_bytes);
+        let defl_size = std::fs::metadata(&defl_zip).unwrap().len();
+        let stor_size = std::fs::metadata(&stor_zip).unwrap().len();
+        assert!(
+            defl_size < stor_size,
+            "deflated {defl_size} must be < stored {stor_size}"
+        );
+
+        // Extract the DEFLATED archive exactly the way a client does (zip crate).
+        std::fs::create_dir_all(&out_dir).unwrap();
+        {
+            let f = std::fs::File::open(&defl_zip).unwrap();
+            let mut archive = zip::ZipArchive::new(f).unwrap();
+            for i in 0..archive.len() {
+                let mut zf = archive.by_index(i).unwrap();
+                let rel = zf.name().to_string();
+                let outpath = out_dir.join(&rel);
+                if rel.ends_with('/') {
+                    std::fs::create_dir_all(&outpath).unwrap();
+                } else {
+                    if let Some(parent) = outpath.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    let mut buf = Vec::new();
+                    zf.read_to_end(&mut buf).unwrap();
+                    std::fs::write(&outpath, buf).unwrap();
+                }
+            }
+        }
+
+        // (a) LOSSLESS: every source file is byte-identical in the extraction.
+        fn assert_tree_identical(a: &std::path::Path, b: &std::path::Path) {
+            for entry in std::fs::read_dir(a).unwrap() {
+                let entry = entry.unwrap();
+                let ap = entry.path();
+                let bp = b.join(entry.file_name());
+                if ap.is_dir() {
+                    assert!(bp.is_dir(), "missing dir after round-trip: {bp:?}");
+                    assert_tree_identical(&ap, &bp);
+                } else {
+                    assert_eq!(
+                        std::fs::read(&ap).unwrap(),
+                        std::fs::read(&bp).unwrap(),
+                        "byte mismatch after round-trip: {ap:?}"
+                    );
+                }
+            }
+        }
+        assert_tree_identical(&src_dir, &out_dir);
+
+        // (b) The extracted DB reopens with every block_ key intact.
+        {
+            let db = open_chain_db_aux(out_dir.to_str().unwrap()).unwrap();
+            for h in 0u32..64 {
+                assert!(
+                    db.get(format!("block_{}", h).as_bytes()).unwrap().is_some(),
+                    "block_{h} missing after round-trip"
+                );
+            }
+        }
+        assert_eq!(local_tip_height(out_dir.to_str().unwrap()), Some(63));
+
+        for p in [&src_dir, &out_dir] {
+            let _ = std::fs::remove_dir_all(p);
+        }
+        let _ = std::fs::remove_file(&defl_zip);
+        let _ = std::fs::remove_file(&stor_zip);
+    }
+
+    // Isolated REAL-DATA validation: run the actual snapshot zip helper against a COPY
+    // of a real chain DB (NEVER the live publisher), confirm the Deflated archive
+    // extracts to a boot-VALID DB (the client's own local_launch_db_status), the tip
+    // survives, and report the real compression ratio. Ignored by default; run with:
+    //   ALPHANUMERIC_TEST_DB=/path/to/copy-of-blockchain.db \
+    //     cargo test bootstrap_archive_deflate_real_db -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bootstrap_archive_deflate_real_db() {
+        use std::io::Read;
+        let src = match std::env::var("ALPHANUMERIC_TEST_DB") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                eprintln!("set ALPHANUMERIC_TEST_DB to a COPY of a real blockchain.db dir");
+                return;
+            }
+        };
+        assert!(
+            src.is_dir(),
+            "ALPHANUMERIC_TEST_DB must be a sled dir: {src:?}"
+        );
+        let uniq = std::process::id();
+        let out_dir = std::env::temp_dir().join(format!("a9_realzip_out_{}", uniq));
+        let defl_zip = std::env::temp_dir().join(format!("a9_realzip_defl_{}.zip", uniq));
+        let stor_zip = std::env::temp_dir().join(format!("a9_realzip_stor_{}.zip", uniq));
+        let _ = std::fs::remove_dir_all(&out_dir);
+
+        // The helper only READS the source dir (no sled lock), safe on a static copy.
+        write_bootstrap_archive_zip(&src, &defl_zip, zip::CompressionMethod::Deflated).unwrap();
+        write_bootstrap_archive_zip(&src, &stor_zip, zip::CompressionMethod::Stored).unwrap();
+        let defl_size = std::fs::metadata(&defl_zip).unwrap().len();
+        let stor_size = std::fs::metadata(&stor_zip).unwrap().len();
+        eprintln!(
+            "REAL DB: stored {:.1} MB -> deflated {:.1} MB ({:.1}x smaller download)",
+            stor_size as f64 / 1e6,
+            defl_size as f64 / 1e6,
+            stor_size as f64 / defl_size.max(1) as f64
+        );
+        assert!(defl_size < stor_size);
+
+        // Extract the Deflated archive the way a client does, then confirm it BOOTS.
+        std::fs::create_dir_all(&out_dir).unwrap();
+        {
+            let f = std::fs::File::open(&defl_zip).unwrap();
+            let mut archive = zip::ZipArchive::new(f).unwrap();
+            for i in 0..archive.len() {
+                let mut zf = archive.by_index(i).unwrap();
+                let rel = zf.name().to_string();
+                let outpath = out_dir.join(&rel);
+                if rel.ends_with('/') {
+                    std::fs::create_dir_all(&outpath).unwrap();
+                } else {
+                    if let Some(parent) = outpath.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    let mut buf = Vec::new();
+                    zf.read_to_end(&mut buf).unwrap();
+                    std::fs::write(&outpath, buf).unwrap();
+                }
+            }
+        }
+        let status = local_launch_db_status(out_dir.to_str().unwrap());
+        let tip = local_tip_height(out_dir.to_str().unwrap());
+        eprintln!("extracted real DB -> launch status {status:?}, tip {tip:?}");
+        assert!(
+            matches!(status, LaunchDbStatus::Valid),
+            "extracted real DB must be boot-valid, got {status:?}"
+        );
+        assert!(tip.is_some(), "extracted real DB must have a tip");
+
+        let _ = std::fs::remove_dir_all(&out_dir);
+        let _ = std::fs::remove_file(&defl_zip);
+        let _ = std::fs::remove_file(&stor_zip);
+    }
+
+    fn reconcile_test_block(index: u32, tag: u8) -> Block {
+        Block {
+            index,
+            previous_hash: [tag; 32],
+            timestamp: 1_000 + index as u64,
+            transactions: Vec::new(),
+            nonce: 0,
+            difficulty: 0,
+            hash: [tag; 32],
+            merkle_root: [0u8; 32],
+        }
+    }
+
+    /// Fresh sled DB at a unique temp path holding the given (height, hash-tag)
+    /// blocks; handle dropped so canonical_reconcile_decision can re-open by path.
+    fn reconcile_test_db(name: &str, heights: &[(u32, u8)]) -> String {
+        let path =
+            std::env::temp_dir().join(format!("a9_reconcile_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        let db = store::Store::open(path.join(CHAIN_DB_FILE), 8 * 1024 * 1024).unwrap();
+        for (h, tag) in heights {
+            let b = reconcile_test_block(*h, *tag);
+            db.insert(
+                format!("block_{}", h).as_bytes(),
+                alphanumeric::a9::codec::serialize(&b).unwrap(),
+            )
+            .unwrap();
+        }
+        db.flush().unwrap();
+        drop(db);
+        path.to_string_lossy().into_owned()
+    }
+
+    fn manifest_at(height: u64, tag: u8) -> Result<BootstrapManifestPointer> {
+        Ok(BootstrapManifestPointer {
+            url: String::new(),
+            network_id: None,
+            height: Some(height),
+            tip_hash: Some(hex::encode([tag; 32])),
+            sha256: None,
+            compressed_bytes: None,
+            extracted_bytes: None,
+            file_count: None,
+            format: None,
+            publisher_pubkey: String::new(),
+            manifest_sig: String::new(),
+            updated_at: 0,
+        })
+    }
+
+    // In sync: we hold the canonical block at the manifest height -> keep the DB.
+    #[test]
+    fn reconcile_in_sync_when_local_holds_canonical_tip_hash() {
+        let db = reconcile_test_db("insync", &[(100, 7)]);
+        let m = manifest_at(100, 7);
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(100), None, None),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+    }
+
+    // The idle-reconcile snapshot gate: a SERVICE node (exchange/explorer/
+    // web-wallet) must self-terminate ONLY when it is genuinely too far behind
+    // to catch up incrementally (> ORPHAN_REORG_DEPTH), never on a transient
+    // "behind but catchable" body-starvation stall — that false positive used
+    // to take services offline every ~minute.
+    #[test]
+    fn idle_snapshot_gate_stays_up_on_behind_prefix_but_exits_on_fork_or_too_far() {
+        let depth = alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH;
+        // NOT forked, within incremental range: STAY UP (false).
+        // Caught up.
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(1000), false));
+        // One block behind.
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(1001), false));
+        // At the finality window.
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(1000 + 64), false));
+        // Exactly at the bound is not beyond the bound.
+        assert!(!idle_reconcile_needs_snapshot(
+            1000,
+            Some(1000 + depth),
+            false
+        ));
+        // NOT forked, beyond the bound: genuinely aged out -> re-bootstrap (true).
+        assert!(idle_reconcile_needs_snapshot(
+            1000,
+            Some(1000 + depth + 1),
+            false
+        ));
+        assert!(idle_reconcile_needs_snapshot(0, Some(50_000), false));
+        // NOT forked, beacon behind local (we are AHEAD): never re-bootstrap.
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(500), false));
+        // NOT forked, beacon unreachable: never nuke on an unconfirmable gap.
+        assert!(!idle_reconcile_needs_snapshot(1000, None, false));
+        // FORKED overrides EVERYTHING — re-bootstrap even at a tiny gap, even
+        // "caught up", even with no beacon: a forked service serves wrong data.
+        // One block behind but forked.
+        assert!(idle_reconcile_needs_snapshot(1000, Some(1001), true));
+        // "Caught up" on a fork.
+        assert!(idle_reconcile_needs_snapshot(1000, Some(1000), true));
+        // Forked with the beacon unavailable.
+        assert!(idle_reconcile_needs_snapshot(1000, None, true));
+        // Forked and ahead by height.
+        assert!(idle_reconcile_needs_snapshot(1000, Some(500), true));
+        // Saturation safety: no underflow/overflow at the u32 extremes.
+        assert!(!idle_reconcile_needs_snapshot(u32::MAX, Some(0), false));
+        assert!(idle_reconcile_needs_snapshot(0, Some(u32::MAX), false));
+    }
+
+    // Fork at the signed checkpoint: hash mismatch at the manifest height must
+    // re-bootstrap immediately (2026-07-08 stranded-fork recovery), never stream.
+    #[test]
+    fn reconcile_fork_at_checkpoint_diverges_immediately() {
+        let db = reconcile_test_db("fork", &[(100, 8)]);
+        let m = manifest_at(100, 7);
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(100), None, None),
+            CanonicalReconcile::Diverged { .. }
+        ));
+    }
+
+    // Merely behind, within the stream window: the live loop catches up — the
+    // "every open re-downloads the chain" fix (2026-07-10: a client 100 behind
+    // at 5s blocks = closed for ~8 minutes = full re-bootstrap, under the old 96).
+    #[test]
+    fn reconcile_behind_within_stream_window_streams() {
+        let db = reconcile_test_db("behind_small", &[(100, 7)]);
+        let m = manifest_at(150, 9); // no local block at 150
+
+        // Boot passes the tip it already scanned. Keep this policy-boundary test
+        // independent of a second best-effort sled reopen; other reconcile tests
+        // exercise the fallback scan with no tip hint.
+        let local_tip = Some(100);
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(150), None, local_tip),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+        // Gap right at the window edge still streams…
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(100 + PEER_HEAL_WINDOW), None, local_tip),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+    }
+
+    // A node that is behind AND on a lost fork must re-bootstrap, not stream.
+    // Here the canonical block at height 100 (the anchor) has a different hash
+    // than the block we hold at 100, proving we are on a diverged branch, not a
+    // clean prefix. The running node's forward-only catch-up could never recover
+    // us (canonical blocks won't link onto our forked tip, and it never rewinds
+    // to the fork point), so the verdict must be Diverged even though the height
+    // gap alone looks small enough to just sync. Without the anchor this node
+    // booted "in sync" and stayed stale forever (the 2026-07-11 stale-client trap).
+    #[test]
+    fn reconcile_behind_and_forked_at_anchor_rebootstraps() {
+        let db = reconcile_test_db("behind_forked", &[(90, 7), (100, 8)]);
+        let m = manifest_at(150, 9); // behind: no local block at 150
+        let anchor = Some((100u32, hex::encode([5u8; 32]))); // canonical differs at 100
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(150), anchor, None),
+            CanonicalReconcile::Diverged { .. }
+        ));
+    }
+
+    // Behind with a MATCHING anchor: genuinely just behind on canonical — stream.
+    #[test]
+    fn reconcile_behind_with_matching_anchor_streams() {
+        let db = reconcile_test_db("behind_anchored", &[(90, 7), (100, 8)]);
+        let m = manifest_at(150, 9);
+        let anchor = Some((100u32, hex::encode([8u8; 32]))); // matches local tip
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(150), anchor, None),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+    }
+
+    fn history_body(entries: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({ "ok": true, "history": entries })
+    }
+
+    fn history_entry(snapshot_height: u64, headers: Vec<(u32, &str, &str)>) -> serde_json::Value {
+        serde_json::json!({
+            "height": snapshot_height,
+            "headers": headers
+                .into_iter()
+                .map(|(h, hash, prev)| serde_json::json!({
+                    "height": h, "hash": hash, "prev_hash": prev, "timestamp": 0
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    // When two snapshots disagree about the same height (a short reorg rewrote
+    // it between them), the NEWEST snapshot's hash must win — independent of
+    // the order the gateway serialized the entries. The old positional logic
+    // kept whichever came first and was only correct by an unpromised sort.
+    #[test]
+    fn anchor_same_height_conflict_newest_snapshot_wins_any_order() {
+        let old_hash = "a".repeat(64);
+        let new_hash = "b".repeat(64);
+        let older = history_entry(100, vec![(90, old_hash.as_str(), &"0".repeat(64))]);
+        let newer = history_entry(150, vec![(90, new_hash.as_str(), &"0".repeat(64))]);
+        for entries in [
+            vec![older.clone(), newer.clone()],
+            vec![newer.clone(), older.clone()],
+        ] {
+            let got = best_anchor_from_history(&history_body(entries), 95);
+            assert_eq!(got, Some((90, new_hash.clone())));
+        }
+    }
+
+    // Highest height at-or-below the local tip wins over a newer-but-lower one.
+    #[test]
+    fn anchor_prefers_highest_usable_height() {
+        let low = history_entry(200, vec![(80, &"c".repeat(64), &"0".repeat(64))]);
+        let high = history_entry(120, vec![(92, &"d".repeat(64), &"0".repeat(64))]);
+        let got = best_anchor_from_history(&history_body(vec![low, high]), 95);
+        assert_eq!(got, Some((92, "d".repeat(64))));
+    }
+
+    // A window whose headers don't chain is rejected wholesale; malformed
+    // hashes and above-tip heights are skipped.
+    #[test]
+    fn anchor_rejects_unlinked_windows_and_junk() {
+        let good_parent = "e".repeat(64);
+        let linked = history_entry(
+            100,
+            vec![
+                (90, good_parent.as_str(), &"0".repeat(64)),
+                (91, &"f".repeat(64), good_parent.as_str()),
+            ],
+        );
+        let unlinked = history_entry(
+            300,
+            vec![
+                (93, &"1".repeat(64), &"0".repeat(64)),
+                (94, &"2".repeat(64), &"9".repeat(64)), // prev doesn't match
+            ],
+        );
+        let junk = history_entry(
+            400,
+            vec![
+                (92, "not-hex", &"0".repeat(64)),
+                (99, &"3".repeat(64), &"0".repeat(64)),
+            ],
+        );
+        let got = best_anchor_from_history(&history_body(vec![linked, unlinked, junk]), 95);
+        // unlinked window's 93/94 rejected; junk's 92 non-hex skipped and its
+        // window is unlinked anyway; linked window's 91 is the best survivor.
+        assert_eq!(got, Some((91, "f".repeat(64))));
+    }
+
+    // An anchor ABOVE our tip tells us nothing about our chain (we hold no block
+    // there to compare), so it is ignored: we fall through to the plain behind
+    // path and, since the gap is within the window, just stream to catch up.
+    #[test]
+    fn reconcile_anchor_above_local_tip_is_ignored() {
+        let db = reconcile_test_db("anchor_above", &[(100, 8)]);
+        let m = manifest_at(150, 9);
+        let anchor = Some((120u32, hex::encode([5u8; 32])));
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(150), anchor, None),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+    }
+
+    // …and one past it re-bootstraps. The LIVE beacon height governs the gap
+    // (v7.6.5 freshness rule), not the lagging manifest height.
+    #[test]
+    fn reconcile_behind_beyond_stream_window_rebootstraps() {
+        let db = reconcile_test_db("behind_big", &[(100, 7)]);
+        let m = manifest_at(150, 9);
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(100 + PEER_HEAL_WINDOW + 1), None, None),
+            CanonicalReconcile::Diverged { .. }
+        ));
+    }
+
+    // The runtime divergence exit's marker outranks an otherwise-in-sync verdict:
+    // the live loop PROVED the chain can't converge while the manifest was stale
+    // (the 2026-07-10 restart crash-loop). remove_local_db clears the marker with
+    // the condemned chain.
+    #[test]
+    fn reconcile_marker_forces_rebootstrap_even_when_in_sync() {
+        let db = reconcile_test_db("marker", &[(100, 7)]);
+        std::fs::write(force_rebootstrap_marker_path(&db), b"test\n").unwrap();
+        let m = manifest_at(100, 7);
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(100), None, None),
+            CanonicalReconcile::Diverged { .. }
+        ));
+    }
+
+    // Fail-open is preserved: with no verified manifest a re-bootstrap is
+    // impossible anyway, so the marker persists silently and offline starts work.
+    #[test]
+    fn reconcile_marker_ignored_when_manifest_unreachable() {
+        let db = reconcile_test_db("marker_offline", &[(100, 7)]);
+        std::fs::write(force_rebootstrap_marker_path(&db), b"test\n").unwrap();
+        let m: Result<BootstrapManifestPointer> = Err("gateway unreachable".into());
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, None, None, None),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+    }
+
+    fn signed_bootstrap_manifest() -> BootstrapManifestPointer {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let publisher_pubkey = hex::encode(signing.verifying_key().to_bytes());
+        let network_id = launch_network_id_hex().unwrap();
+        let mut manifest = BootstrapManifestPointer {
+            url: "https://dyyq00nyrwpgq1yi.public.blob.vercel-storage.com/bootstrap/test.zip"
+                .to_string(),
+            network_id: Some(network_id.clone()),
+            height: Some(0),
+            tip_hash: Some(network_id),
+            sha256: Some(
+                "f199e63d0a621e7df67a1c7644ba78a87c8706f96d5d52610026b2c2d27ed843".to_string(),
+            ),
+            compressed_bytes: None,
+            extracted_bytes: None,
+            file_count: None,
+            format: None,
+            publisher_pubkey,
+            manifest_sig: String::new(),
+            updated_at: 1_783_184_400,
+        };
+        let payload = serde_json::to_vec(&manifest.signed_fields()).unwrap();
+        let sig = signing.sign(&payload);
+        manifest.manifest_sig = hex::encode(sig.to_bytes());
+        manifest
+    }
+
+    // The clamp tests for ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES and
+    // ALPHANUMERIC_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES were deleted with the helpers they
+    // covered. They passed while the values they parsed could never reach the download or the
+    // extractor, which is the failure mode green tests are worst at revealing: the helper was
+    // correct, its caller was unreachable. `ensure_bootstrap_zip_size` below is still live —
+    // it enforces the SIGNED compressed_bytes.
+    // A failed bootstrap attempt must not leave its partial archive on disk: the node boots via
+    // the P2P fallback, so nothing ever revisits the path to truncate it, and the stale bytes
+    // make the NEXT attempt's disk preflight refuse space that is actually available.
+    #[test]
+    fn bootstrap_zip_cleanup_removes_a_partial_archive() {
+        let dir = std::env::temp_dir().join(format!("a9-zip-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let zip = dir.join("blockchain.db.zip");
+        std::fs::write(&zip, b"partially downloaded archive").expect("seed partial zip");
+        assert!(zip.exists());
+
+        {
+            let _cleanup = BootstrapZipCleanup(zip.to_str().unwrap());
+            // ... an error return happens here (bad SHA-256, short body, disk recheck, ...)
+        }
+        assert!(
+            !zip.exists(),
+            "the partial archive must not outlive the failed attempt"
+        );
+
+        // Always-armed is safe: dropping again once extraction has already removed the file is a
+        // no-op, not an error.
+        {
+            let _cleanup = BootstrapZipCleanup(zip.to_str().unwrap());
+        }
+        assert!(!zip.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bootstrap_zip_size_rejects_oversized_downloads() {
+        assert!(ensure_bootstrap_zip_size(10, 10, "test body").is_ok());
+        let err = ensure_bootstrap_zip_size(11, 10, "test body")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("too large"));
+        assert!(err.contains("test body"));
+    }
+
+    #[test]
+    fn bootstrap_download_size_checks_signed_exact_size() {
+        assert!(ensure_bootstrap_download_progress(9, Some(10), Some(1), "body").is_ok());
+        assert!(ensure_bootstrap_download_complete(10, Some(10), Some(1), "body").is_ok());
+
+        let too_large = ensure_bootstrap_download_progress(11, Some(10), None, "body")
+            .unwrap_err()
+            .to_string();
+        assert!(too_large.contains("too large for signed manifest"));
+
+        let incomplete = ensure_bootstrap_download_complete(9, Some(10), None, "body")
+            .unwrap_err()
+            .to_string();
+        assert!(incomplete.contains("size mismatch"));
+    }
+
+    #[test]
+    fn bootstrap_required_disk_bytes_includes_archive_sizes_and_buffer() {
+        assert_eq!(
+            bootstrap_required_disk_bytes(Some(2_048), 8_192),
+            2_048 + 8_192 + BOOTSTRAP_MIN_DISK_BUFFER_BYTES
+        );
+
+        let large_extracted = 200 * 1024 * 1024 * 1024u64;
+        assert_eq!(
+            bootstrap_required_disk_bytes(None, large_extracted),
+            large_extracted + (large_extracted / 20)
+        );
+    }
+
+    #[test]
+    fn bootstrap_archive_stats_enforce_signed_expectations() {
+        let expectations = BootstrapArchiveExpectations {
+            expected_extracted_bytes: Some(12),
+            expected_file_count: Some(2),
+            unverified_extract_limit: None,
+        };
+        let mut stats = BootstrapArchiveStats::default();
+
+        update_bootstrap_archive_stats(&mut stats, 5, expectations).unwrap();
+        update_bootstrap_archive_stats(&mut stats, 7, expectations).unwrap();
+        finalize_bootstrap_archive_stats(stats, expectations).unwrap();
+
+        let mut too_many_bytes = BootstrapArchiveStats::default();
+        let err =
+            update_bootstrap_archive_stats(&mut too_many_bytes, 13, expectations).unwrap_err();
+        assert!(err.contains("more data than signed manifest"));
+
+        let mismatch = BootstrapArchiveStats {
+            extracted_bytes: 12,
+            file_count: 1,
+        };
+        let err = finalize_bootstrap_archive_stats(mismatch, expectations).unwrap_err();
+        assert!(err.contains("file count mismatch"));
+    }
+
+    #[test]
+    fn unverified_bootstrap_archive_stats_enforce_extract_limit() {
+        let expectations = BootstrapArchiveExpectations {
+            expected_extracted_bytes: None,
+            expected_file_count: None,
+            unverified_extract_limit: Some(10),
+        };
+        let mut stats = BootstrapArchiveStats::default();
+
+        update_bootstrap_archive_stats(&mut stats, 10, expectations).unwrap();
+        let err = update_bootstrap_archive_stats(&mut stats, 1, expectations).unwrap_err();
+        assert!(err.contains("Unverified bootstrap archive extraction exceeded limit"));
+    }
+
+    #[test]
+    fn bootstrap_manifest_signature_accepts_pinned_publisher() {
+        let manifest = signed_bootstrap_manifest();
+
+        assert!(
+            verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey).is_ok()
+        );
+    }
+
+    #[test]
+    fn bootstrap_manifest_signature_rejects_tampering() {
+        let mut manifest = signed_bootstrap_manifest();
+        manifest.sha256 = Some("0".repeat(64));
+
+        assert!(
+            verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_manifest_signature_rejects_size_metadata_tampering() {
+        let mut manifest = signed_bootstrap_manifest();
+        manifest.extracted_bytes = Some(42);
+
+        assert!(
+            verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_manifest_rejects_zero_size_metadata() {
+        let mut manifest = signed_bootstrap_manifest();
+        manifest.compressed_bytes = Some(0);
+
+        let err = verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compressed byte count must be nonzero"));
+    }
+
+    #[test]
+    fn bootstrap_manifest_rejects_wrong_network() {
+        let mut manifest = signed_bootstrap_manifest();
+        manifest.network_id = Some("0".repeat(64));
+
+        assert!(
+            verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey)
+                .is_err()
+        );
+    }
+
+    // The R2 recovery mirror wraps the signed manifest under `latest` next to advisory
+    // fields (seed peers, notes). Unwrapping must yield a manifest that passes the SAME
+    // verifier — the mirror is a second transport, never a second authority.
+    #[test]
+    fn recovery_manifest_file_unwraps_the_same_signed_manifest() {
+        let manifest = signed_bootstrap_manifest();
+        let wrapped = serde_json::json!({
+            "schema": "alphanumeric-recovery/1",
+            "network_id": manifest.network_id,
+            "updated_at": manifest.updated_at,
+            "latest": manifest,
+            "seed_peers": [{"ip": "203.0.113.7", "port": 7177, "verified": true, "probe_ms": 42}],
+            "seed_peers_verified": 1,
+            "note": "advisory text the node must ignore"
+        });
+        let parsed: RecoveryManifestFile =
+            serde_json::from_slice(&serde_json::to_vec(&wrapped).unwrap()).unwrap();
+
+        assert!(verify_bootstrap_manifest_with_publisher(
+            &parsed.latest,
+            &parsed.latest.publisher_pubkey
+        )
+        .is_ok());
+    }
+
+    // A mirror an attacker can write to still buys nothing: tampering with the wrapped
+    // manifest breaks the signature exactly as it would on the primary path.
+    #[test]
+    fn recovery_manifest_file_tampering_still_fails_signature_verification() {
+        let mut manifest = signed_bootstrap_manifest();
+        manifest.height = Some(999_999);
+        let wrapped = serde_json::json!({ "latest": manifest });
+        let parsed: RecoveryManifestFile =
+            serde_json::from_slice(&serde_json::to_vec(&wrapped).unwrap()).unwrap();
+
+        assert!(verify_bootstrap_manifest_with_publisher(
+            &parsed.latest,
+            &parsed.latest.publisher_pubkey
+        )
+        .is_err());
+    }
+
+    // A recovery file with no `latest` is a parse error, not a silent empty manifest.
+    #[test]
+    fn recovery_manifest_file_without_latest_is_a_parse_error() {
+        let err = serde_json::from_str::<RecoveryManifestFile>(
+            r#"{"schema":"alphanumeric-recovery/1","seed_peers":[]}"#,
+        );
+        assert!(err.is_err());
+    }
+
+    // 환경변수가 없으면 채굴하지 않는다. 이것은 오류가 아니다 — 지금까지의
+    // 헤드리스 동작이 그대로 남는다.
+    #[test]
+    fn no_mine_variable_means_no_mining_and_no_error() {
+        assert_eq!(parse_headless_mining(None, None, true, true), Ok(None));
+        assert_eq!(
+            parse_headless_mining(None, Some("cpu"), true, true),
+            Ok(None)
+        );
+    }
+
+    // 백엔드 기본값은 빌드가 정한다 — REPL 의 `mine` 과 같은 규칙이다.
+    #[test]
+    fn the_backend_defaults_to_what_the_binary_was_built_for() {
+        assert_eq!(
+            parse_headless_mining(Some("w"), None, true, true),
+            Ok(Some(HeadlessMining {
+                wallet: "w".into(),
+                use_gpu: true
+            }))
+        );
+        assert_eq!(
+            parse_headless_mining(Some("w"), None, false, true),
+            Ok(Some(HeadlessMining {
+                wallet: "w".into(),
+                use_gpu: false
+            }))
+        );
+    }
+
+    #[test]
+    fn an_explicit_backend_overrides_the_default() {
+        assert_eq!(
+            parse_headless_mining(Some("w"), Some("cpu"), true, true),
+            Ok(Some(HeadlessMining {
+                wallet: "w".into(),
+                use_gpu: false
+            }))
+        );
+        assert_eq!(
+            parse_headless_mining(Some("w"), Some("gpu"), true, true),
+            Ok(Some(HeadlessMining {
+                wallet: "w".into(),
+                use_gpu: true
+            }))
+        );
+    }
+
+    // GPU 를 못 하는 빌드에서 gpu 를 요구하면 **실패한다.** CPU 로 강등하지
+    // 않는다 — 강등 한 줄은 스크롤로 사라지고, 운영자가 400분의 1 속도로 한
+    // 세션을 통째로 채굴한 전례가 있다(REPL 의 같은 판단, main.rs:3090 부근).
+    #[test]
+    fn asking_for_gpu_on_a_cpu_only_build_is_an_error_not_a_downgrade() {
+        let err = parse_headless_mining(Some("w"), Some("gpu"), false, true).unwrap_err();
+        assert!(err.contains("gpu"), "무엇이 문제인지 말해야 한다: {err}");
+        assert!(err.contains("built"), "빌드 문제임을 말해야 한다: {err}");
+    }
+
+    #[test]
+    fn an_unknown_backend_is_an_error() {
+        assert!(parse_headless_mining(Some("w"), Some("vulkan"), true, true).is_err());
+        assert!(parse_headless_mining(Some("w"), Some(""), true, true).is_err());
+    }
+
+    // 공백만 있는 지갑 이름은 이름이 아니다. 그대로 통과시키면 나중에
+    // "지갑을 찾을 수 없다"로 나오는데, 진짜 원인은 오타난 환경변수다.
+    #[test]
+    fn a_blank_wallet_name_is_an_error() {
+        assert!(parse_headless_mining(Some("   "), None, true, true).is_err());
+    }
+
+    // ALPHANUMERIC_HEADLESS 없이 ALPHANUMERIC_MINE 만 주면 **거절한다.**
+    // 조용히 무시하면 노드는 대화형 메뉴를 띄우고 아무것도 캐지 않는데,
+    // systemd/docker/screen 아래에서는 그 상태가 며칠 간다.
+    #[test]
+    fn mine_without_headless_is_refused_not_ignored() {
+        let err = parse_headless_mining(Some("w"), None, true, false).unwrap_err();
+        assert!(
+            err.contains("ALPHANUMERIC_HEADLESS"),
+            "무엇을 켜야 하는지 말해야 한다: {err}"
+        );
+        assert!(err.contains("mine"), "대화형 대안을 말해야 한다: {err}");
+    }
+
+    // 변수가 아예 없으면 대화형 기동은 지금까지와 같다 — 오류가 아니다.
+    #[test]
+    fn no_mine_variable_outside_headless_is_still_not_an_error() {
+        assert_eq!(parse_headless_mining(None, None, true, false), Ok(None));
+        assert_eq!(
+            parse_headless_mining(None, Some("cpu"), true, false),
+            Ok(None)
+        );
+    }
+}

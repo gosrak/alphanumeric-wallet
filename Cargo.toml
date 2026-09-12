@@ -1,0 +1,180 @@
+[workspace]
+members = ["gui"]
+# The node stays what a bare `cargo build` / `cargo test` at the root means, so
+# existing release and CI commands do not change.
+default-members = ["."]
+
+[workspace.dependencies]
+# EXACT pin, and the reason is VERIFICATION, not signing. Signature validity is
+# standardised, so a conformant signature verifies under any conformant version --
+# but the ACCEPTANCE SET at the edges is where implementations differ: whether a
+# repeated hint index, non-zero hint padding or an off-length encoding is rejected.
+# tests/mldsa_rejection.rs pins exactly those cases because a patch bump that
+# tightened or loosened any of them would have two nodes disagree on whether one
+# block's signature is valid, which is a chain split, not a compatibility note.
+# Secondary: sign() is deterministic here (a fixed seed yields a fixed signature --
+# see the published_test_vector_still_holds vector), and SIGNING_SPEC.md publishes
+# that vector for third-party implementers, so changed output breaks interop too.
+# Bump deliberately only, re-running the rejection tests and the published vector.
+# Shared with the gui crate, which implements SIGNING_SPEC.md from the outside:
+# both must move together or not at all.
+ml-dsa = "=0.1.1"
+sha2 = "0.10"
+# zeroize feature: gives blake3's Hasher a `zeroize()` METHOD. It has no
+# ZeroizeOnDrop, so dropping a hasher does not wipe it -- call sites must call
+# zeroize() themselves after finalize(), or the master seed stays in the
+# hasher's chunk buffer.
+blake3 = { version = "1.4.0", features = ["zeroize"] }
+hex = "0.4"
+zeroize = "1"
+argon2 = "=0.5.3" # Legacy wallet envelopes depend on these exact KDF defaults.
+aes-gcm = "0.10"
+# Shared with the gui crate, which renders history timestamps in the
+# viewer's local time -- AND with this workspace's own node crate below
+# (its `chrono = { workspace = true }` line), which is the funds-handling
+# crate. Narrowing this entry for the GUI's benefit (e.g. turning off
+# default features) reaches the node silently too. Default features
+# (includes "clock") are enough for the GUI's use; no explicit feature
+# list needed.
+chrono = "0.4"
+
+[package]
+name = "alphanumeric"
+version = "8.0.1"
+edition = "2021"
+# The node is distributed as signed binaries, not as a crates.io package. This also
+# keeps the license gate scoped to third-party code: our own crate carries no
+# `license` field, and marking it unpublished says so explicitly rather than
+# implying a license we have not chosen.
+publish = false
+
+[dependencies]
+# --- gpu_miner feature only (heavy; keep out of default builds) ---
+wgpu = { version = "22", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+argon2 = { workspace = true }
+arrayref = "0.3"
+byteorder = "1.4"
+blake3 = { workspace = true }
+sha2 = { workspace = true }
+rayon = "1.5.3"
+chrono = { workspace = true }
+dashmap = "6.1.0"
+num_cpus = "1.16"
+num-traits = "0.2"
+num-bigint = "0.4.6"
+nix = { version = "0.30.1", features = ["process", "signal"] }
+ipnet = "2.3.1"
+rand_core = "0.6.4"
+rand = "0.8"
+thiserror = "1.0"
+socket2 = "0.5.8"
+uuid = { version = "1.6.1", features = ["v4", "rng"] }
+get_if_addrs = "0.5.3"
+ring = "0.17.14"
+indicatif = "0.18"
+termcolor = "1.1"
+log = "0.4"
+hex = { workspace = true }
+crossbeam-channel = "0.5.15"
+parking_lot = "0.12.1"
+lru = "0.8"
+reed-solomon-erasure = "6.0.0"
+ml-dsa = { workspace = true }
+aes-gcm = { workspace = true }
+zeroize = { workspace = true }
+# WebRTC DataChannel transport for the NAT-traversal mesh (feature `webrtc_mesh`). Optional so the
+# default binary stays lean (AV-false-positive surface) — release builds enable the feature.
+webrtc = { version = "0.17", optional = true }
+bytes = { version = "1", optional = true }
+# rustls 0.23 with the `ring` provider — used by BOTH the DTLS mesh and (since 7.8.2)
+# reqwest's HTTPS via `rustls-no-provider`. Non-optional: reqwest pulls it unconditionally
+# and main() installs the ring provider process-wide. Pinning ring (not aws-lc-rs) drops
+# the aws-lc-sys C build (cmake + NASM), so source builds need only Rust + a C compiler.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+inquire = "0.7.0"
+tokio = { version = "1.52", features = ["full"] }
+futures = "0.3"
+futures-util = "0.3"
+fs2 = "0.4.3"
+serde = { version = "1.0", features = ["derive"] }
+# EXACT PIN — consensus-critical, same rule as ml-dsa above. The Merkle leaf is
+# SHA-256 over this crate's output (blockchain.rs calculate_merkle_leaf_hash), and
+# the P2P wire contract rides its enum-as-map encoding. A version that shifts one
+# byte of encoding is a silent chain split; a lockfile-less source build (the
+# Linux/Windows installer path) would float without these pins. `rmp` is the
+# transitive crate that actually writes the bytes, pinned for the same reason.
+# Bump deliberately only, re-running the codec golden-bytes tests first.
+rmp-serde = "=1.3.1"
+rmp = "=0.8.15"
+libp2p-core = "0.43.2"
+libp2p-identity = { version = "0.2.14", features = ["ed25519", "peerid", "rand"] }
+libp2p-kad = "0.48.0"
+libp2p-noise = "0.46.1"
+libp2p-swarm = { version = "0.47.1", features = ["macros", "tokio"] }
+libp2p-tcp = { version = "0.44.1", features = ["tokio"] }
+libp2p-yamux = "0.47.0"
+if-addrs = "0.10"
+lazy_static = "1.4"
+serde_json = "1.0"
+async-trait = "0.1.74"
+# Legacy engine, retained ONLY for the one-time sled->redb conversion tool
+# (`sled-convert` feature); client and publisher builds carry no sled code.
+sled = { version = "0.34.0", optional = true }
+redb = "4.1"
+env_logger = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+zip = "6"
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+axum = "0.6"
+ctrlc = "3.4"
+igd-next = "0.15"
+sysinfo = "0.30"
+rustyline = "18.0.1"
+
+[build-dependencies]
+bindgen = "0.64"
+winres = "0.1.12"
+
+[features]
+# The mesh is part of the product: a plain `cargo build --release` (what every
+# source-building Linux/Windows user runs) must produce a mesh-capable binary —
+# without this, source builders silently lost direct P2P and never knew (bit real
+# users on 2026-07-08). Runtime opt-out remains: ALPHANUMERIC_WEBRTC_MESH=false.
+default = ["webrtc_mesh"]
+# Enables DB snapshot publishing (zip+upload+sign) and the `push` command.
+bootstrap_publisher = []
+# Opt-in GPU mining backend (wgpu/WGSL BLAKE3). Deliberately NOT in default:
+# the dependency tree is heavy and mining stays CPU-first; enable with
+# `--features gpu_miner` and activate at runtime via `mine <wallet> --gpu`.
+gpu_miner = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# One-time sled->redb database conversion tool for nodes migrating in place
+# (the explorer's initial cutover). Never in client release builds.
+sled-convert = ["dep:sled"]
+# Reserved feature flag used by some libp2p/TCP-specific code paths.
+tcp = []
+# WebRTC DataChannel mesh: NAT'd miners hole-punch direct P2P links, signaled by the gateway.
+webrtc_mesh = ["dep:webrtc", "dep:bytes"]
+
+# NOTE:
+# Windows Defender ML detections are often triggered by small, stripped, unsigned binaries
+# that do heavy filesystem + networking (like bootstrap publish). Keep symbols and avoid
+# aggressive LTO/stripping in release builds until the binary is code-signed.
+[profile.release]
+# Integer overflow PANICS in release, it does not wrap.
+#
+# Rust's default release profile wraps silently, which means an overflow bug is loud
+# in every test run and silent in production, on a codebase whose whole job is exact
+# integer money and consensus arithmetic. A wrap there is not a crash, it is a wrong
+# balance or a divergent block that every node then agrees on forever. A panic is a
+# stopped node an operator restarts.
+#
+# Measured before enabling: the full suite passes in release with checks on (528/528),
+# and the mining hot loop is unaffected (10.74/10.88 MH/s off vs 10.72/10.82 on, inside
+# run-to-run noise) because BLAKE3 does its own explicit wrapping arithmetic internally.
+overflow-checks = true
+debug = 1
+strip = "none"
+lto = false
+panic = "unwind"

@@ -1,0 +1,3194 @@
+use dashmap::DashMap;
+use log::{debug, error, info, warn};
+use ring::signature::{UnparsedPublicKey, ED25519};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+use tokio::time::interval;
+
+use crate::a9::blockchain::{Block, Blockchain, BlockchainError};
+use crate::a9::codec;
+use crate::a9::mldsa;
+use crate::a9::node::NetworkMessage;
+use crate::a9::node::{Node, NodeError};
+
+type VerifiedHeaderQueue = Arc<RwLock<VecDeque<(u32, [u8; 32])>>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ActionType {
+    BlockValidation,
+    AnomalyDetection,
+    ForkResolution,
+    HeaderValidation,
+    ChainVerification,
+}
+
+// Performance and reward constants
+const SENTINEL_CHECK_INTERVAL: u64 = 300; // Check network health
+const MAX_HEADER_CACHE_SIZE: usize = 5000; // Reduced to prevent memory exhaustion attacks
+                                           // Upper bound on headers accepted in one HeaderSync batch. The broadcaster sends at most 100
+                                           // headers per push (its ranged window), so this leaves 10x headroom while bounding the work an
+                                           // attacker can force in one message; the 4 MiB wire frame alone would otherwise admit ~55k.
+const MAX_HEADER_SYNC_BATCH: usize = 1000;
+const CHAIN_VERIFICATION_INTERVAL: u64 = 300; // Verify chain every 5 minutes
+const MLDSA_BINDING_CONTEXT: &[u8] = b"ALPHANUMERIC_MLDSA87_BIND_V2";
+
+pub fn build_mldsa_binding_payload(node_id: &str, mldsa_public_key: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        MLDSA_BINDING_CONTEXT.len() + node_id.len() + mldsa_public_key.len() + 6,
+    );
+    payload.extend_from_slice(MLDSA_BINDING_CONTEXT);
+    payload.extend_from_slice(&(node_id.len() as u16).to_be_bytes());
+    payload.extend_from_slice(node_id.as_bytes());
+    payload.extend_from_slice(&(mldsa_public_key.len() as u16).to_be_bytes());
+    payload.extend_from_slice(mldsa_public_key);
+    payload
+}
+
+const MAX_BLOCK_SIZE: usize = 1_000_000;
+const BLOCK_VERIFICATION_BATCH_SIZE: usize = 1000; // Increased for better scaling
+
+pub const AUTO_STAKE_PERCENTAGE: f64 = 0.20; // 20% automatic stake
+pub const WITHDRAWAL_COOLDOWN: u64 = 24 * 60 * 60; // 24 hours in seconds
+const HEADER_RULES_VERSION: u32 = 2;
+const HEADER_MAX_FUTURE_SECONDS: u64 = 600;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ValidatorTier {
+    RedDiamond,
+    Diamond,
+    Emerald,
+    Gold,
+    Silver,
+    Inactive,
+}
+
+impl ValidatorTier {
+    pub fn calculate_tier(uptime: f64, blocks_verified: u64, network_contribution: f64) -> Self {
+        // Calculate verification score (50% weight)
+        let verification_score = if blocks_verified > 0 {
+            // Logarithmic scaling for blocks verified to reward consistent participation
+            // but prevent runaway scoring
+            let log_factor = (1.0 + (blocks_verified as f64 / 100.0).ln()).min(1.0);
+            log_factor * 0.5 // 50% total weight
+        } else {
+            0.0
+        };
+
+        // Uptime score (25% weight)
+        let uptime_score = (uptime / 100.0).clamp(0.0, 1.0) * 0.25;
+
+        // Network stake score (25% weight)
+        let stake_score = network_contribution * 0.25;
+
+        // Combined score
+        let total_score = verification_score + uptime_score + stake_score;
+
+        // Tier thresholds
+        match total_score {
+            s if s >= 0.80 => ValidatorTier::RedDiamond, // Exceptional validation history + good uptime/stake
+            s if s >= 0.65 => ValidatorTier::Diamond, // Strong validation history + decent uptime/stake
+            s if s >= 0.50 => ValidatorTier::Emerald, // Good validation history + average uptime/stake
+            s if s >= 0.35 => ValidatorTier::Gold,    // Decent validation history
+            s if s > 0.20 => ValidatorTier::Silver,   // Some validation history
+            _ => ValidatorTier::Inactive,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BPoSSentinel {
+    blockchain: Arc<RwLock<Blockchain>>,
+    node: Arc<Node>,
+    node_metrics: Arc<DashMap<String, NodeMetrics>>,
+    header_cache: Arc<RwLock<VecDeque<Block>>>,
+    network_health: Arc<RwLock<NetworkHealth>>,
+    stats: Arc<RwLock<SentinelStats>>,
+    header_sentinel: Arc<HeaderSentinel>,
+    anomaly_detector: Arc<RwLock<AnomalyDetector>>,
+    sync_manager: Arc<RwLock<SyncManager>>,
+    last_anomaly_broadcast: Arc<RwLock<u64>>, // Rate limiting for anomaly broadcasts
+    verified_headers: VerifiedHeaderQueue,
+    initialized: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BPoSSentinel {
+    /// A header may be at most this many seconds old (3 block times) to be
+    /// considered temporally consistent, and at most this many seconds ahead of
+    /// local time. Both bound a PEER-SUPPLIED timestamp, so both are enforced
+    /// saturating.
+    /// Kept though nothing in the crate calls it: this is the header-timestamp
+    /// admission policy, it has direct test coverage, and the header path is
+    /// where it belongs when that path next needs bounding. Marked here rather
+    /// than blanket-allowing the impl, so anything else that dies gets reported.
+    #[allow(dead_code)]
+    const MAX_HEADER_AGE_SECS: u64 = 6;
+    #[allow(dead_code)]
+    const MAX_HEADER_SKEW_SECS: u64 = 2;
+
+    // Memory constants
+    const MAX_PERFORMANCE_HISTORY: usize = 24;
+    const MAX_ACTION_HISTORY: usize = 100;
+    const MAX_VERIFIED_BLOCKS: usize = 200;
+    const MAX_ANOMALIES: usize = 100;
+
+    pub fn new(
+        blockchain: Arc<RwLock<Blockchain>>,
+        node: Arc<Node>,
+        header_sentinel: Arc<HeaderSentinel>,
+    ) -> Self {
+        Self {
+            blockchain,
+            node,
+            node_metrics: Arc::new(DashMap::new()),
+            header_cache: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_HEADER_CACHE_SIZE))),
+            network_health: Arc::new(RwLock::new(NetworkHealth::new())),
+            stats: Arc::new(RwLock::new(SentinelStats::default())),
+            header_sentinel,
+            anomaly_detector: Arc::new(RwLock::new(AnomalyDetector {
+                recent_anomalies: VecDeque::with_capacity(100),
+            })),
+            sync_manager: Arc::new(RwLock::new(SyncManager {})),
+            last_anomaly_broadcast: Arc::new(RwLock::new(0)),
+            verified_headers: Arc::new(RwLock::new(VecDeque::new())),
+            initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub async fn initialize(&self) -> Result<(), String> {
+        if self
+            .initialized
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        // Removed info log for production - initialization is implicit
+
+        // Start independent monitoring tasks
+        self.start_monitoring_tasks();
+        self.start_header_verification();
+
+        // Initial state verification
+        self.verify_chain_state().await?;
+        self.update_network_health(false).await?;
+
+        // Start continuous metrics tracking
+        let sentinel = self.clone();
+        tokio::task::spawn(async move {
+            let mut interval = interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+
+                // Monitor chain for validations
+                if let Err(e) = sentinel.monitor_chain().await {
+                    error!("Chain monitoring error: {}", e);
+                }
+
+                // Update metrics
+                if let Err(e) = sentinel.update_metrics().await {
+                    error!("Metrics update error: {}", e);
+                }
+            }
+        });
+
+        // Removed info log for production - success is implicit
+        Ok(())
+    }
+
+    pub async fn update_metrics(&self) -> Result<(), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let _total_blocks = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_latest_block_index()
+        };
+
+        // Update all node metrics. Keys snapshotted FIRST: `iter_mut` holds a
+        // DashMap SHARD guard — a synchronous parking_lot lock — and the old loop
+        // awaited three times underneath it (headers read, chain read, balance),
+        // a genuine multi-threaded deadlock that stayed harmless only because
+        // nothing populates node_metrics yet. All awaits now run unguarded; the
+        // mutation at the end is brief and sync.
+        let addresses: Vec<String> = self
+            .node_metrics
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in addresses {
+            let address = match self.node_metrics.get(&key) {
+                Some(m) => m.address.clone(),
+                None => continue,
+            };
+
+            // Don't reset blocks_verified, only update if new verifications found
+            let verified_count = {
+                let headers = self.header_sentinel.headers.read().await;
+                headers
+                    .iter()
+                    .filter(|state| state.verified_by.contains(&address))
+                    .count()
+            };
+            // Stake contribution input, read before taking the shard guard.
+            let balance = {
+                let blockchain = self.blockchain.read().await;
+                blockchain.get_wallet_balance(&address).await.ok()
+            };
+
+            let Some(mut metrics_ref) = self.node_metrics.get_mut(&key) else {
+                continue;
+            };
+            let metrics = metrics_ref.value_mut();
+
+            if verified_count > metrics.blocks_verified as usize {
+                metrics.blocks_verified = verified_count as u64;
+            }
+
+            // Update other metrics
+            let time_since_start = now.saturating_sub(metrics.last_active);
+            metrics.uptime = if time_since_start > 0 {
+                ((time_since_start - metrics.total_downtime) as f64 / time_since_start as f64
+                    * 100.0)
+                    .min(100.0)
+            } else {
+                100.0
+            };
+
+            // Update success rate based on verification history
+            if metrics.blocks_verified > 0 {
+                if time_since_start <= 3600 {
+                    metrics.success_rate = 100.0;
+                } else {
+                    let decay_factor = (-((time_since_start - 3600) as f64) / 86400.0).exp();
+                    metrics.success_rate = 100.0 * decay_factor;
+                }
+            }
+
+            // Calculate stake contribution (balance was read above, unguarded).
+            if let Some(balance) = balance {
+                metrics.staked_amount = balance * AUTO_STAKE_PERCENTAGE;
+            }
+
+            // Update tier and performance score
+            metrics.current_tier = ValidatorTier::calculate_tier(
+                metrics.uptime,
+                metrics.blocks_verified,
+                metrics.staked_amount,
+            );
+
+            metrics.calculate_performance_score();
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_memory(&self) -> Result<(), String> {
+        // Each section scopes its own guard: the old flow held header_cache.write
+        // while acquiring verified_headers.write while acquiring anomaly_detector
+        // .write — a four-lock chain where one contended lock wedges them all
+        // (2026-07-08 guard-chaining class). The cleanups are independent.
+        {
+            // Clean header cache - only keep last blocks
+            let mut header_cache = self.header_cache.write().await;
+            if header_cache.len() > Self::MAX_VERIFIED_BLOCKS {
+                let drain_count = header_cache.len() - Self::MAX_VERIFIED_BLOCKS;
+                header_cache.drain(..drain_count);
+            }
+        }
+
+        {
+            // Clean verified headers
+            let mut verified = self.verified_headers.write().await;
+            if verified.len() > Self::MAX_VERIFIED_BLOCKS {
+                let drain_count = verified.len() - Self::MAX_VERIFIED_BLOCKS;
+                verified.drain(..drain_count);
+            }
+        }
+
+        // Cleanup NodeMetrics
+        for mut metrics in self.node_metrics.iter_mut() {
+            // Trim performance history
+            while metrics.performance_history.len() >= Self::MAX_PERFORMANCE_HISTORY {
+                metrics.performance_history.pop_front();
+            }
+
+            // Trim action history
+            while metrics.action_history.len() >= Self::MAX_ACTION_HISTORY {
+                metrics.action_history.pop_front();
+            }
+
+            // Trim verified blocks to recent ones
+            if metrics.verified_blocks.len() > Self::MAX_VERIFIED_BLOCKS {
+                let mut blocks: Vec<_> = metrics.verified_blocks.iter().copied().collect();
+                blocks.sort_unstable();
+                let to_remove = blocks.len() - Self::MAX_VERIFIED_BLOCKS;
+                for old_block in blocks.iter().take(to_remove) {
+                    metrics.verified_blocks.remove(old_block);
+                }
+            }
+        }
+
+        // Cleanup anomaly detector
+        {
+            let mut detector = self.anomaly_detector.write().await;
+            detector.recent_anomalies.truncate(Self::MAX_ANOMALIES);
+        }
+
+        Ok(())
+    }
+
+    fn start_monitoring_tasks(&self) {
+        // BPoS chain monitoring with ML-DSA verification
+        let sentinel = self.clone();
+        tokio::task::spawn(async move {
+            let mut interval = interval(Duration::from_secs(CHAIN_VERIFICATION_INTERVAL));
+            let mut last_height = 0u32;
+
+            loop {
+                interval.tick().await;
+
+                let current_height = {
+                    let blockchain = sentinel.blockchain.read().await;
+                    blockchain.get_latest_block_index() as u32
+                };
+
+                if current_height != last_height {
+                    if let Err(e) = sentinel.monitor_chain().await {
+                        error!("Chain monitoring error: {}", e);
+                    }
+                    last_height = current_height;
+                }
+            }
+        });
+
+        // BPoS metrics and health monitoring
+        let sentinel = self.clone();
+        tokio::task::spawn(async move {
+            let mut interval = interval(Duration::from_secs(SENTINEL_CHECK_INTERVAL));
+            let mut last_metrics_update = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            loop {
+                interval.tick().await;
+
+                // Update network health with force parameter
+                if let Err(e) = sentinel.update_network_health(false).await {
+                    error!("Network health update error: {}", e);
+                }
+
+                // Update BPoS metrics every 5 minutes
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                if now.saturating_sub(last_metrics_update) >= SENTINEL_CHECK_INTERVAL {
+                    if let Err(e) = sentinel.update_metrics().await {
+                        error!("Metrics update error: {}", e);
+                    }
+                    // Force full network health update with metrics
+                    if let Err(e) = sentinel.update_network_health(false).await {
+                        error!("Network health update error: {}", e);
+                    }
+                    last_metrics_update = now;
+                }
+            }
+        });
+
+        // Add daily wallet pruning task
+        tokio::task::spawn(async move {
+            // Wallet pruning is no longer needed since we removed the wallet registry
+
+            // Run periodic tasks every 24 hours
+            let mut interval = interval(Duration::from_secs(24 * 3600));
+            loop {
+                interval.tick().await;
+                // Future periodic tasks can be added here
+            }
+        });
+
+        // Add cleanup task
+        let sentinel = self.clone();
+        tokio::task::spawn(async move {
+            let mut interval = interval(Duration::from_secs(3600)); // Hourly cleanup
+            loop {
+                interval.tick().await;
+                if let Err(e) = sentinel.cleanup_memory().await {
+                    error!("Memory cleanup error: {}", e);
+                }
+            }
+        });
+    }
+
+    pub async fn monitor_chain(&self) -> Result<(), String> {
+        let current_height = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_latest_block_index() as u32
+        };
+
+        const FORK_DETECTION_WINDOW: u64 = 900; // Configurable window
+        const SYNC_THRESHOLD: u32 = 10; // Allow up to 10 blocks difference
+
+        let fork_info = {
+            let mut height_versions: HashMap<u32, HashSet<[u8; 32]>> = HashMap::with_capacity(10);
+            let headers = self.header_sentinel.headers.read().await;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            for header_state in headers.iter().take(100) {
+                if now.saturating_sub(header_state.timestamp) < FORK_DETECTION_WINDOW {
+                    let verified_count = header_state.verified_by.len();
+                    let total_nodes = self.node_metrics.len().max(1);
+
+                    if verified_count >= (total_nodes / 3) {
+                        height_versions
+                            .entry(header_state.header.height)
+                            .or_default()
+                            .insert(header_state.header.hash);
+                    }
+                }
+            }
+
+            height_versions
+                .into_iter()
+                .filter(|(_, versions)| versions.len() > 1)
+                .map(|(height, _)| height)
+                .collect::<HashSet<_>>()
+        };
+
+        if !fork_info.is_empty() {
+            self.handle_chain_fork(fork_info).await?;
+        }
+
+        let max_peer_height = {
+            // Snapshot peers first, then read headers — never hold both guards at
+            // once (couples the locks: a wedged headers writer would wedge peers).
+            let peer_infos: Vec<(String, u32)> = {
+                let peers = self.node.peers.read().await;
+                peers
+                    .values()
+                    .map(|info| (info.address.to_string(), info.blocks))
+                    .collect()
+            };
+            // Max height any peer reports. The former filter compared peer SocketAddr strings to
+            // header verified_by node_ids, which never match, so this trigger was dead (max was
+            // always 0). sync_with_network re-validates peer heights anyway, so computing the max
+            // directly from reported heights is both correct and sufficient.
+            peer_infos
+                .iter()
+                .map(|(_, blocks)| *blocks)
+                .max()
+                .unwrap_or(0)
+        };
+
+        if max_peer_height > current_height + SYNC_THRESHOLD {
+            self.node.sync_with_network().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_chain_fork(&self, fork_blocks: HashSet<u32>) -> Result<(), String> {
+        let mut stats = self.stats.write().await;
+        stats.anomalies_detected += 1;
+
+        // Same-height races are routine on this network (multiple miners at the
+        // difficulty floor) and canonical choice is settled by the PoW reorg engine,
+        // not this layer — see the note above resolve_fork. Log at debug: an error
+        // here reads as "unresolved fork" when nothing is wrong.
+        debug!("Competing headers observed at blocks: {:?}", fork_blocks);
+
+        // Get reputable validators (Emerald tier and above)
+        let trusted_validators: HashSet<String> = self
+            .node_metrics
+            .iter()
+            .filter(|metrics| {
+                matches!(
+                    metrics.current_tier,
+                    ValidatorTier::RedDiamond | ValidatorTier::Diamond | ValidatorTier::Emerald
+                )
+            })
+            .map(|metrics| metrics.key().clone())
+            .collect();
+
+        if trusted_validators.is_empty() {
+            // node_metrics is never populated on a live node (register_wallet_metrics
+            // has no callers), so this set is always empty and the diagnostics-only
+            // resolution below has nothing to do. That is the expected state, not an
+            // error: the PoW reorg engine resolves the race independently.
+            debug!("bPoS validator registry empty; leaving fork resolution to the reorg engine");
+            return Ok(());
+        }
+
+        // Resolve each fork point
+        let mut resolved = 0;
+        for height in fork_blocks {
+            if let Ok(()) = self.resolve_fork(height, &trusted_validators).await {
+                resolved += 1;
+            }
+        }
+
+        stats.forks_resolved += resolved as u64;
+        Ok(())
+    }
+
+    // NOT a live canonical-override safety net. This bPoS fork-resolution layer
+    // (resolve_fork / emergency_fork_resolution / enforce_canonical_chain / get_block_from_network)
+    // is non-functional — get_block_from_network requests the fixed [0,0] height range and can't
+    // fetch a competing block — and is retained only for diagnostics/telemetry. Canonical choice is
+    // decided solely by PoW work-weight in the reorg engine (converge_to_canonical /
+    // try_adopt_orphan_branch). Do not wire this into block acceptance.
+    async fn resolve_fork(
+        &self,
+        block_height: u32,
+        trusted_validators: &HashSet<String>,
+    ) -> Result<(), String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let blockchain = self.blockchain.read().await;
+        let current_height = blockchain.get_latest_block_index() as u32;
+        let blocks_since_fork = current_height.saturating_sub(block_height);
+        drop(blockchain);
+
+        // Emergency resolution check
+        if blocks_since_fork > 1000 {
+            return self.emergency_fork_resolution(block_height).await;
+        }
+
+        // Security hardening: Never drop below safe consensus threshold
+        let min_validators = 3;
+
+        if trusted_validators.len() < min_validators {
+            warn!(
+                "Insufficient validators ({}) for fork resolution - block age: {}",
+                trusted_validators.len(),
+                blocks_since_fork
+            );
+
+            if blocks_since_fork > 100 {
+                // Fall back to any validators in emergency
+                info!("Using fallback validator set due to fork duration");
+            } else {
+                return Ok(());
+            }
+        }
+
+        let headers = self.header_sentinel.headers.read().await;
+        let mut versions: HashMap<[u8; 32], Vec<(String, ValidatorTier, u64)>> = HashMap::new();
+
+        // Process headers with adaptive time window
+        let time_window = match blocks_since_fork {
+            0..=50 => 300,   // 5 minutes normally
+            51..=100 => 600, // 10 minutes if unresolved
+            _ => 1800,       // 30 minutes in emergency
+        };
+
+        for header_state in headers.iter() {
+            // Adaptive future timestamp tolerance
+            let max_future = if self.network_health.read().await.fork_count > 0 {
+                600 // 10 minutes during network issues
+            } else {
+                300 // 5 minutes normally
+            };
+
+            if header_state.timestamp > now + max_future {
+                warn!(
+                    "Skipping future header: {} (max allowed: {})",
+                    header_state.timestamp,
+                    now + max_future
+                );
+                continue;
+            }
+
+            if header_state.header.height == block_height {
+                for verifier in &header_state.verified_by {
+                    if let Some(metrics) = self.node_metrics.get(verifier) {
+                        // Adaptive validator requirements
+                        if blocks_since_fork > 100 || metrics.uptime >= 95.0 {
+                            versions.entry(header_state.header.hash).or_default().push((
+                                verifier.clone(),
+                                metrics.current_tier.clone(),
+                                header_state.timestamp,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Require minimum versions unless emergency
+        if versions.is_empty() && blocks_since_fork < 100 {
+            info!("No valid versions found for height {}", block_height);
+            return Ok(());
+        }
+
+        // Score calculation with safety bounds
+        let mut hash_scores: HashMap<[u8; 32], f64> = HashMap::new();
+        for (hash, verifiers) in versions {
+            // Minimum verifiers requirement reduces over time
+            let min_verifiers = match blocks_since_fork {
+                0..=50 => 3,
+                51..=100 => 2,
+                _ => 1,
+            };
+
+            if verifiers.len() < min_verifiers && blocks_since_fork < 100 {
+                continue;
+            }
+
+            let base_score: f64 = verifiers
+                .iter()
+                .map(|(_, tier, timestamp)| {
+                    // Base tier score
+                    let tier_score = match tier {
+                        ValidatorTier::RedDiamond => 5.0,
+                        ValidatorTier::Diamond => 4.0,
+                        ValidatorTier::Emerald => 3.0,
+                        ValidatorTier::Gold => 2.0,
+                        ValidatorTier::Silver => 1.0,
+                        ValidatorTier::Inactive => 0.0,
+                    };
+
+                    // Time weighting with adaptive window
+                    let age = now.saturating_sub(*timestamp);
+                    if age > time_window {
+                        return 0.0;
+                    }
+
+                    let time_factor = 1.0 + (age as f64 / time_window as f64).min(1.0);
+                    (tier_score * time_factor).min(10.0)
+                })
+                .sum::<f64>();
+
+            // Time consistency verification
+            let timestamps: Vec<_> = verifiers.iter().map(|(_, _, t)| t).collect();
+            if let (Some(&min_time), Some(&max_time)) =
+                (timestamps.iter().min(), timestamps.iter().max())
+            {
+                if max_time - min_time > time_window && blocks_since_fork < 50 {
+                    continue;
+                }
+            }
+
+            hash_scores.insert(hash, base_score);
+        }
+
+        // Adaptive threshold based on fork duration
+        let network_health = self.network_health.read().await;
+        let base_threshold = match blocks_since_fork {
+            0..=50 => 10.0,  // Normal threshold
+            51..=100 => 7.0, // Reduced threshold
+            _ => 5.0,        // Emergency threshold
+        };
+
+        let threshold_multiplier = if blocks_since_fork > 100 {
+            0.5 // Emergency mode
+        } else {
+            (1.0 + (network_health.fork_count as f64 * 0.2)).min(2.0)
+        };
+
+        let required_score = base_threshold * threshold_multiplier;
+
+        // Find best version with sufficient score
+        if let Some((&canonical_hash, score)) = hash_scores
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            let blockchain = self.blockchain.read().await;
+            let current_block = blockchain.get_block(block_height)?;
+
+            if current_block.hash != canonical_hash && *score >= required_score {
+                // Double verification unless emergency
+                let should_switch = if blocks_since_fork > 100 {
+                    true
+                } else {
+                    let confirmation_score = self
+                        .verify_fork_switch(&current_block, canonical_hash)
+                        .await?;
+                    confirmation_score >= required_score
+                };
+
+                if should_switch {
+                    drop(blockchain);
+                    if let Some(block) = self.get_block_from_network(canonical_hash).await? {
+                        info!(
+                            "Switching to fork version with score {} (required {})",
+                            score, required_score
+                        );
+                        self.enforce_canonical_chain(block).await?;
+
+                        let mut health = self.network_health.write().await;
+                        health.update_fork_count(true);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn emergency_fork_resolution(&self, block_height: u32) -> Result<(), String> {
+        warn!(
+            "EMERGENCY: Initiating forced fork resolution for height {}",
+            block_height
+        );
+
+        // Get ALL versions from ANY validator
+        let versions = self.get_all_block_versions(block_height).await?;
+
+        if versions.is_empty() {
+            return Err("No versions available for emergency resolution".into());
+        }
+
+        // Count occurrences of each version
+        let mut version_counts: HashMap<[u8; 32], usize> = HashMap::new();
+        for block in versions {
+            *version_counts.entry(block.hash).or_insert(0) += 1;
+        }
+
+        // Take most common version
+        if let Some((&hash, _)) = version_counts.iter().max_by_key(|&(_, count)| count) {
+            if let Some(block) = self.get_block_from_network(hash).await? {
+                warn!("EMERGENCY: Forcing switch to most common version");
+                self.enforce_canonical_chain(block).await?;
+
+                let mut health = self.network_health.write().await;
+                health.update_fork_count(true);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn verify_fork_switch(&self, current: &Block, new_hash: [u8; 32]) -> Result<f64, String> {
+        // Snapshot-then-drop: holding the peers guard across a network fan-out is
+        // the exact wedge class named in the lock-watchdog comment (node.rs).
+        let addrs: Vec<std::net::SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().take(5).collect()
+        };
+        let mut confirmation_score = 0.0;
+
+        let peer_futures: Vec<_> = addrs
+            .into_iter()
+            .map(|addr| self.node.request_blocks(addr, current.index, current.index))
+            .collect();
+
+        for blocks in futures::future::join_all(peer_futures)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            if let Some(block) = blocks.first() {
+                if block.hash == new_hash {
+                    confirmation_score += 2.0;
+                }
+            }
+        }
+
+        Ok(confirmation_score)
+    }
+
+    async fn get_all_block_versions(&self, height: u32) -> Result<Vec<Block>, String> {
+        // Snapshot-then-drop + a cap (this fan-out had neither: every peer in the
+        // table, under the guard).
+        let addrs: Vec<std::net::SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().take(8).collect()
+        };
+        let mut all_versions = Vec::new();
+
+        let peer_futures: Vec<_> = addrs
+            .into_iter()
+            .map(|addr| self.node.request_blocks(addr, height, height))
+            .collect();
+
+        for mut blocks in futures::future::join_all(peer_futures)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            all_versions.append(&mut blocks);
+        }
+
+        Ok(all_versions)
+    }
+
+    /// Height window to broadcast this tick: the new blocks since `last_height`, capped to the
+    /// most RECENT `max` of them. `None` when there is nothing new.
+    ///
+    /// Two things this gets right that the previous inline arithmetic did not.
+    /// 1. The cursor advances to exactly the window that was SENT. It used to clamp the range to
+    ///    `last_height + 100` and then set the cursor to `current_height`, so everything past the
+    ///    clamp was skipped for good instead of being picked up on the next tick.
+    /// 2. When far behind, the window is the NEWEST `max`, not the oldest. The cursor starts at 0,
+    ///    so against a live chain the first tick used to select heights 1..=100 — ancient headers
+    ///    whose parent link the receiver cannot resolve (`verify_headers_batch` drops a header
+    ///    whose `prev_hash` is in neither the chunk nor the peer's store, and genesis' parent is
+    ///    in neither), making the whole batch a no-op. Simply advancing the cursor to the clamp
+    ///    would instead crawl the entire chain 100 blocks per 10s tick — ~14h from genesis at
+    ///    today's height — spraying stale headers the whole way. This is a beacon of the tip, so
+    ///    the tip is what it broadcasts.
+    fn header_broadcast_window(
+        last_height: u32,
+        current_height: u32,
+        max: u32,
+    ) -> Option<(u32, u32)> {
+        if current_height <= last_height || max == 0 {
+            return None;
+        }
+        let to = current_height;
+        // Never reach below height 1 (genesis is pinned, not broadcast) and never re-send what the
+        // cursor already covered.
+        let from = to
+            .saturating_sub(max.saturating_sub(1))
+            .max(last_height.saturating_add(1))
+            .max(1);
+        Some((from, to))
+    }
+
+    fn start_header_verification(&self) {
+        let sentinel = Arc::clone(&self.header_sentinel);
+        let blockchain = Arc::clone(&self.blockchain);
+        let node = Arc::clone(&self.node);
+        let node_copy = Arc::clone(&self.node);
+
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(10)); // Much longer interval
+            let mut last_height = 0u32;
+
+            loop {
+                interval.tick().await;
+
+                // Only process if height has changed
+                let current_height = {
+                    let chain = blockchain.read().await;
+                    chain.get_latest_block_index() as u32
+                };
+
+                if current_height <= last_height {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+
+                // Get only new headers since last check — RANGED reads, never
+                // get_blocks(): that decoded the ENTIRE chain into memory every 10s
+                // cycle just to take 100 headers (O(chain) RAM + CPU, growing
+                // forever), the same unbounded-materialization class as the whisper
+                // scan fix.
+                let Some((from, to)) =
+                    Self::header_broadcast_window(last_height, current_height, 100)
+                else {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                };
+                let headers = {
+                    let chain = blockchain.read().await;
+                    let mut out = Vec::with_capacity((to.saturating_sub(from) + 1) as usize);
+                    for i in from..=to {
+                        if let Ok(block) = chain.get_block(i) {
+                            out.push(BlockHeaderInfo {
+                                height: block.index,
+                                hash: block.hash,
+                                prev_hash: block.previous_hash,
+                                timestamp: block.timestamp,
+                            });
+                        }
+                    }
+                    out
+                };
+
+                if let Ok(signature) = sentinel.sign_header(&headers).await {
+                    // Snapshot-then-drop: this held the peers guard across up to 5
+                    // network broadcasts plus inter-peer sleeps every cycle — with one
+                    // stalled peer socket that is a repeated ~10-50s guard hold, i.e.
+                    // the 2026-07-08 livelock class.
+                    let targets: Vec<SocketAddr> = {
+                        let peers = node.peers.read().await;
+                        peers.keys().copied().take(5).collect()
+                    };
+                    for addr in targets {
+                        if let Err(e) = sentinel
+                            .broadcast_verified_headers(addr, &headers, &signature, &node_copy)
+                            .await
+                        {
+                            warn!("Failed to broadcast headers to {}: {}", addr, e);
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await; // Add delay between peers
+                    }
+                }
+
+                // Advance to what was actually SENT, not to the chain tip.
+                last_height = to;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    pub async fn process_header_sync(
+        &self,
+        headers: Vec<BlockHeaderInfo>,
+        node_id: &str,
+        signature: Vec<u8>,
+    ) -> Result<(), String> {
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Batch verify headers
+        if let Ok(valid_count) = self
+            .header_sentinel
+            .verify_headers_batch(headers.clone(), node_id, signature)
+            .await
+        {
+            // Update metrics if we verified any headers
+            if valid_count > 0 {
+                if let Some(mut metrics) = self.node_metrics.get_mut(node_id) {
+                    metrics.last_active = start_time;
+                    metrics.blocks_verified += valid_count as u64;
+                    metrics.success_rate = 100.0;
+
+                    // Update header heights in verified set
+                    for header in headers {
+                        metrics.verified_blocks.insert(header.height);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn record_action(
+        &self,
+        address: &str,
+        action_type: ActionType,
+        success: bool,
+        height: Option<u32>,
+    ) -> Result<(), String> {
+        let mut metrics = self
+            .node_metrics
+            .get_mut(address)
+            .ok_or("Node metrics not found")?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if success && action_type == ActionType::BlockValidation {
+            metrics.blocks_verified += 1;
+            if let Some(height) = height {
+                metrics.verified_blocks.insert(height);
+            }
+        }
+
+        metrics
+            .action_history
+            .push_back((now, action_type, success));
+        metrics.calculate_performance_score();
+
+        Ok(())
+    }
+
+    pub async fn register_wallet_metrics(&self, address: &str, balance: f64) -> Result<(), String> {
+        let metrics = NodeMetrics::new(address.to_string(), balance);
+        self.node_metrics.insert(address.to_string(), metrics);
+        Ok(())
+    }
+
+    pub async fn get_node_metrics(&self, address: &str) -> Result<NodeMetrics, String> {
+        self.node_metrics
+            .get(address)
+            .map(|m| m.clone())
+            .ok_or_else(|| "Node metrics not found for address".to_string())
+    }
+
+    pub async fn get_network_metrics(&self) -> Result<NetworkHealth, String> {
+        Ok(self.network_health.read().await.clone())
+    }
+
+    async fn update_network_health(&self, force_full_update: bool) -> Result<(), String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // LOCK ORDER MATTERS: gather every slow input BEFORE taking the health write
+        // lock. This lock is read by interactive status paths (the `info` command);
+        // holding it across blockchain/peers/mempool reads meant a long reorg (which
+        // holds the chain write lock for its whole validation pass) wedged the entire
+        // console for minutes — the "info prints Network Status then hangs" bug.
+        let chain_height = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_latest_block_index() as u32
+        };
+
+        let needs_full = force_full_update || {
+            let health = self.network_health.read().await;
+            now.saturating_sub(health.last_update) > 300
+        };
+        let full_snapshot = if needs_full {
+            let peer_count = self.node.peers.read().await.len();
+            // Active nodes should reflect live network participants (self + connected peers),
+            // not wallet metric entries.
+            let active_nodes = peer_count.saturating_add(1);
+            let network_load = {
+                let blockchain = self.blockchain.read().await;
+                let pending_tx_count = blockchain.get_pending_transactions().await?.len();
+                (pending_tx_count as f64 / MAX_BLOCK_SIZE as f64).min(1.0)
+            };
+            Some((peer_count, active_nodes, network_load))
+        } else {
+            None
+        };
+
+        // Store under a briefly-held write lock — no awaits on other locks inside.
+        let mut health = self.network_health.write().await;
+        health.chain_height = chain_height;
+        if let Some((peer_count, active_nodes, network_load)) = full_snapshot {
+            let total_nodes = active_nodes.max(1);
+            health.active_nodes = active_nodes.max(1);
+            health.participation_rate = (active_nodes as f64 / total_nodes as f64).min(1.0);
+            health.network_load = network_load;
+            health.average_peer_count = peer_count as f64;
+            health.last_update = now;
+        }
+
+        Ok(())
+    }
+
+    /// Temporal admissibility of a PEER-SUPPLIED header timestamp against a
+    /// reference clock: at most `MAX_HEADER_AGE_SECS` old (3 block times) and at
+    /// most `MAX_HEADER_SKEW_SECS` ahead.
+    ///
+    /// Split out as a pure function for two reasons. It is directly testable
+    /// without standing up a sentinel and a chain, and the saturating subtraction
+    /// is load-bearing: the timestamp is attacker-controlled, so a raw `now -
+    /// timestamp` underflows on a future-dated header. That underflow used to
+    /// reject such headers only by accident — the wrapped value looked enormous —
+    /// which meant the behaviour depended on release wrapping semantics and would
+    /// have panicked under overflow checks. The skew clause is what rejects them
+    /// now, deliberately.
+    #[allow(dead_code)]
+    fn header_timestamp_is_temporally_consistent(now: u64, timestamp: u64) -> bool {
+        now.saturating_sub(timestamp) <= Self::MAX_HEADER_AGE_SECS
+            && timestamp <= now.saturating_add(Self::MAX_HEADER_SKEW_SECS)
+    }
+
+    async fn get_block_from_network(&self, hash: [u8; 32]) -> Result<Option<Block>, String> {
+        // Try to get block from connected peers. Snapshot-then-drop (see repair_chain).
+        let addrs: Vec<std::net::SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().take(3).collect()
+        };
+        for addr in addrs {
+            // Try up to 3 peers
+            if let Ok(blocks) = self.node.request_blocks(addr, 0, 0).await {
+                if let Some(block) = blocks.into_iter().find(|b| b.hash == hash) {
+                    return Ok(Some(block));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn enforce_canonical_chain(&self, canonical: Block) -> Result<(), String> {
+        // Simple enforcement - just save the canonical block
+        let blockchain = self.blockchain.read().await;
+        blockchain
+            .save_block(&canonical)
+            .await
+            .map_err(|e| format!("Failed to save canonical block: {}", e))?;
+        Ok(())
+    }
+
+    async fn verify_chain_state(&self) -> Result<(), String> {
+        // Snapshot the tip height under a SHORT read lock and release it BEFORE the
+        // join_all below. verify_block_at_height re-acquires blockchain.read() per child;
+        // holding a parent read across that reentrant re-acquire can stall block-writes
+        // up to the startup timeout under tokio's write-preferring RwLock (audit M5).
+        let current_height = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_latest_block_index() as u32
+        };
+
+        let mut verified_blocks = HashSet::new();
+        let mut anomalies = Vec::new();
+
+        // Verify recent blocks in parallel, but skip very old blocks (genesis era)
+        // Old blocks may have different formats and validation rules
+        const MIN_BLOCK_AGE_FOR_VERIFICATION: u32 = 100; // Skip blocks older than 100 blocks
+        let start_height = current_height.saturating_sub(BLOCK_VERIFICATION_BATCH_SIZE as u32);
+        let min_height = MIN_BLOCK_AGE_FOR_VERIFICATION.max(start_height);
+
+        let blocks: Vec<_> = (min_height..current_height).rev().collect();
+
+        let results = futures::future::join_all(
+            blocks
+                .iter()
+                .map(|&height| self.verify_block_at_height(height)),
+        )
+        .await;
+
+        // Process verification results
+        for (height, result) in blocks.iter().zip(results) {
+            match result {
+                Ok(true) => {
+                    verified_blocks.insert(*height);
+                }
+                Ok(false) => {
+                    anomalies.push(*height);
+                }
+                Err(e) => {
+                    warn!("Error verifying block {}: {}", height, e);
+                }
+            }
+        }
+
+        // Update sentinel stats under a short write lock (not held across the work above).
+        {
+            let mut stats = self.stats.write().await;
+            stats.last_chain_verification = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if !anomalies.is_empty() {
+                stats.anomalies_detected += anomalies.len() as u64;
+            }
+        }
+
+        if !anomalies.is_empty() {
+            self.handle_chain_anomalies(anomalies).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn verify_block_at_height(&self, height: u32) -> Result<bool, String> {
+        // Snapshot ONLY the target block (owned) and drop the read guard BEFORE the batch await, so
+        // no blockchain lock is held across verification. verify_block_batch validates each block
+        // INDEPENDENTLY (per-block sanity; no cross-block/continuity check), so the target's verdict
+        // never depended on its neighbours: the former "target + 49 context blocks" batch discarded
+        // results[1..] entirely. Because verify_chain_state calls this for a whole range of heights,
+        // collecting the context re-read and re-verified the same heavily-overlapping blocks up to
+        // BATCH_SIZE (50) times per sweep — dropping it cuts ~50x the block reads, verification, and
+        // read-lock hold time with an identical result.
+        let target_block = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_block(height)?
+        };
+
+        let results = self.verify_block_batch(&[target_block]).await?;
+        Ok(results[0])
+    }
+
+    async fn verify_block_batch(&self, blocks: &[Block]) -> Result<Vec<bool>, String> {
+        use rayon::prelude::*;
+
+        // No blockchain guard here: the parallel closure below reads only the passed `blocks` slice.
+        // Acquiring a read guard while a caller already holds one risks a reentrant self-deadlock on
+        // the write-preferring RwLock (a writer queued between the two reads parks the second read).
+
+        // Each block's verdict is independent of the others (per-block sanity only), so this is a
+        // plain parallel map over the slice.
+        let results: Vec<bool> = blocks
+            .into_par_iter()
+            .map(Self::block_passes_basic_checks)
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Per-block sanity for BPoS anomaly detection over ALREADY-CONFIRMED blocks (full validation
+    /// ran at mine time; this focuses on network-level anomalies, not re-validation). Depends on the
+    /// single block ONLY — no cross-block/continuity check — which is exactly why
+    /// verify_block_at_height can verify the target block alone without collecting its neighbours.
+    fn block_passes_basic_checks(block: &Block) -> bool {
+        // Empty non-genesis blocks are suspicious.
+        if block.transactions.is_empty() && block.index > 0 {
+            return false;
+        }
+        // Obviously invalid data (negative amounts / fees).
+        for tx in &block.transactions {
+            if tx.amount_units < 0 || tx.fee_units < 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn verify_block_integrity(&self, block: &Block) -> Result<bool, String> {
+        // Verify block hash
+        let calculated_hash = block.calculate_hash_for_block();
+        if calculated_hash != block.hash {
+            return Ok(false);
+        }
+
+        // Verify merkle root
+        let merkle_root = Blockchain::calculate_merkle_root(&block.transactions)?;
+        if merkle_root != block.merkle_root {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    async fn handle_chain_anomalies(&self, anomalies: Vec<u32>) -> Result<(), String> {
+        for height in anomalies {
+            error!(
+                "CRITICAL: Chain anomaly detected at height {} - requires immediate attention",
+                height
+            );
+
+            // Alert network
+            self.broadcast_anomaly_alert(height).await?;
+
+            // Attempt recovery
+            if let Err(e) = self.attempt_chain_recovery(height).await {
+                error!("Failed to recover chain at height {}: {}", height, e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn broadcast_anomaly_alert(&self, height: u32) -> Result<(), String> {
+        // Rate limiting: Only broadcast once per minute to prevent flooding
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut last_broadcast = self.last_anomaly_broadcast.write().await;
+        if now.saturating_sub(*last_broadcast) < 60 {
+            // Skip broadcast if less than 60 seconds since last one
+            return Ok(());
+        }
+        *last_broadcast = now;
+        drop(last_broadcast);
+
+        // Snapshot-then-drop: never hold the peers guard across network sends (the
+        // guard-across-send pattern livelocked the whole node on 2026-07-08).
+        let addrs: Vec<SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().collect()
+        };
+        for addr in addrs {
+            let message = NetworkMessage::AlertMessage(format!("ANOMALY:{}", height));
+
+            if let Err(e) = self.node.send_message(addr, &message).await {
+                error!("Failed to alert peer {} of critical anomaly: {}", addr, e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn attempt_chain_recovery(&self, height: u32) -> Result<(), String> {
+        // Snapshot-then-drop (see broadcast_anomaly_alert).
+        let peer_addrs: Vec<SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().collect()
+        };
+        let mut valid_blocks = Vec::new();
+
+        // Request blocks from peers in parallel
+        let requests = peer_addrs.iter().map(|addr| async {
+            match self.node.request_blocks(*addr, height, height).await {
+                Ok(mut blocks) => {
+                    if blocks.len() == 1
+                        && self
+                            .verify_block_integrity(&blocks[0])
+                            .await
+                            .unwrap_or(false)
+                    {
+                        Some(blocks.remove(0))
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            }
+        });
+
+        let results = futures::future::join_all(requests).await;
+        valid_blocks.extend(results.into_iter().flatten());
+
+        // If we have valid blocks, select the consensus block
+        if !valid_blocks.is_empty() {
+            let consensus_block = self.select_consensus_block(valid_blocks)?;
+
+            // Replace block in blockchain
+            let blockchain = self.blockchain.read().await;
+            blockchain
+                .save_block(&consensus_block)
+                .await
+                .map_err(|e| format!("Failed to save consensus block: {}", e))?;
+
+            // Update network health metrics
+            let mut health = self.network_health.write().await;
+            health.fork_count += 1;
+            health.last_update = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+
+        Ok(())
+    }
+
+    fn select_consensus_block(&self, blocks: Vec<Block>) -> Result<Block, String> {
+        // Group blocks by hash and select the most common
+        let mut block_counts: HashMap<[u8; 32], (usize, Block)> = HashMap::new();
+
+        for block in blocks {
+            block_counts
+                .entry(block.hash)
+                .and_modify(|(count, _)| *count += 1)
+                .or_insert((1, block));
+        }
+
+        block_counts
+            .into_iter()
+            .max_by_key(|(_, (count, _))| *count)
+            .map(|(_, (_, block))| block)
+            .ok_or_else(|| "No consensus block found".to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeMetrics {
+    pub address: String,
+    pub total_balance: f64,
+    pub staked_amount: f64,
+    pub cumulative_rewards: f64,
+    pub current_tier: ValidatorTier,
+    pub tier_progress: f64,
+    pub uptime: f64,
+    pub response_time: u64,
+    pub blocks_verified: u64,
+    pub last_active: u64,
+    pub success_rate: f64,
+    pub network_contribution: f64,
+    pub performance_history: VecDeque<(u64, f64)>,
+    pub last_reward_calculation: u64,
+    pub chain_position: u32,
+    pub last_withdrawal: u64,
+    pub verified_blocks: HashSet<u32>,
+    pub fork_resolutions: u32,
+    pub total_downtime: u64,
+    pub last_header_broadcast: u64,
+    pub peer_response_times: Vec<u64>,
+    pub action_history: VecDeque<(u64, ActionType, bool)>,
+    pub performance_score: f64,
+}
+
+impl NodeMetrics {
+    pub fn new(address: String, total_balance: f64) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Self {
+            address,
+            total_balance,
+            staked_amount: total_balance * AUTO_STAKE_PERCENTAGE,
+            cumulative_rewards: 0.0,
+            current_tier: ValidatorTier::Silver,
+            tier_progress: 0.0,
+            uptime: 100.0,
+            response_time: 0,
+            blocks_verified: 0,
+            last_active: now,
+            success_rate: 0.0,
+            network_contribution: 0.0,
+            performance_history: VecDeque::with_capacity(168),
+            last_reward_calculation: now,
+            chain_position: 0,
+            last_withdrawal: 0,
+            verified_blocks: HashSet::new(),
+            fork_resolutions: 0,
+            total_downtime: 0,
+            last_header_broadcast: now,
+            peer_response_times: Vec::new(),
+            action_history: VecDeque::new(),
+            performance_score: 0.0,
+        }
+    }
+
+    pub fn update_performance(&mut self) -> f64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Keep existing block verification status but allow decay
+        let blocks_score = if self.blocks_verified > 0 {
+            let scaled = (1.0 + (self.blocks_verified as f64 / 5.0).ln()).min(1.0);
+            let inactivity_period = now.saturating_sub(self.last_active);
+
+            // Decay if inactive (exponential decay)
+            if inactivity_period > 3600 {
+                let decay_factor = (-((inactivity_period - 3600) as f64) / 86400.0).exp();
+                (scaled * 0.6) * decay_factor
+            } else {
+                scaled * 0.6
+            }
+        } else {
+            0.0
+        };
+
+        // Factor in recent activity without resetting
+        let active_score = if now.saturating_sub(self.last_active) < 3600 {
+            0.4
+        } else {
+            0.0
+        };
+
+        // Calculate final score while preserving block verification status
+        let performance_score = blocks_score + active_score;
+        self.performance_score = performance_score;
+
+        // Keep success rate at 100% while blocks are being verified
+        self.success_rate = if self.blocks_verified > 0 {
+            if now.saturating_sub(self.last_active) > 3600 {
+                50.0 // Drop to 50% when inactive
+            } else {
+                100.0
+            }
+        } else {
+            0.0
+        };
+
+        performance_score
+    }
+
+    pub fn calculate_performance_score(&mut self) -> f64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let time_since_active = now.saturating_sub(self.last_active) as f64;
+        let decay_factor = (-time_since_active / 3600.0).exp(); // Decay over 1 hour (3600 seconds)
+
+        let active_score = if time_since_active < 60.0 {
+            0.5
+        } else {
+            0.5 * decay_factor // Gradual decay for active score
+        };
+
+        let verification_score = if self.blocks_verified > 0 {
+            let base_score = (1.0 + (self.blocks_verified as f64 / 100.0).ln()).min(1.0) * 0.5;
+
+            // Apply decay to verification score as well
+            base_score * decay_factor
+        } else {
+            0.0
+        };
+
+        self.performance_score = active_score + verification_score;
+
+        self.success_rate = if self.blocks_verified > 0 {
+            if time_since_active < 60.0 {
+                100.0
+            } else {
+                // Decay success rate proportionally to verification score
+                50.0 * decay_factor
+            }
+        } else {
+            0.0
+        };
+
+        self.performance_score
+    }
+
+    pub fn verify_and_prune_actions(&mut self, _now: u64) -> (u64, u64) {
+        const MAX_HISTORY: usize = 1000;
+        const PRUNE_THRESHOLD: usize = 900;
+
+        let total_before = self.verified_blocks.len() as u64;
+
+        // Prune old verifications if needed
+        if self.verified_blocks.len() > MAX_HISTORY {
+            let blocks: Vec<_> = self.verified_blocks.iter().copied().collect();
+            let to_remove = blocks.len() - PRUNE_THRESHOLD;
+
+            for &height in blocks.iter().take(to_remove) {
+                self.verified_blocks.remove(&height);
+            }
+        }
+
+        // Update blocks_verified count
+        self.blocks_verified = self.verified_blocks.len() as u64;
+
+        // Calculate valid actions (recent verifications)
+        let valid_actions = self.blocks_verified;
+
+        self.calculate_performance_score();
+
+        (valid_actions, total_before)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkHealth {
+    pub active_nodes: usize,
+    pub average_block_time: f64,
+    pub chain_height: u32,
+    pub total_staked: f64,
+    pub average_response_time: u64,
+    pub participation_rate: f64,
+    pub fork_count: u32,
+    pub anomaly_count: u32,
+    pub last_update: u64,
+    pub recent_blocks: VecDeque<u32>,
+    pub peer_distribution: HashMap<String, usize>,
+    pub network_load: f64,
+    pub consensus_participation: f64,
+    pub average_peer_count: f64,
+}
+
+impl NetworkHealth {
+    pub fn new() -> Self {
+        Self {
+            active_nodes: 0,
+            average_block_time: 0.0,
+            chain_height: 0,
+            total_staked: 0.0,
+            average_response_time: 0,
+            participation_rate: 0.0,
+            fork_count: 0,
+            anomaly_count: 0,
+            last_update: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            recent_blocks: VecDeque::with_capacity(1000),
+            peer_distribution: HashMap::new(),
+            network_load: 0.0,
+            consensus_participation: 0.0,
+            average_peer_count: 0.0,
+        }
+    }
+
+    pub fn update_fork_count(&mut self, new_fork: bool) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // More aggressive decay - every 30 minutes
+        let time_delta = now.saturating_sub(self.last_update);
+        let periods_elapsed = time_delta / 1800; // 30 minute periods
+
+        if periods_elapsed > 0 {
+            // Decay by 2 per period, ensuring we clear forks more quickly
+            self.fork_count = self.fork_count.saturating_sub((periods_elapsed * 2) as u32);
+        }
+
+        // Add new fork with stricter limits
+        if new_fork {
+            self.fork_count = self.fork_count.saturating_add(1).min(50);
+        }
+
+        self.last_update = now;
+    }
+
+    pub fn adjust_for_slow_blocks(&mut self, avg_block_time: f64) {
+        // Update block time metrics
+        self.average_block_time = avg_block_time;
+
+        // Adjust network load based on block time
+        // Higher block times indicate higher network stress
+        let stress_factor = (avg_block_time / 2.0).min(1.0);
+        self.network_load = self.network_load.max(stress_factor);
+
+        // Update consensus participation based on block timing
+        if avg_block_time > 4.0 {
+            self.consensus_participation *= 0.9; // Reduce participation score for slow blocks
+        }
+
+        // Adjust response time expectation
+        self.average_response_time = (avg_block_time * 1000.0) as u64;
+    }
+}
+
+impl Default for NetworkHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+struct AnomalyDetector {
+    recent_anomalies: VecDeque<String>,
+}
+
+#[derive(Debug)]
+struct SyncManager {}
+
+#[derive(Debug, Clone, Default)]
+pub struct SentinelStats {
+    pub total_headers_processed: u64,
+    pub anomalies_detected: u64,
+    pub forks_resolved: u64,
+    pub nodes_synced: u64,
+    pub rewards_distributed: f64,
+    pub last_chain_verification: u64,
+    pub total_uptime: u64,
+}
+
+// Implementation for cloning
+impl Clone for BPoSSentinel {
+    fn clone(&self) -> Self {
+        Self {
+            blockchain: Arc::clone(&self.blockchain),
+            node: Arc::clone(&self.node),
+            node_metrics: Arc::clone(&self.node_metrics),
+            header_cache: Arc::clone(&self.header_cache),
+            network_health: Arc::clone(&self.network_health),
+            stats: Arc::clone(&self.stats),
+            header_sentinel: Arc::clone(&self.header_sentinel),
+            anomaly_detector: Arc::clone(&self.anomaly_detector),
+            sync_manager: Arc::clone(&self.sync_manager),
+            last_anomaly_broadcast: Arc::clone(&self.last_anomaly_broadcast),
+            verified_headers: Arc::clone(&self.verified_headers),
+            initialized: Arc::clone(&self.initialized),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockHeaderInfo {
+    pub height: u32,
+    pub hash: [u8; 32],
+    pub prev_hash: [u8; 32],
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone)]
+struct HeaderState {
+    header: BlockHeaderInfo,
+    timestamp: u64,
+    verification_count: u32,
+    verified_by: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct VerificationState {
+    timestamp: u64,
+    verifiers: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct NetworkSyncState {
+    participating_nodes: HashSet<String>,
+}
+
+/// A peer's registered ML-DSA verifier key plus the source IP that registered it and when it
+/// was last seen active. Source IP is the anti-Sybil anchor (consensus counts DISTINCT IPs,
+/// not raw keys) and last_seen drives LRU eviction of the bounded map.
+#[derive(Debug, Clone)]
+struct RegisteredKey {
+    mldsa_public_key: Vec<u8>,
+    source_ip: IpAddr,
+    last_seen: u64,
+}
+
+/// Hard cap on the registered-verifier map (>> any real validator set; bounds memory).
+const MAX_PEER_MLDSA_KEYS: usize = 4096;
+/// Max distinct verifier keys accepted from one source IP — the primary DoS/Sybil bound:
+/// one host cannot fill the map or masquerade as many verifiers.
+const MAX_MLDSA_KEYS_PER_IP: usize = 2;
+/// Cap on the in-memory header-verification cache. height>0 headers already require a valid
+/// prev-hash link (bounded), but height-0 headers insert unconditionally, so an attacker
+/// spamming random height-0 headers could grow this without limit (remote OOM). Bounded with
+/// oldest-first eviction; 8192 is far above any live reorg/fork-resolution window.
+const MAX_VERIFICATIONS: usize = 8192;
+/// Low-water mark the verification cache is trimmed back to once it reaches its ceiling.
+/// The gap between this and MAX_VERIFICATIONS is what makes eviction amortised: one linear
+/// pass makes room for that many inserts, instead of one full scan per insert.
+const VERIFICATION_TRIM_TARGET: usize = MAX_VERIFICATIONS * 7 / 8;
+
+#[derive(Debug)]
+pub struct HeaderSentinel {
+    headers: Arc<RwLock<VecDeque<HeaderState>>>,
+    verifications: Arc<DashMap<[u8; 32], VerificationState>>,
+    peer_mldsa_keys: Arc<DashMap<String, RegisteredKey>>,
+    sync_state: Arc<RwLock<NetworkSyncState>>,
+    consensus_threshold: f64,
+    max_headers: usize,
+    public_key: Vec<u8>,
+    secret_key: Vec<u8>,
+    header_rules_version: u32,
+    /// Serialises register_peer_mldsa_key's per-IP count + insert so concurrent registrations
+    /// from the same IP cannot each observe per_ip < cap and all insert (TOCTOU). Registration
+    /// is infrequent and holds no await, so a plain mutex is cheap and deadlock-free.
+    registration_gate: std::sync::Mutex<()>,
+}
+
+impl HeaderSentinel {
+    const LOCAL_VERIFIER_ID: &'static str = "__local__";
+
+    fn strict_header_signatures() -> bool {
+        true
+    }
+
+    fn is_header_rules_v2_active(&self) -> bool {
+        self.header_rules_version >= 2
+    }
+
+    fn max_future_skew_seconds(&self) -> u64 {
+        HEADER_MAX_FUTURE_SECONDS
+    }
+
+    fn signature_required(&self) -> bool {
+        if self.is_header_rules_v2_active() {
+            true
+        } else {
+            Self::strict_header_signatures()
+        }
+    }
+
+    fn external_verifier_count(verifiers: &HashSet<String>) -> usize {
+        verifiers
+            .iter()
+            .filter(|id| id.as_str() != Self::LOCAL_VERIFIER_ID)
+            .count()
+    }
+
+    /// Number of DISTINCT source IPs among a header's external verifiers (LOCAL excluded). This
+    /// is the anti-Sybil NUMERATOR and must be counted on the same basis (distinct IP) as the
+    /// eligibility denominator (registered_verifier_ip_count): MAX_MLDSA_KEYS_PER_IP permits two
+    /// keys behind one IP, so counting raw node_ids would let a single host contribute more to a
+    /// header's tally than to the eligible set and self-satisfy the quorum. A verifier whose key
+    /// is no longer registered (evicted) does not count.
+    fn distinct_verifier_ip_count(&self, verifiers: &HashSet<String>) -> usize {
+        let ips: std::collections::HashSet<IpAddr> = verifiers
+            .iter()
+            .filter(|id| id.as_str() != Self::LOCAL_VERIFIER_ID)
+            .filter_map(|id| self.peer_mldsa_keys.get(id).map(|e| e.value().source_ip))
+            .collect();
+        ips.len()
+    }
+
+    fn verify_signature_with_registered_node_key(
+        &self,
+        payload: &[u8],
+        node_id: &str,
+        signature: &[u8],
+    ) -> Result<bool, String> {
+        if signature.is_empty() {
+            return Ok(false);
+        }
+        // get_mut so we can refresh last_seen: a verifier actively participating in header
+        // consensus must not be LRU-evicted from the bounded key map.
+        let public_key_bytes = {
+            let mut entry = self
+                .peer_mldsa_keys
+                .get_mut(node_id)
+                .ok_or_else(|| format!("No ML-DSA key registered for node {}", node_id))?;
+            entry.last_seen = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            entry.mldsa_public_key.clone()
+        };
+        Ok(mldsa::verify(payload, signature, &public_key_bytes).is_ok())
+    }
+
+    pub fn local_mldsa_public_key(&self) -> Vec<u8> {
+        self.public_key.clone()
+    }
+
+    pub fn register_peer_mldsa_key(
+        &self,
+        node_id: &str,
+        mldsa_public_key: Vec<u8>,
+        ed25519_signature: Vec<u8>,
+        source_ip: IpAddr,
+    ) -> Result<(), String> {
+        if node_id.trim().is_empty() {
+            return Err("Node ID is empty".to_string());
+        }
+        if ed25519_signature.is_empty() {
+            return Err("Missing Ed25519 attestation signature".to_string());
+        }
+
+        let ed_pub = hex::decode(node_id)
+            .map_err(|e| format!("Node ID must be Ed25519 public key hex: {}", e))?;
+        if ed_pub.len() != 32 {
+            return Err("Invalid Ed25519 public key length in node_id".to_string());
+        }
+
+        mldsa::validate_public_key(&mldsa_public_key)?;
+
+        let payload = build_mldsa_binding_payload(node_id, &mldsa_public_key);
+        let verifier = UnparsedPublicKey::new(&ED25519, &ed_pub);
+        verifier
+            .verify(&payload, &ed25519_signature)
+            .map_err(|_| "Invalid Ed25519 attestation signature".to_string())?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Serialise the rest (existing-key update OR per-IP count + insert) so concurrent
+        // same-IP registrations cannot each pass the per-IP cap check and all insert (TOCTOU).
+        let _reg_guard = self
+            .registration_gate
+            .lock()
+            .map_err(|_| "registration gate poisoned".to_string())?;
+
+        // Existing node_id: accept a key rotation, always refresh last_seen + source_ip.
+        if let Some(mut existing) = self.peer_mldsa_keys.get_mut(node_id) {
+            if existing.mldsa_public_key.as_slice() != mldsa_public_key.as_slice() {
+                warn!(
+                    "ML-DSA key rotated for node {} (updating attested key binding)",
+                    node_id
+                );
+                existing.mldsa_public_key = mldsa_public_key;
+            }
+            existing.last_seen = now;
+            existing.source_ip = source_ip;
+            return Ok(());
+        }
+
+        // NEW node_id. Primary bound: at most MAX_MLDSA_KEYS_PER_IP distinct keys per source
+        // IP, so one host can't fill the map or masquerade as many verifiers.
+        let per_ip = self
+            .peer_mldsa_keys
+            .iter()
+            .filter(|e| e.value().source_ip == source_ip)
+            .count();
+        if per_ip >= MAX_MLDSA_KEYS_PER_IP {
+            return Err(format!("Too many ML-DSA registrations from {}", source_ip));
+        }
+        // Backstop: if the map is genuinely full (only reachable with many diverse IPs given
+        // the per-IP cap), evict the least-recently-seen entry to make room. Active verifiers
+        // refresh last_seen on every signature check, so honest participants are not evicted.
+        if self.peer_mldsa_keys.len() >= MAX_PEER_MLDSA_KEYS {
+            if let Some(oldest) = self
+                .peer_mldsa_keys
+                .iter()
+                .min_by_key(|e| e.value().last_seen)
+                .map(|e| e.key().clone())
+            {
+                self.peer_mldsa_keys.remove(&oldest);
+            }
+        }
+        self.peer_mldsa_keys.insert(
+            node_id.to_string(),
+            RegisteredKey {
+                mldsa_public_key,
+                source_ip,
+                last_seen: now,
+            },
+        );
+        Ok(())
+    }
+
+    /// Number of DISTINCT source IPs among registered verifier keys — the anti-Sybil
+    /// consensus denominator. A host registering many self-signed node_ids counts once, so it
+    /// cannot inflate the verifier set to self-satisfy the header quorum.
+    fn registered_verifier_ip_count(&self) -> usize {
+        let ips: std::collections::HashSet<IpAddr> = self
+            .peer_mldsa_keys
+            .iter()
+            .map(|e| e.value().source_ip)
+            .collect();
+        ips.len()
+    }
+
+    pub fn new() -> Self {
+        let (public_key, secret_key) = mldsa::generate_keypair();
+        Self {
+            headers: Arc::new(RwLock::new(VecDeque::with_capacity(10000))),
+            verifications: Arc::new(DashMap::new()),
+            peer_mldsa_keys: Arc::new(DashMap::new()),
+            sync_state: Arc::new(RwLock::new(NetworkSyncState {
+                participating_nodes: HashSet::new(),
+            })),
+            consensus_threshold: 0.67,
+            max_headers: 10000,
+            public_key,
+            secret_key,
+            header_rules_version: HEADER_RULES_VERSION,
+            registration_gate: std::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn spawn_add_verified_header(sentinel: Arc<HeaderSentinel>, header_info: BlockHeaderInfo) {
+        tokio::spawn(async move {
+            if let Err(e) = sentinel.add_verified_header(header_info).await {
+                warn!("Failed to add verified header: {}", e);
+            }
+        });
+    }
+
+    pub async fn verify_header(&self, header: &BlockHeaderInfo) -> bool {
+        if let Some(last_header) = self.headers.read().await.back() {
+            // Verify hash chain
+            if header.prev_hash != last_header.header.hash {
+                return false;
+            }
+
+            // Verify temporal ordering
+            if header.timestamp <= last_header.header.timestamp {
+                return false;
+            }
+
+            true
+        } else {
+            // First header is always valid
+            true
+        }
+    }
+
+    pub async fn verify_headers_batch(
+        &self,
+        headers: Vec<BlockHeaderInfo>,
+        node_id: &str,
+        signature: Vec<u8>,
+    ) -> Result<usize, String> {
+        // Bound the attacker-influenced batch BEFORE any O(n) work (serialize, existing-header map,
+        // chunk loop). A legitimate broadcaster sends at most 100 headers per push, so a batch far
+        // over the cap is abusive; reject it up front rather than let the 4 MiB frame admit ~55k.
+        if headers.len() > MAX_HEADER_SYNC_BATCH {
+            return Err(format!(
+                "Header batch too large: {} > {}",
+                headers.len(),
+                MAX_HEADER_SYNC_BATCH
+            ));
+        }
+        let mut valid_count = 0;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let headers_payload = codec::serialize(&headers)
+            .map_err(|e| format!("Headers serialization error: {}", e))?;
+        let signature_valid =
+            self.verify_signature_with_registered_node_key(&headers_payload, node_id, &signature)?;
+        let batch_requires_signature = self.signature_required();
+        if !signature_valid && batch_requires_signature {
+            return Err("Header batch signature verification failed".to_string());
+        }
+        // Index stored headers by hash once (hash -> height, timestamp) instead of a linear scan
+        // per incoming header: the incoming batch is attacker-influenced, so the old
+        // O(incoming x stored) find made a large header batch quadratic.
+        let existing_headers: std::collections::HashMap<[u8; 32], (u32, u64)> = {
+            self.headers
+                .read()
+                .await
+                .iter()
+                .map(|h| (h.header.hash, (h.header.height, h.header.timestamp)))
+                .collect()
+        };
+
+        // Process up to 200 headers at a time
+        for chunk in headers.chunks(200) {
+            let mut verified_headers = Vec::with_capacity(chunk.len());
+
+            // Verify headers in chunk
+            for header in chunk {
+                let strict_v2 = self.is_header_rules_v2_active();
+                // A header already in the verification cache was validated when first seen. Still
+                // record THIS reporter as one of its verifiers — distinct reporters must accumulate
+                // toward the quorum. The former early `continue` dropped every reporter after the
+                // first, so an honestly-reported conflicting header could never reach quorum and the
+                // reject gate was inert. Push it through to the accumulation block below (which adds
+                // node_id), but skip re-running the temporal/link validation it already passed.
+                if self.verifications.contains_key(&header.hash) {
+                    verified_headers.push(header.clone());
+                    continue;
+                }
+
+                // Do quick temporal verification
+                if header.timestamp > now + self.max_future_skew_seconds() {
+                    continue;
+                }
+
+                // Check previous hash links
+                if header.height > 0 {
+                    let prev_in_chunk = verified_headers
+                        .iter()
+                        .find(|h: &&BlockHeaderInfo| h.hash == header.prev_hash)
+                        .map(|h| (h.height, h.timestamp));
+                    let prev_in_store = existing_headers.get(&header.prev_hash).copied();
+                    let Some((prev_height, prev_timestamp)) = prev_in_chunk.or(prev_in_store)
+                    else {
+                        continue;
+                    };
+
+                    if strict_v2 && header.height != prev_height.saturating_add(1) {
+                        continue;
+                    }
+                    if strict_v2 && header.timestamp <= prev_timestamp {
+                        continue;
+                    }
+                }
+
+                verified_headers.push(header.clone());
+            }
+
+            // Batch add verified headers
+            if !verified_headers.is_empty() {
+                // Bound the verification cache BEFORE taking the headers guard, and once for
+                // the whole chunk rather than once per header. The trim is O(cache); running
+                // it under a lock that block ingestion also needs charged that cost to the
+                // wrong subsystem, and running it per header paid it up to 200 times for one
+                // batch. Chunks are capped at 200, so this reserves the exact room needed.
+                self.trim_verifications(verified_headers.len());
+                let mut header_states = self.headers.write().await;
+
+                for header in verified_headers {
+                    let mut verification =
+                        self.verifications.entry(header.hash).or_insert_with(|| {
+                            VerificationState {
+                                timestamp: now,
+                                verifiers: HashSet::with_capacity(10),
+                            }
+                        });
+
+                    // Add verification
+                    if verification.verifiers.insert(node_id.to_string()) {
+                        valid_count += 1;
+                    }
+
+                    header_states.push_back(HeaderState {
+                        header,
+                        timestamp: now,
+                        verification_count: verification.verifiers.len() as u32,
+                        verified_by: verification.verifiers.clone(),
+                    });
+
+                    // Keep fixed size
+                    if header_states.len() > 1000 {
+                        header_states.pop_front();
+                    }
+                }
+            }
+        }
+
+        Ok(valid_count)
+    }
+
+    pub async fn is_header_verified(&self, hash: &[u8; 32]) -> bool {
+        // Compute the required-verifier threshold (which reads `sync_state`) BEFORE taking
+        // the `verifications` entry guard, so we never hold a DashMap guard across an await.
+        // This keeps the cache's lock order consistent with the rest of the module
+        // (sync_state -> verifications) rather than the inverse.
+        let participating = self.sync_state.read().await.participating_nodes.len();
+        let registered = self.registered_verifier_ip_count();
+        let eligible = participating.max(registered).max(1);
+        let required = self.required_verifier_count(eligible);
+
+        let Some(v) = self.verifications.get(hash) else {
+            return false;
+        };
+        // Count by distinct source IP, matching the IP-based eligibility denominator, so two
+        // keys behind one IP cannot inflate the tally past the quorum threshold.
+        let actual = self.distinct_verifier_ip_count(&v.verifiers);
+
+        actual >= required
+    }
+
+    pub async fn eligible_verifier_count(&self) -> usize {
+        let participating = self.sync_state.read().await.participating_nodes.len();
+        let registered = self.registered_verifier_ip_count();
+        participating.max(registered).max(1)
+    }
+
+    pub async fn should_enforce_consensus_for_headers(&self) -> bool {
+        // Only enforce quorum checks when there is enough validator context to avoid
+        // breaking bootstrap/single-node operation.
+        let eligible = self.eligible_verifier_count().await;
+        eligible >= 3
+    }
+
+    pub async fn has_monitoring_quorum_for_block(&self, height: u32) -> bool {
+        let _ = height;
+        // A conflict is high-confidence telemetry only with real verifier context.
+        // This result never gates canonical block validity; PoW and ledger rules are
+        // the sole validity authority.
+        self.should_enforce_consensus_for_headers().await
+    }
+
+    pub fn should_require_verified_header_record_for_block(&self, height: u32) -> bool {
+        let _ = height;
+        self.is_header_rules_v2_active()
+    }
+
+    pub fn has_verification_record(&self, hash: &[u8; 32]) -> bool {
+        self.verifications.contains_key(hash)
+    }
+
+    pub async fn has_conflicting_verified_header(
+        &self,
+        height: u32,
+        expected_hash: &[u8; 32],
+    ) -> bool {
+        let candidates: Vec<[u8; 32]> = {
+            let headers = self.headers.read().await;
+            headers
+                .iter()
+                .filter(|state| {
+                    state.header.height == height && state.header.hash != *expected_hash
+                })
+                .map(|state| state.header.hash)
+                .collect()
+        };
+
+        for hash in candidates {
+            if self.is_header_verified(&hash).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn required_verifier_count(&self, eligible: usize) -> usize {
+        let eligible = eligible.max(1);
+        // Ratio-based threshold with deterministic integer ceiling.
+        let threshold_ppm = (self.consensus_threshold * 1_000_000.0)
+            .round()
+            .clamp(0.0, 1_000_000.0) as u128;
+        let required = ((eligible as u128)
+            .saturating_mul(threshold_ppm)
+            .saturating_add(999_999))
+            / 1_000_000;
+        (required as usize).clamp(1, eligible)
+    }
+
+    async fn manage_header_cache(&self) -> Result<(), String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Header-cache cleanup under the `headers` lock ONLY, in its own scope so the
+        // guard is RELEASED before we touch `sync_state` below. Holding `headers`
+        // across `sync_state.write()` (as this used to) is the inverse of the order
+        // `add_verified_header` uses (sync_state -> headers): an ABBA deadlock that,
+        // once the cache filled (max_headers), could permanently wedge the header
+        // subsystem when two per-block tasks interleaved (2026-07-09 audit H2). These
+        // two cleanups are independent, so releasing early is behavior-preserving.
+        {
+            let mut headers = self.headers.write().await;
+            // Remove old headers (older than 24 hours)
+            headers.retain(|state| now.saturating_sub(state.timestamp) < 24 * 3600);
+            // If still too many headers, keep only the most recent ones
+            if headers.len() > self.max_headers {
+                let excess = headers.len() - self.max_headers;
+                for _ in 0..excess {
+                    headers.pop_front();
+                }
+            }
+        }
+
+        // Clean up verifications (DashMap — no lock needed)
+        self.verifications
+            .retain(|_, v| now.saturating_sub(v.timestamp) < 24 * 3600);
+
+        // Update sync state — acquired AFTER the `headers` guard above is dropped.
+        let mut sync_state = self.sync_state.write().await;
+        sync_state.participating_nodes.retain(|node| {
+            self.verifications
+                .iter()
+                .any(|v| v.verifiers.contains(node))
+        });
+
+        Ok(())
+    }
+
+    /// Evict the oldest verification entry when the cache is at MAX_VERIFICATIONS and
+    /// `hash` is not already present, so no header path can grow `verifications`
+    /// without bound — height-0 spam (verify_and_add_header), long HeaderSync chains
+    /// (verify_headers_batch), or fresh-hash announces (add_verified_header).
+    /// manage_header_cache only age-prunes (24h), so a count cap is still required.
+    fn evict_oldest_verification_if_full(&self, hash: &[u8; 32]) {
+        // An update to an existing hash consumes no new slot.
+        if self.verifications.contains_key(hash) {
+            return;
+        }
+        self.trim_verifications(1);
+    }
+
+    /// Make room for `incoming` new verification entries, trimming the oldest in one pass.
+    ///
+    /// Evicting exactly one entry per insert is what made this expensive: once the cache is
+    /// saturated EVERY insert paid a full O(MAX_VERIFICATIONS) scan to remove a single entry,
+    /// and on the HeaderSync path that scan ran under the headers write guard, so it charged
+    /// block ingestion for it. Trimming down to a low-water mark instead amortises one pass
+    /// over the ~1k inserts it makes room for.
+    ///
+    /// Selection is linear: `select_nth_unstable_by_key` partitions so everything below the
+    /// pivot is at least as old, which is exactly the set to drop — their order among
+    /// themselves is irrelevant, so a full sort would be wasted work.
+    fn trim_verifications(&self, incoming: usize) {
+        // Gate on the CEILING, trim down to the low-water mark. Gating on the mark instead
+        // would make every insert in the band between the two pay a full collect-and-select
+        // pass — precisely the per-insert cost this exists to remove, leaving the amortisation
+        // in name only. (The validation cache in node.rs shares this shape: its prune owns
+        // the ceiling gate and trims to the mark, for every caller alike.)
+        if self.verifications.len().saturating_add(incoming) <= MAX_VERIFICATIONS {
+            return;
+        }
+        let target = VERIFICATION_TRIM_TARGET.min(MAX_VERIFICATIONS.saturating_sub(incoming));
+        let mut aged: Vec<([u8; 32], u64)> = self
+            .verifications
+            .iter()
+            .map(|e| (*e.key(), e.value().timestamp))
+            .collect();
+        // Size the cut from what was actually collected, not from a length read before it.
+        // Other tasks insert and remove concurrently, so the two can disagree — and deriving
+        // the count from the stale figure would over-evict by the difference.
+        let excess = aged.len().saturating_sub(target);
+        if excess == 0 {
+            return;
+        }
+        if excess >= aged.len() {
+            for (hash, _) in aged {
+                self.verifications.remove(&hash);
+            }
+            return;
+        }
+        aged.select_nth_unstable_by_key(excess, |(_, timestamp)| *timestamp);
+        aged.truncate(excess);
+        for (hash, _) in aged {
+            self.verifications.remove(&hash);
+        }
+    }
+
+    pub async fn add_verified_header(&self, header: BlockHeaderInfo) -> Result<(), String> {
+        // Quick add to headers
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let local_verifier = Self::LOCAL_VERIFIER_ID.to_string();
+
+        let mut headers = self.headers.write().await;
+        if headers.len() >= self.max_headers {
+            drop(headers);
+            self.manage_header_cache().await?;
+            headers = self.headers.write().await;
+        }
+
+        let mut verified_by = HashSet::new();
+        verified_by.insert(local_verifier.clone());
+        headers.push_back(HeaderState {
+            header: header.clone(),
+            timestamp: now,
+            verification_count: 1,
+            verified_by,
+        });
+        drop(headers);
+
+        // Get sync state and record verification
+        let sync_state = self.sync_state.read().await;
+        // Bound the verification cache before inserting a new hash — this announce
+        // path adds one entry per unique header and manage_header_cache only
+        // age-prunes, so an attacker announcing many fresh hashes within 24h would
+        // otherwise grow it without bound.
+        self.evict_oldest_verification_if_full(&header.hash);
+        {
+            let mut state =
+                self.verifications
+                    .entry(header.hash)
+                    .or_insert_with(|| VerificationState {
+                        timestamp: now,
+                        verifiers: HashSet::new(),
+                    });
+            state.verifiers.insert(local_verifier);
+        }
+        for node_id in &sync_state.participating_nodes {
+            // Update verification state
+            let _ = self
+                .verifications
+                .entry(header.hash)
+                .or_insert_with(|| VerificationState {
+                    timestamp: now,
+                    verifiers: HashSet::new(),
+                })
+                .verifiers
+                .insert(node_id.clone());
+        }
+        // Release the sync_state read guard BEFORE acquiring headers.write() below.
+        // Holding a sync_state guard across headers.write() is the second half of the
+        // ABBA with manage_header_cache (headers -> sync_state); sync_state is not read
+        // past this point, so dropping it here keeps the two locks strictly ordered
+        // (2026-07-09 audit H2).
+        drop(sync_state);
+
+        let (verification_count, verified_by) = self
+            .verifications
+            .get(&header.hash)
+            .map(|state| {
+                (
+                    Self::external_verifier_count(&state.verifiers) as u32,
+                    state.verifiers.clone(),
+                )
+            })
+            .unwrap_or((0, HashSet::new()));
+
+        let mut headers = self.headers.write().await;
+        if let Some(last) = headers.back_mut() {
+            if last.header.hash == header.hash {
+                last.verification_count = verification_count;
+                last.verified_by = verified_by;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn verify_and_add_header(
+        &self,
+        header: BlockHeaderInfo,
+        node_id: &str,
+        signature: Vec<u8>,
+    ) -> Result<bool, String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let header_payload =
+            codec::serialize(&header).map_err(|e| format!("Serialization error: {}", e))?;
+        let signature_valid =
+            self.verify_signature_with_registered_node_key(&header_payload, node_id, &signature)?;
+        if !signature_valid && self.signature_required() {
+            return Err("Header signature verification failed".to_string());
+        }
+        if header.timestamp > now + self.max_future_skew_seconds() {
+            return Err("Header timestamp too far in the future".to_string());
+        }
+        if header.height > 0 {
+            let prev = self
+                .headers
+                .read()
+                .await
+                .iter()
+                .rev()
+                .find(|h| h.header.hash == header.prev_hash)
+                .map(|h| h.header.clone())
+                .ok_or_else(|| "Header previous hash not found".to_string())?;
+            if self.is_header_rules_v2_active() && header.height != prev.height.saturating_add(1) {
+                return Err("Header height continuity check failed".to_string());
+            }
+            if self.is_header_rules_v2_active() && header.timestamp <= prev.timestamp {
+                return Err("Header timestamp continuity check failed".to_string());
+            }
+        }
+
+        // Bound the verification cache before inserting a NEW hash, so height-0 spam
+        // (random hashes, no prev-link check) can't OOM us.
+        self.evict_oldest_verification_if_full(&header.hash);
+
+        // Record the verification and take the snapshot the header record needs, then
+        // RELEASE the DashMap entry guard BEFORE awaiting the `headers` lock. Holding a
+        // `verifications` entry guard across `self.headers.write().await` is the inverse of
+        // the order `verify_headers_batch` uses (headers -> verifications), so once the two
+        // paths touched the same shard they could interleave into a stall. Never hold a
+        // verification-cache guard across an await.
+        let (verification_count, verified_by) = {
+            let mut verification =
+                self.verifications
+                    .entry(header.hash)
+                    .or_insert_with(|| VerificationState {
+                        timestamp: now,
+                        verifiers: HashSet::with_capacity(10),
+                    });
+
+            // Add verification atomically
+            verification.verifiers.insert(node_id.to_string());
+
+            (
+                verification.verifiers.len() as u32,
+                verification.verifiers.clone(),
+            )
+        };
+
+        // Add to headers queue with fixed size
+        let mut headers = self.headers.write().await;
+        if headers.len() >= 1000 {
+            // Keep only last 1000 headers
+            headers.pop_front(); // Remove oldest
+        }
+        headers.push_back(HeaderState {
+            header,
+            timestamp: now,
+            verification_count,
+            verified_by,
+        });
+
+        Ok(true)
+    }
+
+    // Regular cleanup of old verifications
+    #[allow(dead_code)]
+    async fn prune_old_verifications(&self, now: u64) {
+        const MAX_AGE: u64 = 60; // Only keep last minute of verifications
+
+        self.verifications
+            .retain(|_, v| now.saturating_sub(v.timestamp) < MAX_AGE);
+
+        let mut headers = self.headers.write().await;
+        headers.retain(|state| now.saturating_sub(state.timestamp) < MAX_AGE);
+    }
+
+    #[allow(dead_code)]
+    async fn verify_signature(
+        &self,
+        data: &[u8],
+        signature: &[u8],
+        public_key: &[u8],
+    ) -> Result<bool, String> {
+        Ok(mldsa::verify(data, signature, public_key).is_ok())
+    }
+
+    #[allow(dead_code)]
+    async fn sign_single_header(&self, header: &BlockHeaderInfo) -> Result<Vec<u8>, String> {
+        let header_bytes =
+            codec::serialize(header).map_err(|e| format!("Serialization error: {}", e))?;
+
+        mldsa::sign(&header_bytes, &self.secret_key)
+    }
+
+    // Add new method for signing multiple headers
+    async fn sign_header(&self, headers: &[BlockHeaderInfo]) -> Result<Vec<u8>, String> {
+        // Serialize all headers into a single byte array
+        let headers_bytes =
+            codec::serialize(headers).map_err(|e| format!("Headers serialization error: {}", e))?;
+
+        // Sign the entire batch of headers
+        mldsa::sign(&headers_bytes, &self.secret_key)
+    }
+    pub async fn verify_chain_consistency(&self) -> Result<bool, String> {
+        let headers = self.headers.read().await;
+        let mut prev_header: Option<&BlockHeaderInfo> = None;
+
+        for state in headers.iter() {
+            if let Some(prev) = prev_header {
+                if state.header.prev_hash != prev.hash {
+                    return Ok(false);
+                }
+                if state.header.timestamp <= prev.timestamp {
+                    return Ok(false);
+                }
+            }
+            prev_header = Some(&state.header);
+        }
+        Ok(true)
+    }
+
+    async fn broadcast_verified_headers(
+        &self,
+        addr: SocketAddr,
+        headers: &[BlockHeaderInfo],
+        signature: &[u8],
+        node: &Arc<Node>,
+    ) -> Result<(), String> {
+        node.advertise_mldsa_key(addr)
+            .await
+            .map_err(|e| e.to_string())?;
+        let message = NetworkMessage::HeaderSync {
+            headers: headers.to_vec(),
+            node_id: node.id().to_string(),
+            signature: signature.to_vec(),
+        };
+
+        node.send_message(addr, &message)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl Default for HeaderSentinel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Helper types for temporal provenance
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainVerification {
+    pub height: u32,
+    pub timestamp: u64,
+    pub verified_by: String,
+    pub verification_time: u64,
+    pub result: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemporalMetric {
+    pub timestamp: u64,
+    pub metric_type: MetricType,
+    pub value: f64,
+    pub node: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MetricType {
+    BlockTime,
+    ResponseTime,
+    NetworkLoad,
+    ConsensusParticipation,
+    ValidationSuccess,
+}
+
+impl From<NodeError> for String {
+    fn from(error: NodeError) -> Self {
+        error.to_string()
+    }
+}
+
+impl From<BlockchainError> for String {
+    fn from(error: BlockchainError) -> Self {
+        error.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Only the tests construct transactions now that the dead verify_transaction
+    // is gone; importing here keeps the lib build free of an unused import.
+    use crate::a9::blockchain::Transaction;
+    use std::collections::HashSet;
+
+    // The cursor must advance to exactly what was sent — never past it — so nothing inside the
+    // cap is dropped. Beyond the cap the window DELIBERATELY jumps to the newest `max` rather
+    // than crawling forward from genesis; that skip is the intended behaviour for a tip beacon,
+    // and is asserted explicitly below.
+    #[test]
+    fn header_broadcast_window_tracks_the_tip_and_advances_only_past_what_it_sent() {
+        type S = BPoSSentinel;
+
+        // Nothing new -> no broadcast.
+        assert_eq!(S::header_broadcast_window(100, 100, 100), None);
+        assert_eq!(S::header_broadcast_window(100, 99, 100), None);
+
+        // Steady state: one new block -> exactly that block.
+        assert_eq!(S::header_broadcast_window(100, 101, 100), Some((101, 101)));
+
+        // Within the cap: every new block, nothing skipped.
+        assert_eq!(S::header_broadcast_window(100, 150, 100), Some((101, 150)));
+
+        // First tick against a live chain: the cursor starts at 0, and the window is the newest
+        // 100 — NOT heights 1..=100, whose parent links no peer can resolve.
+        assert_eq!(
+            S::header_broadcast_window(0, 520_000, 100),
+            Some((519_901, 520_000))
+        );
+
+        // Far behind after a catch-up: still the newest 100, and the cursor lands on the tip so
+        // the next tick resumes from there instead of crawling.
+        let (from, to) = S::header_broadcast_window(1_000, 11_000, 100).unwrap();
+        assert_eq!((from, to), (10_901, 11_000));
+        assert_eq!(
+            S::header_broadcast_window(to, 11_000, 100),
+            None,
+            "advancing the cursor to `to` leaves nothing pending"
+        );
+
+        // The window never reaches below height 1 (genesis is pinned, not broadcast).
+        assert_eq!(S::header_broadcast_window(0, 5, 100), Some((1, 5)));
+        assert_eq!(S::header_broadcast_window(0, 1, 100), Some((1, 1)));
+
+        // Contiguity across ticks: chaining the windows covers every height with no gap.
+        let mut cursor = 0u32;
+        let mut covered = Vec::new();
+        for tip in [10u32, 20, 30] {
+            let (f, t) = S::header_broadcast_window(cursor, tip, 100).unwrap();
+            covered.extend(f..=t);
+            cursor = t;
+        }
+        assert_eq!(covered, (1..=30).collect::<Vec<_>>());
+    }
+
+    fn aged_verification(timestamp: u64) -> VerificationState {
+        VerificationState {
+            timestamp,
+            verifiers: HashSet::new(),
+        }
+    }
+
+    // The cache must stay under its ceiling, and the trim must be AMORTISED: evicting one
+    // entry per insert meant a full O(MAX_VERIFICATIONS) scan on every insert once saturated,
+    // charged (on the HeaderSync path) to the headers write guard.
+    #[test]
+    fn verification_trim_bounds_the_cache_and_drops_the_oldest_first() {
+        let sentinel = HeaderSentinel::new();
+        for i in 0..MAX_VERIFICATIONS as u64 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            sentinel.verifications.insert(hash, aged_verification(i));
+        }
+        assert_eq!(sentinel.verifications.len(), MAX_VERIFICATIONS);
+
+        // Reserving room for one entry trims to the low-water mark in a single pass.
+        sentinel.trim_verifications(1);
+        let after = sentinel.verifications.len();
+        assert!(
+            after <= VERIFICATION_TRIM_TARGET,
+            "trim must reach the low-water mark, got {after}"
+        );
+        assert!(
+            after >= VERIFICATION_TRIM_TARGET.saturating_sub(1),
+            "trim must not overshoot far past the mark, got {after}"
+        );
+
+        // It dropped the OLDEST: the surviving timestamps are the high end of the range.
+        let dropped = MAX_VERIFICATIONS - after;
+        for i in 0..dropped as u64 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            assert!(
+                !sentinel.verifications.contains_key(&hash),
+                "entry {i} was among the oldest and must have been evicted"
+            );
+        }
+
+        // AMORTISATION, asserted rather than described. Every insert from the low-water mark
+        // back up to the ceiling must be absorbed WITHOUT a trim firing — observable as the
+        // map growing monotonically. Gating on the mark instead of the ceiling would trim on
+        // each of these, pinning len at the mark and making the whole exercise pointless.
+        let headroom = MAX_VERIFICATIONS - after - 1;
+        for i in 0..headroom as u64 {
+            let mut hash = [0xffu8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            sentinel
+                .verifications
+                .insert(hash, aged_verification(1_000_000 + i));
+            let before_trim = sentinel.verifications.len();
+            sentinel.trim_verifications(1);
+            assert_eq!(
+                sentinel.verifications.len(),
+                before_trim,
+                "insert {i} of {headroom} below the ceiling must not trigger a pass"
+            );
+        }
+        assert!(
+            sentinel.verifications.len() <= MAX_VERIFICATIONS,
+            "the ceiling must hold across the refill"
+        );
+
+        // One more insert crosses the ceiling, and THAT one trims.
+        let mut hash = [0xeeu8; 32];
+        hash[..8].copy_from_slice(&999u64.to_be_bytes());
+        sentinel
+            .verifications
+            .insert(hash, aged_verification(2_000_000));
+        sentinel.trim_verifications(1);
+        assert!(
+            sentinel.verifications.len() <= VERIFICATION_TRIM_TARGET,
+            "crossing the ceiling must trim back to the low-water mark"
+        );
+    }
+
+    // A whole HeaderSync chunk reserves its room in one call; chunks are capped at 200.
+    #[test]
+    fn verification_trim_reserves_room_for_a_whole_chunk() {
+        let sentinel = HeaderSentinel::new();
+        for i in 0..MAX_VERIFICATIONS as u64 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            sentinel.verifications.insert(hash, aged_verification(i));
+        }
+        sentinel.trim_verifications(200);
+        assert!(
+            sentinel.verifications.len() + 200 <= MAX_VERIFICATIONS,
+            "after reserving for a full chunk the batch must fit under the ceiling"
+        );
+    }
+
+    // A registered key from a DISTINCT source IP (octet), so N such entries count as N
+    // distinct eligible verifiers under the anti-Sybil distinct-IP quorum count.
+    fn reg_key(pk: u8, ip_octet: u8) -> RegisteredKey {
+        RegisteredKey {
+            mldsa_public_key: vec![pk; 32],
+            source_ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, ip_octet)),
+            last_seen: 0,
+        }
+    }
+
+    fn tx_with(amount_units: i128, fee_units: i128) -> Transaction {
+        Transaction {
+            sender: "s".to_string(),
+            recipient: "r".to_string(),
+            fee_units,
+            amount_units,
+            timestamp: 0,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        }
+    }
+
+    fn block_with(index: u32, transactions: Vec<Transaction>) -> Block {
+        Block {
+            index,
+            previous_hash: [0u8; 32],
+            timestamp: 0,
+            transactions,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root: [0u8; 32],
+        }
+    }
+
+    // #7: BPoS block verification is PER-BLOCK — block_passes_basic_checks looks at one block only,
+    // never its neighbours — which is exactly what lets verify_block_at_height verify the target
+    // block alone (its former 49-block context batch had every result but [0] discarded).
+    #[test]
+    fn block_basic_checks_are_per_block_independent() {
+        // A non-genesis block with a valid tx passes.
+        assert!(BPoSSentinel::block_passes_basic_checks(&block_with(
+            5,
+            vec![tx_with(10, 1)]
+        )));
+        // Genesis (index 0) is allowed to be empty.
+        assert!(BPoSSentinel::block_passes_basic_checks(&block_with(
+            0,
+            vec![]
+        )));
+        // An empty NON-genesis block is rejected.
+        assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(
+            5,
+            vec![]
+        )));
+        // Negative amount or fee is rejected.
+        assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(
+            5,
+            vec![tx_with(-1, 0)]
+        )));
+        assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(
+            5,
+            vec![tx_with(10, -1)]
+        )));
+        // One bad tx fails the block regardless of sibling txs — the verdict is a function of this
+        // block alone, so no neighbouring-block context can change it.
+        assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(
+            5,
+            vec![tx_with(10, 1), tx_with(-1, 0)]
+        )));
+    }
+
+    #[test]
+    fn verifier_threshold_is_ratio_based_for_small_sets() {
+        let sentinel = HeaderSentinel::new();
+        // Default threshold is 0.67, so 3 eligible validators require 3 confirmations (ceil(2.01)).
+        assert_eq!(sentinel.required_verifier_count(3), 3);
+        // 4 eligible validators require 3 confirmations (ceil(2.68)).
+        assert_eq!(sentinel.required_verifier_count(4), 3);
+    }
+
+    #[test]
+    fn verifier_threshold_is_clamped_to_valid_range() {
+        let sentinel = HeaderSentinel::new();
+        let required = sentinel.required_verifier_count(10);
+        assert!(required >= 1);
+        assert!(required <= 10);
+    }
+
+    #[tokio::test]
+    async fn header_quorum_enforcement_is_disabled_for_small_networks() {
+        let sentinel = HeaderSentinel::new();
+        assert!(!sentinel.should_enforce_consensus_for_headers().await);
+    }
+
+    #[tokio::test]
+    async fn header_quorum_enforcement_is_enabled_with_three_eligible_nodes() {
+        let sentinel = HeaderSentinel::new();
+        sentinel
+            .peer_mldsa_keys
+            .insert("n1".to_string(), reg_key(1, 1));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n2".to_string(), reg_key(2, 2));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n3".to_string(), reg_key(3, 3));
+        assert!(sentinel.should_enforce_consensus_for_headers().await);
+    }
+
+    // #9: verify_headers_batch must reject an over-cap batch BEFORE doing O(n) work. A legitimate
+    // broadcaster sends <=100 headers; an attacker (limited only by the 4 MiB frame) could send ~55k.
+    #[tokio::test]
+    async fn verify_headers_batch_rejects_oversized_batch() {
+        let sentinel = HeaderSentinel::new();
+        let hdr = |h: u32| BlockHeaderInfo {
+            height: h,
+            hash: [0u8; 32],
+            prev_hash: [0u8; 32],
+            timestamp: 0,
+        };
+
+        // One over the cap: rejected specifically for SIZE (before signature/processing).
+        let oversized: Vec<BlockHeaderInfo> =
+            (0..(MAX_HEADER_SYNC_BATCH as u32 + 1)).map(hdr).collect();
+        assert_eq!(oversized.len(), MAX_HEADER_SYNC_BATCH + 1);
+        let err = sentinel
+            .verify_headers_batch(oversized, "n1", vec![])
+            .await
+            .expect_err("an over-cap header batch must be rejected");
+        assert!(err.contains("too large"), "rejected for size, got: {}", err);
+
+        // A within-cap batch must NOT trip the size gate (it may fail later for other reasons).
+        let ok_size: Vec<BlockHeaderInfo> = (0..10u32).map(hdr).collect();
+        if let Err(e) = sentinel.verify_headers_batch(ok_size, "n1", vec![]).await {
+            assert!(
+                !e.contains("too large"),
+                "a within-cap batch must not be size-rejected: {}",
+                e
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_verified_header_is_detected() {
+        let sentinel = HeaderSentinel::new();
+
+        sentinel
+            .peer_mldsa_keys
+            .insert("n1".to_string(), reg_key(1, 1));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n2".to_string(), reg_key(2, 2));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n3".to_string(), reg_key(3, 3));
+
+        let conflicting_hash = [0xAA; 32];
+        let expected_hash = [0xBB; 32];
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        sentinel.headers.write().await.push_back(HeaderState {
+            header: BlockHeaderInfo {
+                height: 10,
+                hash: conflicting_hash,
+                prev_hash: [0x10; 32],
+                timestamp: now,
+            },
+            timestamp: now,
+            verification_count: 3,
+            verified_by: HashSet::new(),
+        });
+
+        sentinel.verifications.insert(
+            conflicting_hash,
+            VerificationState {
+                timestamp: now,
+                verifiers: ["n1".to_string(), "n2".to_string(), "n3".to_string()]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+
+        assert!(
+            sentinel
+                .has_conflicting_verified_header(10, &expected_hash)
+                .await
+        );
+    }
+
+    // L3 regression: a header's verifier quorum is counted by DISTINCT source IP, not by raw
+    // node_id, so the two keys MAX_MLDSA_KEYS_PER_IP permits behind one IP cannot forge quorum.
+    #[tokio::test]
+    async fn header_quorum_counts_distinct_ips_not_keys() {
+        let sentinel = HeaderSentinel::new();
+        // Three eligible source IPs -> the required threshold is 3 (ceil(3 * 0.67)).
+        sentinel
+            .peer_mldsa_keys
+            .insert("n1".to_string(), reg_key(1, 1));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n2".to_string(), reg_key(2, 2));
+        // Two distinct keys, SAME source IP (10.0.0.3): allowed, but one Sybil identity.
+        sentinel
+            .peer_mldsa_keys
+            .insert("n3a".to_string(), reg_key(3, 3));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n3b".to_string(), reg_key(4, 3));
+        assert_eq!(sentinel.registered_verifier_ip_count(), 3);
+        assert_eq!(sentinel.required_verifier_count(3), 3);
+
+        let hash = [0xCD; 32];
+
+        // Verified by n1 + BOTH keys behind ip3: 3 node_ids but only 2 distinct IPs. Counting keys
+        // would forge quorum (3 >= 3); counting IPs correctly does not (2 < 3).
+        sentinel.verifications.insert(
+            hash,
+            VerificationState {
+                timestamp: 0,
+                verifiers: ["n1".to_string(), "n3a".to_string(), "n3b".to_string()]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        assert!(
+            !sentinel.is_header_verified(&hash).await,
+            "two keys behind one IP must not reach quorum"
+        );
+
+        // Three genuinely distinct verifier IPs DO reach quorum.
+        sentinel.verifications.insert(
+            hash,
+            VerificationState {
+                timestamp: 0,
+                verifiers: ["n1".to_string(), "n2".to_string(), "n3a".to_string()]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        assert!(
+            sentinel.is_header_verified(&hash).await,
+            "three distinct verifier IPs must reach quorum"
+        );
+    }
+
+    #[test]
+    fn header_rule_v2_is_chain_wide() {
+        let sentinel = HeaderSentinel::new();
+        assert!(sentinel.is_header_rules_v2_active());
+        assert!(sentinel.should_require_verified_header_record_for_block(1));
+        assert!(sentinel.should_require_verified_header_record_for_block(1_000_000));
+    }
+
+    // High-confidence block-conflict telemetry requires real verifier context. It is
+    // intentionally incapable of accepting or rejecting canonical blocks.
+    #[tokio::test]
+    async fn block_monitoring_quorum_requires_three_eligible_even_in_v2() {
+        let sentinel = HeaderSentinel::new();
+        assert!(sentinel.is_header_rules_v2_active());
+        // Fresh node: <3 eligible verifiers -> do NOT enforce (was unconditionally true in v2).
+        assert!(!sentinel.has_monitoring_quorum_for_block(1).await);
+        // Three registered verifier IPs -> enforcement engages.
+        sentinel
+            .peer_mldsa_keys
+            .insert("n1".to_string(), reg_key(1, 1));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n2".to_string(), reg_key(2, 2));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n3".to_string(), reg_key(3, 3));
+        assert!(sentinel.has_monitoring_quorum_for_block(1).await);
+    }
+
+    #[test]
+    fn header_rule_v2_uses_fixed_future_skew() {
+        let sentinel = HeaderSentinel::new();
+        assert_eq!(
+            sentinel.max_future_skew_seconds(),
+            HEADER_MAX_FUTURE_SECONDS
+        );
+    }
+
+    // A verifier key from a distinct source IP that can actually sign, so header paths pass
+    // the signature gate and reach the lock code.
+    fn signing_verifier(ip_octet: u8) -> (String, RegisteredKey, Vec<u8>) {
+        let (public_key, secret_key) = mldsa::generate_keypair();
+        let node_id = format!("verifier-{}", ip_octet);
+        let key = RegisteredKey {
+            mldsa_public_key: public_key,
+            source_ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, ip_octet)),
+            last_seen: 0,
+        };
+        (node_id, key, secret_key)
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    // The verify_and_add_header refactor (release the verifications guard before taking the
+    // headers lock) must still record the verification and the header with the right snapshot.
+    #[tokio::test]
+    async fn verify_and_add_header_records_verification_and_header() {
+        let sentinel = HeaderSentinel::new();
+        let (node_id, key, secret_key) = signing_verifier(1);
+        sentinel.peer_mldsa_keys.insert(node_id.clone(), key);
+
+        let header = BlockHeaderInfo {
+            height: 0,
+            hash: [0x42; 32],
+            prev_hash: [0; 32],
+            timestamp: now_secs(),
+        };
+        let payload = codec::serialize(&header).unwrap();
+        let signature = mldsa::sign(&payload, &secret_key).unwrap();
+
+        let added = sentinel
+            .verify_and_add_header(header.clone(), &node_id, signature)
+            .await
+            .unwrap();
+        assert!(added);
+        assert!(sentinel.has_verification_record(&header.hash));
+
+        let headers = sentinel.headers.read().await;
+        let state = headers
+            .iter()
+            .find(|s| s.header.hash == header.hash)
+            .expect("header should be recorded");
+        assert_eq!(state.verification_count, 1);
+        assert!(state.verified_by.contains(&node_id));
+    }
+
+    // Regression guard for the verifications <-> headers lock order (ABBA). verify_and_add_header
+    // (verifications entry -> headers.write) and verify_headers_batch (headers.write ->
+    // verifications entry) must not hold a verifications entry guard across the headers await, or
+    // two concurrent header messages on the same shard can stall the worker. Hammer both paths
+    // concurrently on overlapping hashes and require the whole set to finish inside a timeout; a
+    // reintroduced guard-across-await would hang here. Runs on the same multi-worker runtime shape
+    // as production.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn header_paths_stay_live_under_concurrent_interleaving() {
+        let sentinel = std::sync::Arc::new(HeaderSentinel::new());
+        let (node_id, key, secret_key) = signing_verifier(2);
+        sentinel.peer_mldsa_keys.insert(node_id.clone(), key);
+        let now = now_secs();
+
+        let mut tasks = Vec::new();
+        for i in 0..64u32 {
+            // Single-header path.
+            let s = std::sync::Arc::clone(&sentinel);
+            let id = node_id.clone();
+            let sk = secret_key.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut hash = [0u8; 32];
+                hash[0..4].copy_from_slice(&i.to_le_bytes());
+                let header = BlockHeaderInfo {
+                    height: 0,
+                    hash,
+                    prev_hash: [0; 32],
+                    timestamp: now,
+                };
+                let payload = codec::serialize(&header).unwrap();
+                let signature = mldsa::sign(&payload, &sk).unwrap();
+                let _ = s.verify_and_add_header(header, &id, signature).await;
+            }));
+
+            // Batch path on the SAME hash (same DashMap shard), so the two orders contend.
+            let s = std::sync::Arc::clone(&sentinel);
+            let id = node_id.clone();
+            let sk = secret_key.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut hash = [0u8; 32];
+                hash[0..4].copy_from_slice(&i.to_le_bytes());
+                let headers = vec![BlockHeaderInfo {
+                    height: 0,
+                    hash,
+                    prev_hash: [0; 32],
+                    timestamp: now,
+                }];
+                let payload = codec::serialize(&headers).unwrap();
+                let signature = mldsa::sign(&payload, &sk).unwrap();
+                let _ = s.verify_headers_batch(headers, &id, signature).await;
+            }));
+        }
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(20), async move {
+            for t in tasks {
+                let _ = t.await;
+            }
+        })
+        .await;
+        assert!(
+            joined.is_ok(),
+            "header verification paths deadlocked under concurrent interleaving"
+        );
+    }
+    /// A backward wall-clock adjustment, or a hostile future-dated header, must
+    /// not underflow the age arithmetic. Under release wrapping that produced a
+    /// huge age (rejecting by accident); under overflow checks it would panic on
+    /// attacker-controlled input. The skew bound is what rejects future headers
+    /// now, and it does so deliberately.
+    #[test]
+    fn header_timestamp_checks_survive_clock_movement_in_both_directions() {
+        let now = 1_700_000_000u64;
+
+        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now, now
+        ));
+        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now,
+            now - BPoSSentinel::MAX_HEADER_AGE_SECS
+        ));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now,
+            now - BPoSSentinel::MAX_HEADER_AGE_SECS - 1
+        ));
+
+        // Future-dated within the allowed skew is fine; beyond it is rejected --
+        // and neither path may underflow.
+        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now,
+            now + BPoSSentinel::MAX_HEADER_SKEW_SECS
+        ));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now,
+            now + BPoSSentinel::MAX_HEADER_SKEW_SECS + 1
+        ));
+
+        // Extreme adversarial inputs: no panic, no wrap, correct verdict.
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now,
+            u64::MAX
+        ));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now, 0
+        ));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            0,
+            u64::MAX
+        ));
+        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(
+            0, 0
+        ));
+        // A clock that jumped backwards past the header: age saturates to 0, and
+        // the skew bound is what decides.
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            1, 1_000_000
+        ));
+    }
+
+    /// No wall-clock difference in this module may use raw subtraction: every one
+    /// of them takes an operand that is peer-supplied or a stored timestamp that
+    /// a clock adjustment can move ahead of `now`.
+    #[test]
+    fn bpos_uses_no_raw_wall_clock_subtraction() {
+        let src = include_str!("bpos.rs");
+        let production = src.split("#[cfg(test)]").next().expect("first segment");
+        assert!(
+            !production.contains("now - "),
+            "wall-clock differences must use saturating_sub: a backward clock \
+             adjustment would otherwise wrap or panic"
+        );
+    }
+}

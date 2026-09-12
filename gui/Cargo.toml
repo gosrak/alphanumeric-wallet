@@ -1,0 +1,57 @@
+[package]
+name = "alphanumeric-gui"
+version = "8.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+name = "alphanumeric_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "alphanumeric-wallet"
+path = "src/main.rs"
+
+[dependencies]
+# zeroize feature: without it, ml-dsa's SigningKey::drop and
+# ExpandedSigningKey::drop are no-ops, and every signature leaves several KB of
+# full spending key -- seed, rho, K, tr, s1, s2, t0 and their NTT forms -- in
+# freed memory. Declared by THIS crate only: the node's own manifest does not
+# ask for it, and `default-members = ["."]` means a bare `cargo build` or
+# `cargo test` at the root compiles ml-dsa without it.
+#
+# `cargo build --workspace` is different: cargo unifies features across the
+# members of one invocation, so that command builds a single ml-dsa with
+# `zeroize` ON and the node links that one. Harmless -- the feature adds Drop
+# impls that wipe key material, it changes no signature byte, and the `=0.1.1`
+# pin holds either way. Check it with
+# `cargo tree --workspace -e features -i ml-dsa`.
+ml-dsa = { workspace = true, features = ["zeroize"] }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+argon2 = { workspace = true }
+aes-gcm = { workspace = true }
+chrono = { workspace = true }
+rand = "0.8"
+image = { version = "=0.25.10", default-features = false, features = [
+    "bmp", "gif", "jpeg", "png", "tiff", "webp",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+iced = { version = "0.14", features = ["advanced-shaping", "canvas", "qr_code", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+# xdg-portal rather than gtk3: keeps GTK out of the build. tokio: the picker
+# future is driven from a `Task::perform`, which needs an async runtime.
+rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "tokio"] }
+# 자식 노드를 SIGTERM 으로 세우고(SIGKILL 은 노드의 StartupLockGuard::drop 을
+# 건너뛰어 락과 포트가 남는다), PR_SET_PDEATHSIG 로 GUI 가 죽을 때 노드가
+# 고아로 남지 않게 한다. 버전은 노드 매니페스트와 같은 0.30.1 -- 다르면
+# 잠금파일에 nix 항목이 둘 생긴다.
+nix = { version = "0.30.1", features = ["process", "signal"] }
+
+[dev-dependencies]
+tempfile = "3"
