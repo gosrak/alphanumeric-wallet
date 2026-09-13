@@ -5,7 +5,7 @@ layer 1 whose transactions are signed with **ML-DSA-87 (FIPS 204)** rather than 
 elliptic curve.
 
 [![Rust](https://img.shields.io/badge/Rust-1.93.1-orange)](#build-from-source)
-[![Platform](https://img.shields.io/badge/Platform-Linux-blue)](#supported-platforms)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20x86__64%20%7C%20Linux%20ARM64%20%7C%20Windows-blue)](#supported-platforms)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license-and-credits)
 [![Node](https://img.shields.io/badge/node-v8.0.1-lightgrey)](docs/NODE.md)
 
@@ -46,13 +46,14 @@ node-side additions the wallet needs, on top.
 
 ### From a release
 
-Download `alphanumeric-wallet-linux-x86_64` (and, to run your own node,
-`alphanumeric-node-linux-x86_64`) from [Releases](../../releases), then:
+Each [release](../../releases) carries the wallet and the node for three platforms, and
+a `SHA256SUMS` file covering all of them:
 
-```bash
-chmod +x alphanumeric-wallet-linux-x86_64
-./alphanumeric-wallet-linux-x86_64
-```
+| Platform | Wallet | Node |
+|---|---|---|
+| Linux x86_64 | `alphanumeric-wallet-linux-x86_64` | `alphanumeric-node-linux-x86_64` |
+| Linux ARM64 (aarch64) | `alphanumeric-wallet-linux-aarch64` | `alphanumeric-node-linux-aarch64` |
+| Windows x86_64 | `alphanumeric-wallet-windows-x86_64.zip` — both, unpacked side by side | |
 
 Verify what you downloaded against the checksums published with the release:
 
@@ -60,16 +61,25 @@ Verify what you downloaded against the checksums published with the release:
 sha256sum -c SHA256SUMS
 ```
 
-If you want the wallet to start its own node, the wallet looks for a file named exactly
-`alphanumeric` next to itself — so rename the node asset, or name its path in F7 Settings:
+**Linux.** If you want the wallet to start its own node, the wallet looks for a file
+named exactly `alphanumeric` next to itself — so rename the node asset, or name its path
+in F7 Settings:
 
 ```bash
+chmod +x alphanumeric-wallet-linux-x86_64
 mv alphanumeric-node-linux-x86_64 alphanumeric && chmod +x alphanumeric
+./alphanumeric-wallet-linux-x86_64
 ```
 
-The binaries link nothing but the C library (X11, Wayland and xkbcommon are opened at
-run time), and were built against **glibc 2.39** — Ubuntu 24.04 or newer, or an equally
-recent distribution. On anything older, build from source.
+The Linux binaries link nothing but the C library (X11, Wayland and xkbcommon are opened
+at run time), and were built against **glibc 2.31** — Ubuntu 20.04, Debian 11, Raspberry
+Pi OS Bullseye, or anything newer. On older systems, build from source.
+
+**Windows.** Unpack the zip anywhere and run `alphanumeric-wallet.exe`. The node,
+`alphanumeric.exe`, is already beside it under the name the wallet looks for. The wallet
+keeps its files under `%USERPROFILE%\.alphanumeric-gui`. Windows may warn that the
+program is unrecognised, since the binaries are not code-signed; "More info" → "Run
+anyway" is the way past that, once you have checked the checksum.
 
 ### Build from source
 
@@ -147,9 +157,15 @@ variables — is upstream's, and its reference is kept in **[docs/NODE.md](docs/
 
 ## Supported platforms
 
-Built and tested on Linux (x86_64). The node itself supports macOS and Windows as well
-(see [docs/NODE.md](docs/NODE.md)); the wallet's process supervision and its data
-directory layout are Linux-first and have not been exercised elsewhere.
+Released for Linux x86_64, Linux ARM64 and Windows x86_64, wallet and node alike. The
+Linux builds are exercised on this machine; the Windows build was driven end to end under
+Wine — wallet creation, the node it starts, sync to the network tip, restart, quit, and
+what happens when the wallet is killed — and its Windows-only code paths (process
+supervision via a job object and a console Ctrl-C, the profile directory, the CPU and
+memory gauges) have tests that run on a Windows `cargo test`. It has not yet been run on
+a physical Windows machine. macOS is not built; the node itself supports it (see
+[docs/NODE.md](docs/NODE.md)), and the wallet type-checks there, but no one has linked or
+run it.
 
 ## License and credits
 

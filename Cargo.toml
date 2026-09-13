@@ -161,6 +161,17 @@ webrtc_mesh = ["dep:webrtc", "dep:bytes"]
 # Windows Defender ML detections are often triggered by small, stripped, unsigned binaries
 # that do heavy filesystem + networking (like bootstrap publish). Keep symbols and avoid
 # aggressive LTO/stripping in release builds until the binary is code-signed.
+# What ships: release with the debug info dropped and the binary stripped.
+# `release` above keeps `debug = 1` so a node's panic names its line, and
+# the wallet inherits that at 230 MB. Nothing in the wallet reads its own
+# debug info, so `cargo build --profile dist -p alphanumeric-gui` is the
+# same code at a fraction of the size. The node can use it too; a panic
+# then reports without line numbers.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = true
+
 [profile.release]
 # Integer overflow PANICS in release, it does not wrap.
 #

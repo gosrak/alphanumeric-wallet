@@ -1283,9 +1283,12 @@ impl App {
     pub fn node_binary_display(&self) -> String {
         match self.configured_binary() {
             Some(path) => path.display().to_string(),
-            None => exe_dir()
-                .map(|dir| dir.join("alphanumeric").display().to_string())
-                .unwrap_or_else(|| "alphanumeric (next to the wallet)".to_string()),
+            None => {
+                let name = node::binary_file_name();
+                exe_dir()
+                    .map(|dir| dir.join(&name).display().to_string())
+                    .unwrap_or_else(|| format!("{name} (next to the wallet)"))
+            }
         }
     }
 
@@ -4956,6 +4959,21 @@ async fn discover_via_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The hint names the file `node::locate_binary` will actually look
+    // for. On Windows that is `alphanumeric.exe`; a hint without the suffix
+    // sends the user to put a file there that is never found.
+    #[test]
+    fn the_unconfigured_binary_hint_names_the_platform_file() {
+        let (mut app, _) = App::new();
+        app.node_binary_input = String::new();
+        let shown = app.node_binary_display();
+        assert_eq!(
+            Path::new(&shown).file_name().and_then(|name| name.to_str()),
+            Some(node::binary_file_name().as_str()),
+            "{shown}"
+        );
+    }
     use alphanumeric_gui::seed::MasterSeed;
 
     // M8: create and restore both went through `keystore_payload` by hand

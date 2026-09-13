@@ -9,10 +9,36 @@ use crate::keystore;
 use crate::seed::MasterSeed;
 use zeroize::Zeroizing;
 
+/// The variables that name the user's home directory, first match wins.
+/// Windows has no `HOME`: the profile directory is `USERPROFILE`, and it is
+/// preferred there because a Git-Bash or MSYS shell sets a `HOME` of its
+/// own that points into the shell's tree, not the user's.
+#[cfg(windows)]
+const HOME_VARS: &[&str] = &["USERPROFILE", "HOME"];
+#[cfg(not(windows))]
+const HOME_VARS: &[&str] = &["HOME"];
+
+/// The user's home directory, or `None` if no variable names one.
+pub fn home_dir() -> Option<PathBuf> {
+    home_dir_from(|key| std::env::var_os(key))
+}
+
+/// `home_dir` over any lookup, so a test need not touch the process
+/// environment (tests run in parallel threads; `set_var` races them).
+pub fn home_dir_from<F>(lookup: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    HOME_VARS
+        .iter()
+        .find_map(|key| lookup(key))
+        .map(PathBuf::from)
+}
+
 /// `~/.alphanumeric-gui/seed.enc`, or `None` if there is no home directory.
 pub fn default_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        let mut path = PathBuf::from(home);
+    home_dir().map(|home| {
+        let mut path = home;
         path.push(".alphanumeric-gui");
         path.push("seed.enc");
         path
@@ -427,6 +453,38 @@ pub fn reveal_master_seed(path: &Path, passphrase: &[u8]) -> Result<Zeroizing<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Windows has no `HOME`; the profile directory is `USERPROFILE`. A
+    // wallet that only knows `HOME` refuses to create itself there with "No
+    // home directory available".
+    #[test]
+    fn the_home_directory_is_the_first_home_variable_that_is_set() {
+        let only_home = |key: &str| (key == "HOME").then(|| std::ffi::OsString::from("/h"));
+        assert_eq!(home_dir_from(only_home), Some(PathBuf::from("/h")));
+        assert_eq!(home_dir_from(|_| None), None);
+    }
+
+    // A Git-Bash or MSYS shell leaves a `HOME` pointing into its own tree.
+    // The wallet must not follow it: the profile directory is where the
+    // user's files are, and where a wallet made without that shell went.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_profile_directory_wins_over_a_stray_home() {
+        let both = |key: &str| match key {
+            "USERPROFILE" => Some(std::ffi::OsString::from("C:\\Users\\me")),
+            "HOME" => Some(std::ffi::OsString::from("C:\\msys64\\home\\me")),
+            _ => None,
+        };
+        assert_eq!(home_dir_from(both), Some(PathBuf::from("C:\\Users\\me")));
+    }
+
+    #[test]
+    fn the_default_wallet_path_hangs_off_the_home_directory() {
+        assert_eq!(
+            default_path(),
+            home_dir().map(|home| home.join(".alphanumeric-gui").join("seed.enc"))
+        );
+    }
     use crate::seed::MasterSeed;
 
     #[test]
@@ -587,8 +645,10 @@ mod tests {
         assert_eq!(written.trim_end(), encoded.as_str());
     }
 
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path)
             .expect("metadata")
@@ -729,6 +789,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_export_is_the_same_bytes_and_readable_by_the_owner_only() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -774,6 +835,7 @@ mod tests {
     // I2: `export_bytes` writes exactly the bytes it was given, not whatever
     // happens to be on disk at the moment it runs -- the whole point of
     // reading the envelope before the (non-modal) save dialog opens.
+    #[cfg(unix)]
     #[test]
     fn export_bytes_writes_exactly_the_bytes_it_was_given() {
         let dir = tempfile::tempdir().expect("tempdir");

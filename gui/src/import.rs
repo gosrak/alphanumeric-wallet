@@ -46,6 +46,15 @@ pub fn open_wallet_file(path: &Path, passphrase: &[u8]) -> Result<WalletFile, St
     // for a writer, before the metadata check below could ever run. With
     // O_NONBLOCK the open returns at once and `is_file` refuses it. On a
     // regular file the flag changes nothing.
+    //
+    // A stat first, which blocks on nothing: Windows refuses to open a
+    // directory at all (access denied), and that would surface below as
+    // "Could not read" rather than the plain statement of what it is. The
+    // check after the open stays for whatever changed in between.
+    let not_regular = |path: &Path| format!("{} is not a regular file.", path.display());
+    if std::fs::metadata(path).is_ok_and(|meta| !meta.is_file()) {
+        return Err(not_regular(path));
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -61,7 +70,7 @@ pub fn open_wallet_file(path: &Path, passphrase: &[u8]) -> Result<WalletFile, St
         .map_err(|e| format!("Could not read {}: {e}", path.display()))?
         .is_file();
     if !is_regular {
-        return Err(format!("{} is not a regular file.", path.display()));
+        return Err(not_regular(path));
     }
     // Bounded no matter how the file behaves: `take` caps the read at one
     // byte past the limit, so a regular file that is merely huge is refused

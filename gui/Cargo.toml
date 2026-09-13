@@ -1,6 +1,6 @@
 [package]
 name = "alphanumeric-gui"
-version = "8.0.1"
+version = "8.1.0"
 edition = "2021"
 publish = false
 
@@ -53,6 +53,22 @@ rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", 
 # 0.30.1, the same version the node's manifest asks for -- a different one
 # would put two `nix` entries in the lockfile.
 nix = { version = "0.30.1", features = ["process", "signal"] }
+
+# Process control the standard library does not expose: whether a pid is
+# alive (`OpenProcess`), a graceful stop (a Ctrl-C delivered through the
+# node's own hidden console -- the node's non-unix branch waits on
+# `tokio::signal::ctrl_c`), and a job object so the node dies with the GUI,
+# which is what PR_SET_PDEATHSIG does on Linux above -- and the node's CPU
+# and memory gauges, which read `/proc` elsewhere. 0.61 is the line
+# tokio, mio and socket2 already pull in, so this adds no lockfile entry.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

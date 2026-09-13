@@ -26,7 +26,10 @@ pub const LOG_FILE: &str = "node.log";
 /// where we read the pid back when reclaiming an orphan.
 pub const INSTANCE_LOCK: &str = ".alphanumeric.instance.lock";
 /// The conventional name of the node binary.
-const BINARY_NAME: &str = "alphanumeric";
+/// `alphanumeric`, or `alphanumeric.exe` on Windows.
+pub fn binary_file_name() -> String {
+    format!("alphanumeric{}", std::env::consts::EXE_SUFFIX)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {
@@ -50,8 +53,8 @@ impl NodeConfig {
 /// Same convention as the keystore (`storage::default_path` is
 /// `~/.alphanumeric-gui/seed.enc`).
 pub fn default_data_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        let mut path = PathBuf::from(home);
+    crate::storage::home_dir().map(|home| {
+        let mut path = home;
         path.push(".alphanumeric-gui");
         path.push("node");
         path
@@ -78,14 +81,14 @@ pub fn locate_binary(configured: Option<&Path>, exe_dir: &Path) -> Result<PathBu
             ))
         };
     }
-    let sibling = exe_dir.join(BINARY_NAME);
+    let name = binary_file_name();
+    let sibling = exe_dir.join(&name);
     if sibling.is_file() {
         Ok(sibling)
     } else {
         Err(format!(
-            "No node binary found. Looked for `{}` next to the wallet, in {}. \
+            "No node binary found. Looked for `{name}` next to the wallet, in {}. \
              Set the path in settings, or put the two side by side.",
-            BINARY_NAME,
             exe_dir.display()
         ))
     }
@@ -94,7 +97,7 @@ pub fn locate_binary(configured: Option<&Path>, exe_dir: &Path) -> Result<PathBu
 /// The whole environment given to the child. **It does not inherit the
 /// parent's environment** -- an `ALPHANUMERIC_*` left in the user's shell
 /// would drag the wallet's node into the mining node's configuration.
-/// `HOME`/`PATH`/`LANG` are passed separately by the caller (Task 2).
+/// `inherited_env_keys` are passed separately by the caller (Task 2).
 pub fn child_env(config: &NodeConfig) -> Vec<(String, String)> {
     vec![
         // Starts as a node with no wallet. With no `private.key` it
@@ -127,6 +130,30 @@ pub fn child_env(config: &NodeConfig) -> Vec<(String, String)> {
     ]
 }
 
+/// The parent's variables the child gets back after `env_clear`: what the
+/// platform's loader and runtime cannot do without, and nothing that could
+/// carry a mining node's configuration. On Windows a process without
+/// SYSTEMROOT commonly fails in DLL or Winsock initialisation, and the
+/// profile directory stands in for HOME.
+pub fn inherited_env_keys() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &[
+            "PATH",
+            "LANG",
+            "SYSTEMROOT",
+            "SYSTEMDRIVE",
+            "USERPROFILE",
+            "TEMP",
+            "TMP",
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        &["HOME", "PATH", "LANG"]
+    }
+}
+
 pub fn explorer_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
@@ -137,12 +164,13 @@ pub fn stats_url(port: u16) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopOutcome {
-    /// Went down on its own via SIGTERM. The node has removed the lock and
-    /// released its ports.
+    /// Went down on its own when asked (SIGTERM; Ctrl-C on Windows). The
+    /// node has removed the lock and released its ports.
     Graceful,
-    /// Overran the grace period and was SIGKILLed. The node's
-    /// `StartupLockGuard::drop` never ran, so the lock may still be sitting
-    /// there -- the next start's `reclaim_orphan` cleans it up.
+    /// Overran the grace period and was killed outright (SIGKILL;
+    /// `TerminateProcess` on Windows). The node's `StartupLockGuard::drop`
+    /// never ran, so the lock may still be sitting there -- the next start's
+    /// `reclaim_orphan` cleans it up.
     Killed,
 }
 
@@ -181,7 +209,7 @@ impl NodeProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err));
-        for key in ["HOME", "PATH", "LANG"] {
+        for key in inherited_env_keys() {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }
@@ -206,12 +234,30 @@ impl NodeProcess {
             }
         }
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // A console of its own, with no window. `ask_to_stop` attaches
+            // to it to deliver a Ctrl-C; a child of a windowless GUI has no
+            // console at all otherwise, and a Ctrl-C has nowhere to go.
+            command.creation_flags(win::CREATE_NO_WINDOW);
+        }
+
         let child = command.spawn().map_err(|e| {
             format!(
                 "Could not start the node at {}: {e}",
                 config.binary.display()
             )
         })?;
+
+        // The node dies with the GUI, as PR_SET_PDEATHSIG does above. Best
+        // effort: a GUI that is itself inside a job that forbids nesting
+        // still gets its node, just not the tie.
+        #[cfg(windows)]
+        if let Err(e) = win::kill_with_the_gui(&child) {
+            eprintln!("The node will not be stopped if the wallet crashes: {e}");
+        }
+
         Ok(Self { child })
     }
 
@@ -225,14 +271,19 @@ impl NodeProcess {
             .map_err(|e| format!("Could not check on the node: {e}"))
     }
 
-    /// Sends SIGTERM and waits `grace`. SIGKILLs if it's still alive after
-    /// that.
+    /// Asks the node to stop and waits `grace`. Kills it outright if it's
+    /// still alive after that.
     pub fn stop(&mut self, grace: Duration) -> Result<StopOutcome, String> {
         if self.exited()?.is_some() {
             return Ok(StopOutcome::Graceful);
         }
-        send_sigterm(self.child.id());
-        let deadline = Instant::now() + grace;
+        // An ask that could not even be delivered has no reason to wait
+        // for: straight to the kill.
+        let deadline = if ask_to_stop(self.child.id()) {
+            Instant::now() + grace
+        } else {
+            Instant::now()
+        };
         while Instant::now() < deadline {
             if self.exited()?.is_some() {
                 return Ok(StopOutcome::Graceful);
@@ -245,16 +296,21 @@ impl NodeProcess {
     }
 }
 
-fn send_sigterm(pid: u32) {
+/// Asks `pid` to shut down cleanly: SIGTERM, or on Windows a Ctrl-C. `true`
+/// if the ask was delivered -- not that the process obeyed.
+fn ask_to_stop(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        let _ = nix::sys::signal::kill(
+        nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGTERM,
-        );
+        )
+        .is_ok()
     }
-    #[cfg(not(unix))]
-    let _ = pid;
+    #[cfg(windows)]
+    {
+        win::ask_to_stop(pid)
+    }
 }
 
 fn is_alive(pid: u32) -> bool {
@@ -262,10 +318,145 @@ fn is_alive(pid: u32) -> bool {
     {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = pid;
-        false
+        win::is_alive(pid)
+    }
+}
+
+/// Windows has no signals. What stands in for them, and for PDEATHSIG.
+#[cfg(windows)]
+mod win {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+        ATTACH_PARENT_PROCESS, CTRL_C_EVENT,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    pub use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    /// Closed on drop.
+    struct Owned(HANDLE);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a handle this process opened and has not closed.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    /// `kill(pid, 0)`'s answer. A pid that cannot be opened is alive
+    /// unless the system says there is no such process: `reclaim_orphan`
+    /// deletes the lock of a pid that is not alive, and a node that merely
+    /// refused us a handle must not lose its lock.
+    pub fn is_alive(pid: u32) -> bool {
+        // SAFETY: plain system calls on a pid; the handle is closed by
+        // `Owned` on every path.
+        unsafe {
+            let handle = Owned(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid));
+            if handle.0.is_null() {
+                let error = std::io::Error::last_os_error();
+                return error.raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32);
+            }
+            let mut code = 0u32;
+            GetExitCodeProcess(handle.0, &mut code) != 0 && code == STILL_ACTIVE as u32
+        }
+    }
+
+    /// The GUI's own Ctrl-C handler: swallows the event. Installed once,
+    /// never removed. The event `ask_to_stop` sends reaches the GUI too,
+    /// and it arrives AFTER `GenerateConsoleCtrlEvent` returns, on a thread
+    /// of its own -- an "ignore" switched on for the call and off again
+    /// right after it was measured (under Wine) to leave the GUI dead: the
+    /// event landed once the ignore was already gone. A handler routine
+    /// is not inherited by the node the GUI starts, unlike the
+    /// `SetConsoleCtrlHandler(NULL, TRUE)` flag, so the node keeps its own
+    /// Ctrl-C handling.
+    unsafe extern "system" fn swallow_ctrl_c(ctrl_type: u32) -> windows_sys::core::BOOL {
+        (ctrl_type == CTRL_C_EVENT) as windows_sys::core::BOOL
+    }
+
+    /// A Ctrl-C to `pid`, which must own a console (`CREATE_NO_WINDOW`
+    /// gives it one): the GUI attaches to that console, sends the event to
+    /// everything on it -- the node, and the GUI itself, which swallows it
+    /// -- and detaches. `false` if the console could not be attached to,
+    /// or the event not sent.
+    pub fn ask_to_stop(pid: u32) -> bool {
+        // SAFETY: console attachment is process-global state, undone before
+        // returning; the handler is a plain function with the documented
+        // signature, and stays installed for the process's lifetime.
+        static SWALLOW: std::sync::Once = std::sync::Once::new();
+        unsafe {
+            SWALLOW.call_once(|| {
+                SetConsoleCtrlHandler(Some(swallow_ctrl_c), 1);
+            });
+            FreeConsole();
+            if AttachConsole(pid) == 0 {
+                return false;
+            }
+            let sent = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) != 0;
+            FreeConsole();
+            // Back to the console the wallet was started from, if there is
+            // one (a terminal, or `cargo test`), so its output keeps going
+            // there. Started from Explorer there is none, and this fails
+            // without effect.
+            AttachConsole(ATTACH_PARENT_PROCESS);
+            sent
+        }
+    }
+
+    /// Puts `child` in a job that kills its members when its last handle
+    /// closes -- and the last handle closes when this process ends,
+    /// however it ends. The job handle is leaked on purpose: closing it
+    /// earlier would be the kill.
+    pub fn kill_with_the_gui(child: &Child) -> Result<(), String> {
+        // SAFETY: the limit struct is plain data passed by pointer with its
+        // size; the child handle is `std`'s own, still open while `child`
+        // lives.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Err(format!(
+                    "could not create a job object: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if set == 0 {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(format!(
+                    "could not set the job's kill-on-close limit: {error}"
+                ));
+            }
+            if AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) == 0 {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(format!("could not assign the node to the job: {error}"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -291,7 +482,7 @@ pub fn reclaim_orphan(lock_path: &Path, grace: Duration) -> Result<Option<u32>, 
         let _ = std::fs::remove_file(lock_path);
         return Ok(None);
     }
-    send_sigterm(pid);
+    let _ = ask_to_stop(pid);
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
         if !is_alive(pid) {
@@ -543,6 +734,44 @@ fn supervise(config: NodeConfig, rx: mpsc::Receiver<Command>, state: Arc<Mutex<N
 mod tests {
     use super::*;
 
+    // On Windows the node next to the wallet is `alphanumeric.exe`; a
+    // lookup for the bare name never finds it.
+    #[test]
+    fn the_node_binary_carries_the_platform_exe_suffix() {
+        assert_eq!(
+            binary_file_name(),
+            format!("alphanumeric{}", std::env::consts::EXE_SUFFIX)
+        );
+    }
+
+    // Same convention as the keystore, and the same home lookup: a
+    // Windows profile directory counts.
+    #[test]
+    fn the_default_data_dir_hangs_off_the_home_directory() {
+        assert_eq!(
+            default_data_dir(),
+            crate::storage::home_dir().map(|home| home.join(".alphanumeric-gui").join("node"))
+        );
+    }
+
+    // The child starts from a cleared environment. What it gets back is
+    // what the platform's loader and runtime cannot do without: on Windows
+    // a process without SYSTEMROOT commonly fails in DLL or Winsock
+    // initialisation, and nothing else there stands in for HOME.
+    #[test]
+    fn the_inherited_variables_are_what_the_platform_needs() {
+        let keys = inherited_env_keys();
+        assert!(keys.contains(&"PATH"));
+        if cfg!(windows) {
+            for key in ["SYSTEMROOT", "SYSTEMDRIVE", "USERPROFILE", "TEMP", "TMP"] {
+                assert!(keys.contains(&key), "{key} missing from {keys:?}");
+            }
+        } else {
+            assert!(keys.contains(&"HOME"));
+            assert!(!keys.contains(&"SYSTEMROOT"));
+        }
+    }
+
     #[test]
     fn a_configured_binary_that_exists_wins() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -569,7 +798,7 @@ mod tests {
     #[test]
     fn without_a_configured_path_the_sibling_of_the_gui_is_used() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let sibling = dir.path().join("alphanumeric");
+        let sibling = dir.path().join(binary_file_name());
         std::fs::write(&sibling, b"").expect("write");
         assert_eq!(locate_binary(None, dir.path()).expect("found"), sibling);
     }
@@ -707,6 +936,7 @@ mod tests {
         assert_eq!(stats_url(8097), "http://127.0.0.1:8097");
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_log_and_lock_sit_in_the_data_directory() {
         let config = sample_config();
@@ -719,6 +949,7 @@ mod tests {
 
     use std::time::Duration;
 
+    #[cfg(unix)]
     /// A fake to stand in for the node. The `trap` flag makes one that
     /// honors SIGTERM and one that ignores it -- the latter actually
     /// exercises the SIGKILL fallback path.
@@ -738,6 +969,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn fake_config(dir: &Path, honors_sigterm: bool) -> NodeConfig {
         NodeConfig {
             binary: fake_node(dir, honors_sigterm),
@@ -784,6 +1016,7 @@ mod tests {
         supervisor
     }
 
+    #[cfg(unix)]
     /// `trap ... TERM` runs before the fake prints `hello` (see `fake_node`
     /// above), so a line in the log is a deterministic proof the trap is
     /// installed. Measured: sending SIGTERM right after `spawn()` with no
@@ -801,6 +1034,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawning_creates_the_data_directory_and_the_log() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -842,6 +1076,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn sigterm_stops_it_without_a_kill() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -861,6 +1096,7 @@ mod tests {
     /// SIGKILL skips the node's `StartupLockGuard::drop`, leaving the lock
     /// and ports behind. So it's used only as a last resort, and this
     /// checks that last resort actually exists.
+    #[cfg(unix)]
     #[test]
     fn a_child_that_ignores_sigterm_is_killed_after_the_grace_period() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -877,6 +1113,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn exited_is_none_while_it_runs_and_some_after_it_stops() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -907,6 +1144,7 @@ mod tests {
     /// immediately orphans its grandchild, which a subreaper picks up, so
     /// it actually goes away. That's also the real situation
     /// `reclaim_orphan` deals with.
+    #[cfg(unix)]
     #[test]
     fn a_live_orphan_named_by_the_lock_is_stopped() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1032,6 +1270,110 @@ mod tests {
         assert!(tail_log(&dir.path().join("absent.log"), 5).is_empty());
     }
 
+    // The Windows side of `is_alive`, `ask_to_stop` and `kill_with_the_gui`.
+    // These run only on a Windows `cargo test`; on Linux they are not even
+    // compiled.
+    #[cfg(windows)]
+    mod windows {
+        use super::super::*;
+        use std::os::windows::process::CommandExt;
+
+        #[test]
+        fn the_gui_itself_is_alive() {
+            assert!(is_alive(std::process::id()));
+        }
+
+        #[test]
+        fn an_exited_child_is_not_alive() {
+            let mut child = std::process::Command::new("cmd")
+                .args(["/c", "exit 0"])
+                .creation_flags(win::CREATE_NO_WINDOW)
+                .spawn()
+                .expect("spawn cmd");
+            let pid = child.id();
+            child.wait().expect("wait");
+            assert!(!is_alive(pid));
+        }
+
+        // What `NodeProcess::stop` and `reclaim_orphan` rely on: a child
+        // started the way `spawn` starts the node (a hidden console of its
+        // own) receives a Ctrl-C from the GUI, which has no console. ping
+        // has no handler, so the default one ends it.
+        #[test]
+        fn a_ctrl_c_reaches_a_child_with_a_hidden_console() {
+            let mut child = std::process::Command::new("ping")
+                .args(["-n", "300", "127.0.0.1"])
+                .creation_flags(win::CREATE_NO_WINDOW)
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn ping");
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(ask_to_stop(child.id()), "the Ctrl-C was delivered");
+            super::wait_for(
+                || child.try_wait().expect("try_wait").is_some(),
+                "ping to end on Ctrl-C",
+            );
+        }
+    }
+
+    /// The real node, started the way the wallet starts it and asked to
+    /// stop the way the wallet asks. Only with `ALPHANUMERIC_NODE_BINARY`
+    /// naming a node binary for THIS target (a Windows `cargo test` wants
+    /// `alphanumeric.exe`; under Wine, the same): the other tests stand in
+    /// scripts for the node, and this is the one that checks the stand-in
+    /// against the real thing -- that the platform's stop signal reaches
+    /// it and that it takes its lock away on the way out. Skipped, with a
+    /// note, when the variable is not set.
+    ///
+    /// Heavy: a fresh data directory means the node fetches and unpacks
+    /// the chain snapshot first (about 200 MB down, 1.5 GB on disk, a few
+    /// minutes), and only a node past that point has its signal handling
+    /// in place -- asked earlier it dies like any process would, lock and
+    /// all. Readiness is the stats server answering on its port.
+    #[test]
+    fn the_real_node_stops_gracefully_and_removes_its_lock() {
+        let Some(binary) = std::env::var_os("ALPHANUMERIC_NODE_BINARY") else {
+            eprintln!("ALPHANUMERIC_NODE_BINARY not set; the real-node stop test is skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = NodeConfig {
+            binary: PathBuf::from(binary),
+            data_dir: dir.path().join("node"),
+            p2p_port: 17378,
+            explorer_port: 18296,
+            stats_port: 18297,
+        };
+        let mut node = NodeProcess::spawn(&config).expect("the node starts");
+        let lock = config.lock_path();
+        let started = Instant::now();
+        let stats = std::net::SocketAddr::from(([127, 0, 0, 1], config.stats_port));
+        let up =
+            |addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok();
+        while !up(stats) {
+            assert!(
+                node.exited().expect("try_wait").is_none(),
+                "the node exited before its stats server came up:\n{}",
+                std::fs::read_to_string(config.log_path()).unwrap_or_default()
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(15 * 60),
+                "no stats server after 15 min:\n{}",
+                std::fs::read_to_string(config.log_path()).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert!(lock.exists(), "a running node holds its lock");
+        let outcome = node.stop(Duration::from_secs(40)).expect("stop");
+        assert_eq!(
+            outcome,
+            StopOutcome::Graceful,
+            "log:\n{}",
+            std::fs::read_to_string(config.log_path()).unwrap_or_default()
+        );
+        assert!(!lock.exists(), "a graceful exit removes the lock");
+    }
+
     fn wait_for(mut done: impl FnMut() -> bool, what: &str) {
         for _ in 0..200 {
             if done() {
@@ -1042,6 +1384,7 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_supervisor_reaches_running_and_reports_the_pid() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1079,14 +1422,23 @@ mod tests {
     fn a_child_that_dies_on_its_own_is_noticed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let supervisor = start_supervised(|| {
-            let binary = dir.path().join("quitter");
-            std::fs::write(&binary, "#!/bin/sh\nexit 3\n").expect("write");
+            // A script the platform runs directly: a shell script, or on
+            // Windows a batch file, which `Command` hands to cmd.exe.
             #[cfg(unix)]
-            {
+            let binary = {
                 use std::os::unix::fs::PermissionsExt;
+                let binary = dir.path().join("quitter");
+                std::fs::write(&binary, "#!/bin/sh\nexit 3\n").expect("write");
                 std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
                     .expect("chmod");
-            }
+                binary
+            };
+            #[cfg(windows)]
+            let binary = {
+                let binary = dir.path().join("quitter.bat");
+                std::fs::write(&binary, "@exit 3\r\n").expect("write");
+                binary
+            };
             NodeConfig {
                 binary,
                 data_dir: dir.path().join("node"),
@@ -1102,6 +1454,7 @@ mod tests {
         assert_eq!(supervisor.state(), NodeState::Exited { code: Some(3) });
     }
 
+    #[cfg(unix)]
     #[test]
     fn dropping_the_supervisor_stops_the_node() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1123,6 +1476,7 @@ mod tests {
     /// without dropping the `Supervisor` -- the Drop path is already
     /// covered by `dropping_the_supervisor_stops_the_node`, and this defect
     /// only shows up when `stop()` is called without a Drop.
+    #[cfg(unix)]
     #[test]
     fn an_explicitly_stopped_supervisor_stops_reporting_running() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1139,6 +1493,7 @@ mod tests {
         assert_eq!(supervisor.state(), NodeState::Stopped);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_supervisor_surfaces_the_log() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -70,17 +70,93 @@ pub fn cpu_percent(prev: &CpuSample, now: &CpuSample) -> Option<f32> {
 }
 
 pub fn read_cpu_sample(pid: u32) -> Option<CpuSample> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     Some(CpuSample {
         pid,
-        ticks: parse_cpu_ticks(&stat)?,
+        ticks: read_cpu_ticks(pid)?,
         at: Instant::now(),
     })
 }
 
+/// utime + stime in USER_HZ ticks, however the platform counts them.
+#[cfg(not(windows))]
+fn read_cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_cpu_ticks(&stat)
+}
+
+#[cfg(windows)]
+fn read_cpu_ticks(pid: u32) -> Option<u64> {
+    win::cpu_ticks(pid)
+}
+
+#[cfg(not(windows))]
 pub fn read_rss_kib(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     parse_rss_kib(&status)
+}
+
+#[cfg(windows)]
+pub fn read_rss_kib(pid: u32) -> Option<u64> {
+    win::rss_kib(pid)
+}
+
+/// The same two numbers from the process APIs, since there is no `/proc`.
+#[cfg(windows)]
+mod win {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    /// Closed on drop.
+    struct Owned(HANDLE);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a handle this process opened and has not closed.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    fn open(pid: u32) -> Option<Owned> {
+        // SAFETY: a plain system call on a pid.
+        let handle = Owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) });
+        (!handle.0.is_null()).then_some(handle)
+    }
+
+    /// `GetProcessTimes` counts in 100 ns units; a USER_HZ tick is 10 ms.
+    const UNITS_PER_TICK: u64 = 10_000_000 / super::USER_HZ as u64;
+
+    fn as_u64(time: FILETIME) -> u64 {
+        (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+    }
+
+    pub fn cpu_ticks(pid: u32) -> Option<u64> {
+        let process = open(pid)?;
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: four out-pointers to live locals, and a handle opened above.
+        let ok =
+            unsafe { GetProcessTimes(process.0, &mut creation, &mut exit, &mut kernel, &mut user) };
+        (ok != 0).then_some((as_u64(kernel) + as_u64(user)) / UNITS_PER_TICK)
+    }
+
+    pub fn rss_kib(pid: u32) -> Option<u64> {
+        let process = open(pid)?;
+        // SAFETY: the struct is plain data, sized by its own `cb`.
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = unsafe { K32GetProcessMemoryInfo(process.0, &mut counters, counters.cb) };
+        (ok != 0).then_some(counters.WorkingSetSize as u64 / 1024)
+    }
 }
 
 /// What the CPU gauge fills against: ONE busy core, 0..=1. `cpu_percent`
@@ -155,6 +231,50 @@ fn counts_as_gone(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The gauges on Windows. The wallet's own process stands in for the
+    // node: it is certainly alive, certainly resident, and can be made to
+    // burn CPU on demand.
+    #[cfg(windows)]
+    mod windows {
+        use super::super::*;
+
+        #[test]
+        fn the_resident_size_of_a_live_process_is_measured() {
+            let rss = read_rss_kib(std::process::id()).expect("measured");
+            assert!(
+                rss > 1024,
+                "a running wallet is more than a megabyte resident: {rss}"
+            );
+        }
+
+        #[test]
+        fn cpu_ticks_advance_while_the_process_works() {
+            let pid = std::process::id();
+            let before = read_cpu_sample(pid).expect("measured");
+            let started = Instant::now();
+            let mut x = 0u64;
+            while started.elapsed() < std::time::Duration::from_millis(300) {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            }
+            std::hint::black_box(x);
+            let after = read_cpu_sample(pid).expect("measured");
+            assert!(
+                after.ticks > before.ticks,
+                "{} -> {}",
+                before.ticks,
+                after.ticks
+            );
+            let percent = cpu_percent(&before, &after).expect("two samples");
+            assert!(percent > 10.0, "a busy loop reads as load: {percent}");
+        }
+
+        #[test]
+        fn a_pid_that_does_not_exist_is_not_measured() {
+            assert!(read_cpu_sample(4_000_000_000).is_none());
+            assert!(read_rss_kib(4_000_000_000).is_none());
+        }
+    }
 
     /// `/proc/<pid>/stat`'s comm field is wrapped in parentheses and **can
     /// itself hold spaces and parentheses**. Splitting on whitespace from the
@@ -285,6 +405,7 @@ mod tests {
     /// Skipping an unreadable subdirectory and adding up the rest would show
     /// the DISK field a smaller-than-real number **as if it were correct**.
     /// When part of it is unknown, say so.
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_subdirectory_makes_the_size_unknown_not_smaller() {
         use std::os::unix::fs::PermissionsExt;

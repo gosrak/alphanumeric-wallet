@@ -1,5 +1,10 @@
 //! Entry point for the alphanumeric wallet.
 
+// A window, not a console: without this, Windows opens a black console
+// window behind the wallet, and closing it closes the wallet. Nothing the
+// wallet prints is for a console -- the node's output goes to its log file.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod theme;
 mod view;
