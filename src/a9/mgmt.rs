@@ -1052,6 +1052,32 @@ struct Contact {
     last_seen: u64,
 }
 
+/// Forty lowercase hex characters: an address as the node prints one.
+pub fn is_bare_address(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The address a `mine <target>` mines to: a loaded wallet's, by name or
+/// address, or the target itself when it is an address and no wallet has
+/// it. Mining needs nothing but an address -- `Miner::mine_block` takes one
+/// and a block carries no miner signature -- so a wallet whose key lives
+/// elsewhere (the GUI wallet) can be mined to without its key.
+pub fn resolve_mining_address(
+    wallets: &HashMap<String, Wallet>,
+    target: &str,
+) -> std::result::Result<String, String> {
+    if let Some(w) = wallets.get(target) {
+        return Ok(w.address.clone());
+    }
+    if let Some(w) = wallets.values().find(|w| w.address == target) {
+        return Ok(w.address.clone());
+    }
+    if is_bare_address(target) {
+        return Ok(target.to_string());
+    }
+    Err(format!("No wallet found with name or address: {target}"))
+}
+
 impl Mgmt {
     pub fn new(
         _db: Store,
@@ -1865,14 +1891,7 @@ impl Mgmt {
         prep_bar.enable_steady_tick(Duration::from_millis(100));
 
         let wallet_input = command[1].to_string();
-        let miner_wallet = if let Some(w) = wallets.get(&wallet_input) {
-            w
-        } else {
-            wallets
-                .values()
-                .find(|w| w.address == wallet_input)
-                .ok_or_else(|| format!("No wallet found with name or address: {}", wallet_input))?
-        };
+        let miner_address = resolve_mining_address(wallets, &wallet_input)?;
 
         // Tip snapshot ONLY — no mempool selection here. mine_block rebuilds its
         // template from the LIVE mempool on every pass (with its own
@@ -1913,7 +1932,7 @@ impl Mgmt {
                 &mut header,
                 &[],
                 MINING_NONCE_WINDOW,
-                miner_wallet.address.clone(),
+                miner_address.clone(),
                 use_gpu,
             )
             .await
@@ -1954,7 +1973,7 @@ impl Mgmt {
                 // reads as a lost reward. The chain ledger is authoritative either way.
                 let rotated_recipient = coinbase
                     .map(|tx| tx.recipient.as_str())
-                    .filter(|r| !r.eq_ignore_ascii_case(&miner_wallet.address))
+                    .filter(|r| !r.eq_ignore_ascii_case(&miner_address))
                     .map(str::to_owned);
                 if let Some(recipient) = &rotated_recipient {
                     writeln!(
@@ -1967,7 +1986,7 @@ impl Mgmt {
                 let breakdown = {
                     let blockchain_guard = blockchain.read().await;
                     blockchain_guard
-                        .get_wallet_balance_breakdown(&miner_wallet.address)
+                        .get_wallet_balance_breakdown(&miner_address)
                         .await?
                 };
 
@@ -4487,6 +4506,26 @@ mod tests {
     use crate::a9::blockchain::{ADDRESS_TX_FLAG_RECIPIENT, ADDRESS_TX_FLAG_SENDER};
     use crate::a9::codec;
     use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn a_bare_address_is_forty_lowercase_hex_characters() {
+        assert!(is_bare_address("089b61914421754ca33e03b42c6dcd9c709c6cc1"));
+        assert!(!is_bare_address("089B61914421754CA33E03B42C6DCD9C709C6CC1"));
+        assert!(!is_bare_address("089b61914421754ca33e03b42c6dcd9c709c6cc"));
+        assert!(!is_bare_address("default_wallet"));
+    }
+
+    #[test]
+    fn a_mining_target_resolves_to_a_wallet_or_a_bare_address() {
+        let mut wallets = HashMap::new();
+        wallets.insert("w".to_string(), Wallet::new(None).expect("wallet"));
+        let owned = wallets["w"].address.clone();
+        assert_eq!(resolve_mining_address(&wallets, "w").unwrap(), owned);
+        assert_eq!(resolve_mining_address(&wallets, &owned).unwrap(), owned);
+        let bare = "089b61914421754ca33e03b42c6dcd9c709c6cc1";
+        assert_eq!(resolve_mining_address(&wallets, bare).unwrap(), bare);
+        assert!(resolve_mining_address(&wallets, "nobody").is_err());
+    }
 
     /// One address-index row as `contacts` receives it: `flags` says whether the
     /// scanned wallet was the sender, the recipient, or (self-send) both.

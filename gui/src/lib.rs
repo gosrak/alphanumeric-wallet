@@ -19,6 +19,7 @@ pub mod node;
 pub mod photo;
 pub mod proc;
 pub mod seed;
+pub mod settings;
 pub mod startup;
 pub mod storage;
 pub mod tx;

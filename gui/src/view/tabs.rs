@@ -22,6 +22,7 @@ pub fn shortcut(key: &Key) -> Option<Screen> {
         Key::Named(Named::F2) => Some(Screen::Receive),
         Key::Named(Named::F3) => Some(Screen::Send),
         Key::Named(Named::F4) => Some(Screen::History),
+        Key::Named(Named::F5) => Some(Screen::Mining),
         Key::Named(Named::F6) => Some(Screen::Node),
         Key::Named(Named::F7) => Some(Screen::Settings),
         _ => None,
@@ -35,11 +36,12 @@ pub fn is_quit_shortcut(key: &Key) -> bool {
     matches!(key, Key::Named(Named::F10))
 }
 
-pub(crate) const TABS: [(&str, &str, Screen); 6] = [
+pub(crate) const TABS: [(&str, &str, Screen); 7] = [
     ("F1", "Wallet", Screen::Wallet),
     ("F2", "Receive", Screen::Receive),
     ("F3", "Send", Screen::Send),
     ("F4", "History", Screen::History),
+    ("F5", "Mining", Screen::Mining),
     ("F6", "Node", Screen::Node),
     ("F7", "Settings", Screen::Settings),
 ];
@@ -141,7 +143,7 @@ mod tests {
     /// `Screen`, it's quit, so `is_quit_shortcut` answers that separately.
     #[test]
     fn an_unmapped_key_changes_nothing() {
-        assert_eq!(shortcut(&Key::Named(Named::F5)), None);
+        assert_eq!(shortcut(&Key::Named(Named::F5)), Some(Screen::Mining));
         assert_eq!(shortcut(&Key::Named(Named::F8)), None);
         assert_eq!(shortcut(&Key::Named(Named::Enter)), None);
         assert_eq!(shortcut(&Key::Named(Named::F10)), None);

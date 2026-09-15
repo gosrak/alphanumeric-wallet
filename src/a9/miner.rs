@@ -77,6 +77,10 @@ pub mod status {
     // Only the address is a string, so it needs a lock. No contention, since
     // it's only touched at session start and end.
     static ADDRESS: RwLock<Option<String>> = RwLock::new(None);
+    /// Session totals and the attempt in flight, for the stats server.
+    static HASHES: AtomicU64 = AtomicU64::new(0);
+    static DIFFICULTY: AtomicU64 = AtomicU64::new(0);
+    static THREADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
     // `cargo test` runs tests in parallel by default, and this module's state
     // is a process global — without a shared lock, one test's
@@ -125,6 +129,9 @@ pub mod status {
         // session's numbers as this one's.
         HPS.store(0, Ordering::Relaxed);
         BLOCKS.store(0, Ordering::Relaxed);
+        HASHES.store(0, Ordering::Relaxed);
+        DIFFICULTY.store(0, Ordering::Relaxed);
+        THREADS.store(0, Ordering::Relaxed);
         USE_GPU.store(use_gpu, Ordering::Relaxed);
         if let Ok(mut slot) = ADDRESS.write() {
             *slot = Some(address.to_string());
@@ -158,6 +165,92 @@ pub mod status {
 
     pub fn record_block() {
         BLOCKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The session's hash count so far, however the backend counts it: the
+    /// CPU path adds each thread's batch, the GPU path stores the pool's sum.
+    pub fn add_hashes(h: u64) {
+        HASHES.fetch_add(h, Ordering::Relaxed);
+    }
+
+    pub fn record_hashes_total(h: u64) {
+        HASHES.store(h, Ordering::Relaxed);
+    }
+
+    pub fn hashes_total() -> u64 {
+        HASHES.load(Ordering::Relaxed)
+    }
+
+    pub fn record_difficulty(d: u64) {
+        DIFFICULTY.store(d, Ordering::Relaxed);
+    }
+
+    pub fn difficulty() -> u64 {
+        DIFFICULTY.load(Ordering::Relaxed)
+    }
+
+    pub fn record_threads(n: u32) {
+        THREADS.store(n, Ordering::Relaxed);
+    }
+
+    pub fn threads() -> u32 {
+        THREADS.load(Ordering::Relaxed)
+    }
+
+    /// One line per mining device, as the stats server publishes it. The
+    /// clocks are `None` until telemetry fills them in.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct DeviceFigures {
+        pub index: u32,
+        pub name: String,
+        pub hps: f64,
+        pub hashes: u64,
+        pub core_mhz: Option<u32>,
+        pub mem_mhz: Option<u32>,
+        pub temp_c: Option<u32>,
+        pub power_w: Option<f64>,
+    }
+
+    /// GPU: one per pool device. CPU: one line named for its threads.
+    /// Empty when nothing is mining.
+    pub fn devices() -> Vec<DeviceFigures> {
+        if !is_mining() {
+            return Vec::new();
+        }
+        if USE_GPU.load(Ordering::Relaxed) {
+            #[cfg(feature = "gpu_miner")]
+            {
+                let mut list: Vec<DeviceFigures> = crate::a9::gpu_miner::device_snapshots()
+                    .into_iter()
+                    .map(|d| DeviceFigures {
+                        index: d.index,
+                        name: d.name,
+                        hps: d.hps,
+                        hashes: d.hashes,
+                        core_mhz: None,
+                        mem_mhz: None,
+                        temp_c: None,
+                        power_w: None,
+                    })
+                    .collect();
+                crate::a9::gpu_telemetry::merge(&mut list, &crate::a9::gpu_telemetry::readings());
+                return list;
+            }
+            #[cfg(not(feature = "gpu_miner"))]
+            {
+                return Vec::new();
+            }
+        }
+        vec![DeviceFigures {
+            index: 0,
+            name: format!("CPU × {} threads", threads()),
+            hps: hashes_per_second() as f64,
+            hashes: hashes_total(),
+            core_mhz: None,
+            mem_mhz: None,
+            temp_c: None,
+            power_w: None,
+        }]
     }
 }
 
@@ -650,6 +743,13 @@ impl MiningManager {
                     if ghs <= 0.0 || difficulty == 0 {
                         continue; // first dispatch hasn't landed yet
                     }
+                    status::record_difficulty(difficulty);
+                    status::record_hashes_total(
+                        crate::a9::gpu_miner::device_snapshots()
+                            .iter()
+                            .map(|d| d.hashes)
+                            .sum(),
+                    );
                     let sweeps = progress_micro.load(Ordering::Relaxed) as f64 / 1e6;
                     pb.set_position(((sweeps.fract() * 100.0) as u64).min(99));
                     let eta = crate::a9::gpu_miner::format_eta(
@@ -1118,6 +1218,9 @@ impl MiningManager {
                 let progress_bar = Arc::clone(&progress_bar);
                 let hashes_done = Arc::clone(&hashes_done);
                 let header = header.clone();
+                // Recorded here, on the CPU path only: a GPU session must
+                // not report the thread count it never used.
+                status::record_threads(num_threads as u32);
                 match tokio::task::spawn_blocking(move || {
                     (0..num_threads as u64).into_par_iter().try_for_each(
                         |thread_id| -> Result<(), MiningError> {
@@ -1261,6 +1364,8 @@ impl MiningManager {
                                     let total = hashes_done
                                         .fetch_add(update_interval, Ordering::Relaxed)
                                         .saturating_add(update_interval);
+                                    status::add_hashes(update_interval);
+                                    status::record_difficulty(cached_difficulty);
                                     if let Ok(pb) = progress_bar.try_lock() {
                                         pb.set_position(total);
                                         let hash_hex = hex::encode(hash);

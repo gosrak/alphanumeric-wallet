@@ -5,6 +5,8 @@ pub mod codec;
 pub mod compact;
 #[cfg(feature = "gpu_miner")]
 pub mod gpu_miner;
+#[cfg(feature = "gpu_miner")]
+pub mod gpu_telemetry;
 pub mod ledger;
 pub mod mempool;
 pub mod mgmt;

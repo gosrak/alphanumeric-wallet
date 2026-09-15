@@ -486,6 +486,554 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::a9::blockchain::Block;
 
+/// One physical GPU as the node reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuDevice {
+    pub index: u32,
+    pub name: String,
+    pub backend: String,
+    pub vendor: u32,
+    pub device: u32,
+}
+
+/// One entry per physical card. `enumerate_adapters` lists a card once per
+/// backend (Vulkan and GL on Linux; DX12 too on Windows); keep the first,
+/// which is the preferred backend since the list is built in backend order.
+pub fn dedup_physical(list: Vec<GpuDevice>) -> Vec<GpuDevice> {
+    // GL names a card by its renderer string ("… /PCIe/SSE2") and reports
+    // no PCI ids, so it cannot be matched to its Vulkan/DX12/Metal twin.
+    // It is also never the backend to mine on when a real one is there:
+    // drop every GL adapter as soon as any other backend listed anything.
+    let has_real = list.iter().any(|d| d.backend != "Gl");
+    let list: Vec<GpuDevice> = if has_real {
+        list.into_iter().filter(|d| d.backend != "Gl").collect()
+    } else {
+        list
+    };
+    // Per vendor, the first backend that lists it sets the card count. A
+    // later backend listing no more cards of that vendor is showing the same
+    // cards again -- sometimes under an invented name and id, as Wine's DX12
+    // layer does ("GTX 470" for an RTX 5090) -- so it adds none. One that
+    // lists more keeps them, for a card only it can drive; its twins of the
+    // first backend's cards then fall to the exact match below.
+    let mut first_backend: Vec<(u32, String, usize)> = Vec::new(); // vendor, backend, count
+    for d in &list {
+        if !first_backend.iter().any(|(v, _, _)| *v == d.vendor) {
+            let count = list
+                .iter()
+                .filter(|o| o.vendor == d.vendor && o.backend == d.backend)
+                .count();
+            first_backend.push((d.vendor, d.backend.clone(), count));
+        }
+    }
+    let list: Vec<GpuDevice> = list
+        .iter()
+        .filter(|d| {
+            // Every vendor was recorded above; a miss keeps the adapter.
+            let Some((_, primary, primary_count)) =
+                first_backend.iter().find(|(v, _, _)| *v == d.vendor)
+            else {
+                return true;
+            };
+            if &d.backend == primary {
+                return true;
+            }
+            let here = list
+                .iter()
+                .filter(|o| o.vendor == d.vendor && o.backend == d.backend)
+                .count();
+            here > *primary_count
+        })
+        .cloned()
+        .collect();
+    let mut out: Vec<GpuDevice> = Vec::new();
+    for d in list {
+        if !out
+            .iter()
+            .any(|o| o.vendor == d.vendor && o.device == d.device && o.name == d.name)
+        {
+            out.push(d);
+        }
+    }
+    for (i, d) in out.iter_mut().enumerate() {
+        d.index = i as u32;
+    }
+    out
+}
+
+fn gpu_instance() -> (wgpu::Instance, wgpu::Backends) {
+    let backends = wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        ..Default::default()
+    });
+    (instance, backends)
+}
+
+fn device_of(info: &wgpu::AdapterInfo, index: u32) -> GpuDevice {
+    GpuDevice {
+        index,
+        name: info.name.clone(),
+        backend: format!("{:?}", info.backend),
+        vendor: info.vendor,
+        device: info.device,
+    }
+}
+
+static ADAPTERS: std::sync::OnceLock<Vec<GpuDevice>> = std::sync::OnceLock::new();
+
+/// The usable adapters, enumerated once per process. Software adapters
+/// (llvmpipe) are left out, the way `new_async` leaves them out. A driver
+/// that panics during enumeration reads as no adapters.
+pub fn usable_adapters() -> Vec<GpuDevice> {
+    ADAPTERS
+        .get_or_init(|| {
+            std::panic::catch_unwind(|| {
+                let (instance, backends) = gpu_instance();
+                let raw: Vec<GpuDevice> = instance
+                    .enumerate_adapters(backends)
+                    .into_iter()
+                    .map(|a| a.get_info())
+                    .filter(|gi| gi.device_type != wgpu::DeviceType::Cpu)
+                    .enumerate()
+                    .map(|(i, gi)| device_of(&gi, i as u32))
+                    .collect();
+                dedup_physical(raw)
+            })
+            .unwrap_or_default()
+        })
+        .clone()
+}
+
+/// Which usable adapters to mine on. `ALPHANUMERIC_GPU_INDEX=N` means exactly
+/// device N; `ALPHANUMERIC_GPU_DEVICES=0,2` a set; neither, every one.
+pub fn select_indices(
+    available: &[GpuDevice],
+    devices_env: Option<&str>,
+    index_env: Option<&str>,
+) -> Result<Vec<u32>, String> {
+    let n = available.len() as u32;
+    let check = |i: u32| -> Result<u32, String> {
+        if i < n {
+            Ok(i)
+        } else {
+            Err(format!(
+                "GPU index {i} is out of range: {n} usable GPU(s) found (valid 0..={})",
+                n.saturating_sub(1)
+            ))
+        }
+    };
+    if let Some(one) = index_env {
+        let i: u32 = one
+            .trim()
+            .parse()
+            .map_err(|_| format!("ALPHANUMERIC_GPU_INDEX={one:?} is not a number"))?;
+        return Ok(vec![check(i)?]);
+    }
+    if let Some(list) = devices_env {
+        let mut picked = Vec::new();
+        for part in list.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let i: u32 = part
+                .parse()
+                .map_err(|_| format!("ALPHANUMERIC_GPU_DEVICES entry {part:?} is not a number"))?;
+            let i = check(i)?;
+            if !picked.contains(&i) {
+                picked.push(i);
+            }
+        }
+        picked.sort_unstable();
+        if picked.is_empty() {
+            return Err("ALPHANUMERIC_GPU_DEVICES is set but names no GPU".into());
+        }
+        return Ok(picked);
+    }
+    Ok((0..n).collect())
+}
+
+impl GpuMiner {
+    /// Build on the physical card at `index` in [`usable_adapters`] order,
+    /// trying each backend that card is listed under (Vulkan first, then GL or
+    /// DX12) so a broken preferred backend falls back on the SAME card.
+    pub fn new_for_index(index: u32) -> Result<Self, String> {
+        pollster::block_on(async {
+            let target = usable_adapters()
+                .into_iter()
+                .find(|d| d.index == index)
+                .ok_or_else(|| format!("no usable GPU at index {index}"))?;
+            let (instance, backends) = gpu_instance();
+            let mut errors = Vec::new();
+            for adapter in instance.enumerate_adapters(backends) {
+                let gi = adapter.get_info();
+                if gi.device_type == wgpu::DeviceType::Cpu
+                    || gi.vendor != target.vendor
+                    || gi.device != target.device
+                    || gi.name != target.name
+                {
+                    continue;
+                }
+                match Self::try_build(&adapter).await {
+                    Ok(miner) => return Ok(miner),
+                    Err(e) => errors.push(format!("{} ({:?}): {e}", gi.name, gi.backend)),
+                }
+            }
+            Err(if errors.is_empty() {
+                format!("GPU {index} ({}) is no longer enumerable", target.name)
+            } else {
+                errors.join("; ")
+            })
+        })
+    }
+}
+
+/// Start of device slot `slot` of `slots` in the 64-bit nonce space: slots
+/// are `u64::MAX / slots` apart, the first at `base`.
+/// `(nonce, timestamp, difficulty, hash)` of a found block.
+pub type Hit = (u64, u64, u64, [u8; 32]);
+
+pub fn nonce_base_for_slot(base: u64, slot: usize, slots: usize) -> u64 {
+    let stride = u64::MAX / slots.max(1) as u64;
+    base.wrapping_add(stride.wrapping_mul(slot as u64))
+}
+
+/// Per-device counters. Every field is an atomic so the stats server reads
+/// them without a lock while the device threads write.
+struct DeviceStats {
+    index: u32,
+    name: String,
+    /// EWMA GH/s as f64 bits, carried across attempts.
+    rate_ewma_bits: AtomicU64,
+    hashes: AtomicU64,
+    alive: AtomicBool,
+    /// Converged dispatch size, carried across attempts (was the global
+    /// LAST_ITERS; each card converges to its own speed).
+    last_iters: std::sync::atomic::AtomicU32,
+}
+
+impl DeviceStats {
+    fn new(index: u32, name: String) -> Self {
+        Self {
+            index,
+            name,
+            rate_ewma_bits: AtomicU64::new(0f64.to_bits()),
+            hashes: AtomicU64::new(0),
+            alive: AtomicBool::new(true),
+            last_iters: std::sync::atomic::AtomicU32::new(4),
+        }
+    }
+}
+
+/// What the stats server publishes for one GPU.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceSnapshot {
+    pub index: u32,
+    pub name: String,
+    /// Hashes per second.
+    pub hps: f64,
+    pub hashes: u64,
+    pub alive: bool,
+}
+
+/// Every selected card, each with its own miner and counters.
+pub struct GpuPool {
+    miners: Vec<Arc<GpuMiner>>,
+    stats: Vec<DeviceStats>,
+}
+
+impl GpuPool {
+    fn build() -> Result<Self, String> {
+        let all = usable_adapters();
+        let chosen = select_indices(
+            &all,
+            std::env::var("ALPHANUMERIC_GPU_DEVICES").ok().as_deref(),
+            std::env::var("ALPHANUMERIC_GPU_INDEX").ok().as_deref(),
+        )?;
+        let mut miners = Vec::new();
+        let mut stats = Vec::new();
+        let mut errors = Vec::new();
+        for i in chosen {
+            let d = &all[i as usize];
+            let built = std::panic::catch_unwind(|| GpuMiner::new_for_index(i))
+                .unwrap_or_else(|_| Err("GPU init panicked (driver crash)".to_string()));
+            match built {
+                Ok(m) => {
+                    miners.push(Arc::new(m));
+                    stats.push(DeviceStats::new(d.index, d.name.clone()));
+                }
+                Err(e) => errors.push(format!("[{}] {}: {e}", d.index, d.name)),
+            }
+        }
+        if miners.is_empty() {
+            return Err(format!(
+                "no usable GPU adapter ({})",
+                if errors.is_empty() {
+                    "none found".to_string()
+                } else {
+                    errors.join("; ")
+                }
+            ));
+        }
+        for e in &errors {
+            eprintln!("  GPU skipped: {e}");
+        }
+        Ok(Self { miners, stats })
+    }
+
+    /// The same physical adapter built `copies` times -- two "devices" on a
+    /// one-GPU box, so the coordinator's multi-device paths run in a test.
+    #[cfg(test)]
+    pub fn build_for_test(copies: usize) -> Result<Self, String> {
+        let d = usable_adapters().first().ok_or("no GPU")?.clone();
+        let mut miners = Vec::new();
+        let mut stats = Vec::new();
+        for k in 0..copies {
+            miners.push(Arc::new(GpuMiner::new_for_index(d.index)?));
+            stats.push(DeviceStats::new(k as u32, d.name.clone()));
+        }
+        Ok(Self { miners, stats })
+    }
+
+    /// Slots of the devices that have not died.
+    pub fn live(&self) -> Vec<usize> {
+        (0..self.miners.len())
+            .filter(|&i| self.stats[i].alive.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    pub fn snapshots(&self) -> Vec<DeviceSnapshot> {
+        self.stats
+            .iter()
+            .map(|s| {
+                let ghs = f64::from_bits(s.rate_ewma_bits.load(Ordering::Relaxed));
+                DeviceSnapshot {
+                    index: s.index,
+                    name: s.name.clone(),
+                    hps: if ghs.is_finite() { ghs * 1e9 } else { 0.0 },
+                    hashes: s.hashes.load(Ordering::Relaxed),
+                    alive: s.alive.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    }
+
+    fn publish_total_rate(&self) {
+        let total: f64 = self
+            .stats
+            .iter()
+            .filter(|s| s.alive.load(Ordering::Relaxed))
+            .map(|s| f64::from_bits(s.rate_ewma_bits.load(Ordering::Relaxed)))
+            .filter(|g| g.is_finite())
+            .sum();
+        RATE_EWMA_BITS.store(total.to_bits(), Ordering::Relaxed);
+    }
+
+    fn reset_rates(&self) {
+        for s in &self.stats {
+            s.rate_ewma_bits.store(0f64.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// One block attempt on every live device at once. Device slot `k` of `n`
+    /// searches from `nonce_base_for_slot(base, k, n)`; the first hit stops
+    /// the others at their next dispatch boundary. A device that panics is
+    /// marked dead and skipped from then on; when the last one dies the panic
+    /// is re-raised so the caller's existing demote-to-CPU path runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attempt(
+        &self,
+        number: u32,
+        previous_hash: &[u8; 32],
+        merkle_root: &[u8; 32],
+        previous_difficulty: u64,
+        previous_block_timestamp: u64,
+        budget: Duration,
+        tip_counter: &AtomicU64,
+        tip_version: u64,
+        session_progress_micro: &AtomicU64,
+        stop: &AtomicBool,
+    ) -> Option<Hit> {
+        let live = self.live();
+        if live.is_empty() {
+            return None;
+        }
+        let hit: Mutex<Option<Hit>> = Mutex::new(None);
+        let found = AtomicBool::new(false);
+        let died: Mutex<Option<String>> = Mutex::new(None);
+        let base = crate::a9::miner::attempt_nonce_base();
+        let slots = live.len();
+        let deadline = Instant::now() + budget;
+        std::thread::scope(|scope| {
+            for (k, &slot) in live.iter().enumerate() {
+                let miner = Arc::clone(&self.miners[slot]);
+                let (hit, found, died) = (&hit, &found, &died);
+                scope.spawn(move || {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.device_search(
+                            &miner,
+                            slot,
+                            nonce_base_for_slot(base, k, slots),
+                            number,
+                            previous_hash,
+                            merkle_root,
+                            previous_difficulty,
+                            previous_block_timestamp,
+                            deadline,
+                            tip_counter,
+                            tip_version,
+                            session_progress_micro,
+                            stop,
+                            found,
+                        )
+                    }));
+                    match r {
+                        Ok(Some(h)) => {
+                            if let Ok(mut g) = hit.lock() {
+                                if g.is_none() {
+                                    *g = Some(h);
+                                }
+                            }
+                            found.store(true, Ordering::SeqCst);
+                        }
+                        Ok(None) => {}
+                        Err(payload) => {
+                            let s = &self.stats[slot];
+                            s.alive.store(false, Ordering::Relaxed);
+                            s.rate_ewma_bits.store(0f64.to_bits(), Ordering::Relaxed);
+                            let why = payload
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| payload.downcast_ref::<&str>().map(|m| m.to_string()))
+                                .unwrap_or_else(|| "device panicked".to_string());
+                            eprintln!("  GPU [{}] {} lost mid-session: {why}", s.index, s.name);
+                            if let Ok(mut d) = died.lock() {
+                                *d = Some(format!("[{}] {}: {why}", s.index, s.name));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        self.publish_total_rate();
+        let result = hit.into_inner().ok().flatten();
+        if result.is_none() && self.live().is_empty() {
+            let why = died
+                .into_inner()
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "every GPU died".to_string());
+            // Unwinds like a device panic would, so the caller's existing
+            // `note_gpu_died` + CPU-fallback path (miner.rs) handles it.
+            std::panic::resume_unwind(Box::new(format!("every GPU in the pool died: {why}")));
+        }
+        result
+    }
+
+    /// The single-card search loop, run on one device thread. See
+    /// [`gpu_mine_attempt`] for the dispatch sizing, preemption and display
+    /// rationale; this is that loop with per-device counters and the shared
+    /// `found` flag as an extra stop condition.
+    #[allow(clippy::too_many_arguments)]
+    fn device_search(
+        &self,
+        gpu: &GpuMiner,
+        slot: usize,
+        mut base: u64,
+        number: u32,
+        previous_hash: &[u8; 32],
+        merkle_root: &[u8; 32],
+        previous_difficulty: u64,
+        previous_block_timestamp: u64,
+        deadline: Instant,
+        tip_counter: &AtomicU64,
+        tip_version: u64,
+        session_progress_micro: &AtomicU64,
+        stop: &AtomicBool,
+        found: &AtomicBool,
+    ) -> Option<(u64, u64, u64, [u8; 32])> {
+        const THREADS: u32 = 65535 * 256;
+        const MAX_ITERS: u32 = 256;
+        let stats = &self.stats[slot];
+        let target_dispatch_ms =
+            adaptive_dispatch_target_ms(TIP_INTERVAL_EWMA_MS.load(Ordering::Acquire));
+        let tip_moved = || tip_counter.load(Ordering::Acquire) != tip_version;
+        let mut iters: u32 = stats.last_iters.load(Ordering::Relaxed).clamp(1, MAX_ITERS);
+        while Instant::now() < deadline
+            && !tip_moved()
+            && !stop.load(Ordering::Relaxed)
+            && !found.load(Ordering::Relaxed)
+        {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .max(previous_block_timestamp);
+            let difficulty = Block::consensus_next_difficulty(
+                previous_difficulty,
+                timestamp.saturating_sub(previous_block_timestamp),
+                number,
+            );
+            let zero_bits = (difficulty / 16) as u32;
+            let header = build_header(number, previous_hash, timestamp, 0, difficulty, merkle_root);
+
+            let per_dispatch = THREADS as u64 * iters as u64;
+            let dispatch_start = Instant::now();
+            let nonce = gpu.search_batch_iters(&header, zero_bits, base, THREADS, iters);
+            stats.hashes.fetch_add(per_dispatch, Ordering::Relaxed);
+            if let Some(nonce) = nonce {
+                if tip_moved() {
+                    record_tip_change_observation();
+                    return None;
+                }
+                let full = build_header(
+                    number,
+                    previous_hash,
+                    timestamp,
+                    nonce,
+                    difficulty,
+                    merkle_root,
+                );
+                let hash = *blake3::hash(&full).as_bytes();
+                return Some((nonce, timestamp, difficulty, hash));
+            }
+            let dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+            base = base.wrapping_add(per_dispatch);
+            iters = next_dispatch_iters(iters, dispatch_ms, target_dispatch_ms, MAX_ITERS);
+            stats.last_iters.store(iters, Ordering::Relaxed);
+
+            let inst_ghs = per_dispatch as f64 / (dispatch_ms.max(1.0) / 1000.0) / 1e9;
+            let prev = f64::from_bits(stats.rate_ewma_bits.load(Ordering::Relaxed));
+            let ghs = if prev.is_finite() && prev > 0.0 {
+                prev * 0.8 + inst_ghs * 0.2
+            } else {
+                inst_ghs
+            };
+            stats.rate_ewma_bits.store(ghs.to_bits(), Ordering::Relaxed);
+            self.publish_total_rate();
+            LAST_DIFFICULTY.store(difficulty, Ordering::Relaxed);
+            let progress_inc =
+                ((per_dispatch as f64 / expected_hashes(difficulty)) * 1e6).max(0.0) as u64;
+            session_progress_micro.fetch_add(progress_inc, Ordering::Relaxed);
+        }
+        if tip_moved() {
+            record_tip_change_observation();
+        }
+        None
+    }
+}
+
+/// Per-GPU figures of the cached pool; empty before the pool is built or
+/// while it is in the failed state.
+pub fn device_snapshots() -> Vec<DeviceSnapshot> {
+    let cache = GPU.lock().unwrap_or_else(|p| p.into_inner());
+    match &*cache {
+        GpuCache::Ready(pool) => pool.snapshots(),
+        _ => Vec::new(),
+    }
+}
+
 /// Process-wide cached GPU miner (init is ~100-200ms; reuse it across blocks).
 ///
 /// REBUILDABLE (was a write-once OnceLock): a mid-session device loss — Windows
@@ -507,7 +1055,7 @@ use crate::a9::blockchain::Block;
 /// marginal PSU/thermal/OC — and re-initializing wgpu every block is pure waste).
 enum GpuCache {
     Uninit,
-    Ready(Arc<GpuMiner>),
+    Ready(Arc<GpuPool>),
     Failed { reason: String, since: Instant },
 }
 
@@ -519,12 +1067,6 @@ static GPU: Mutex<GpuCache> = Mutex::new(GpuCache::Uninit);
 /// every mine command. Monotonic Instant (not wall-clock) so an NTP step can't
 /// perturb recovery timing.
 const REBUILD_BACKOFF: Duration = Duration::from_secs(30);
-
-/// Converged dispatch size, carried ACROSS attempts. Attempts end on every
-/// network tip change (~5s), and restarting the adaptive sizing from 4 each
-/// time meant the first dispatches of EVERY attempt ran far under the wall-
-/// clock target — with the rate display re-ramping alongside.
-static LAST_ITERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(4);
 
 /// Displayed-rate EWMA (f64 bits), carried across attempts. Instantaneous
 /// per-dispatch rate keeps template-rebuild gaps out of the denominator, and
@@ -575,27 +1117,21 @@ static LAST_DIFFICULTY: AtomicU64 = AtomicU64::new(0);
 /// checks each adapter inside its fallback loop, so an Ok here is a verified-
 /// correct BLAKE3 kernel on a working adapter (a broken preferred backend having
 /// fallen back, not demoted). Records Failed with a fresh backoff clock on error.
-fn build_into(cache: &mut GpuCache) -> Result<Arc<GpuMiner>, String> {
-    // catch_unwind: GpuMiner::new() -> new_async() can PANIC OUTSIDE try_build's
-    // own catch_unwind — a wedged driver's wgpu error handler panics in
-    // request_adapter/request_device/Instance::new, which are before the guarded
+fn build_into(cache: &mut GpuCache) -> Result<Arc<GpuPool>, String> {
+    // catch_unwind: a wedged driver's wgpu error handler can panic in
+    // Instance::new / request_adapter / request_device, before any guarded
     // region. Without catching it here the panic would unwind through the held
-    // Mutex guard: it would POISON the lock AND skip the `*cache = Failed` write
-    // below, so the backoff would never engage and every command would re-init +
-    // re-panic. Catching it records Failed (backoff engages) and lets the guard
-    // drop normally (no poison). GpuMiner::new is a plain fn item, so it is
-    // UnwindSafe without AssertUnwindSafe.
-    let built = std::panic::catch_unwind(GpuMiner::new)
+    // Mutex guard, poison the lock AND skip the `*cache = Failed` write, so the
+    // backoff would never engage. (Each device build inside GpuPool::build is
+    // guarded too; this catches enumeration and anything else.)
+    let built = std::panic::catch_unwind(GpuPool::build)
         .unwrap_or_else(|_| Err("GPU init panicked (driver crash)".to_string()));
     match built {
-        Ok(m) => {
-            // A rebuild may have switched adapters (fast dGPU -> slower fallback);
-            // re-arm the adaptive dispatch size from the floor so the first
-            // dispatch on the new adapter can't inherit the old one's converged
-            // (possibly MAX) iters and run for seconds before shrinking (during
-            // which the tip/stop checks can't fire). Cheap: rebuilds are rare.
-            LAST_ITERS.store(4, std::sync::atomic::Ordering::Relaxed);
-            let arc = Arc::new(m);
+        Ok(pool) => {
+            // A fresh pool starts every device's adaptive dispatch size from the
+            // floor (DeviceStats::new), so a rebuilt device can't inherit an old
+            // converged size and run for seconds before shrinking.
+            let arc = Arc::new(pool);
             *cache = GpuCache::Ready(Arc::clone(&arc));
             Ok(arc)
         }
@@ -614,7 +1150,7 @@ fn build_into(cache: &mut GpuCache) -> Result<Arc<GpuMiner>, String> {
 /// lock). The build runs while holding the lock — this serializes concurrent
 /// first-inits exactly like the old OnceLock::get_or_init, and there is no await
 /// held across the std Mutex (GpuMiner::new() is synchronous).
-fn shared_gpu_arc() -> Result<Arc<GpuMiner>, String> {
+fn shared_gpu_arc() -> Result<Arc<GpuPool>, String> {
     let mut cache = GPU.lock().unwrap_or_else(|p| p.into_inner());
     match &*cache {
         GpuCache::Ready(m) => return Ok(Arc::clone(m)),
@@ -634,7 +1170,7 @@ fn shared_gpu_arc() -> Result<Arc<GpuMiner>, String> {
 /// transient TDR (recovers in ~2s) resumes GPU mining immediately instead of
 /// waiting out the backoff window. (An UNDER-LOAD loss goes through
 /// note_gpu_died() into Failed, so it is backoff-throttled, not rebuilt here.)
-fn rebuild_gpu() -> Result<Arc<GpuMiner>, String> {
+fn rebuild_gpu() -> Result<Arc<GpuPool>, String> {
     let mut cache = GPU.lock().unwrap_or_else(|p| p.into_inner());
     build_into(&mut cache)
 }
@@ -658,29 +1194,37 @@ pub fn note_gpu_died(reason: &str) {
 /// The mine command prints this ONCE on stdout so `--gpu` is never silent
 /// about which adapter it picked (or that it picked none).
 pub fn gpu_status() -> Result<String, String> {
-    let miner = shared_gpu_arc()?;
-    // Re-verify per mine command: a cached-Ready miner can have died since the
-    // last command (driver reset/TDR) — without this the status line would claim
-    // a healthy GPU on a dead device. One 92-byte hash (~ms). A dead device can
-    // make the readback PANIC (get_mapped_range on a lost device) rather than
-    // return Err, so catch that too and treat it as a loss.
-    let alive = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| miner.self_check()))
-        .unwrap_or_else(|_| Err("device panicked during re-check".into()));
-    match alive {
-        Ok(()) => Ok(miner.adapter_name.clone()),
-        Err(_dead) => {
-            // Rebuild once now (new() self-checks + falls back internally). A
-            // transient TDR recovers in ~2s so GPU mining resumes this command;
-            // a persistently-dead GPU caches Failed and shared_gpu_arc's backoff
-            // throttles further attempts. Either way the caller's spawn_blocking
-            // JoinError arm still demotes to CPU if the rebuild itself dies.
-            let rebuilt = rebuild_gpu()?;
-            Ok(rebuilt.adapter_name.clone())
-        }
-    }
+    let pool = shared_gpu_arc()?;
+    // Re-verify per mine command: a cached-Ready device can have died since the
+    // last command (driver reset/TDR) -- without this the status line would claim
+    // a healthy GPU on a dead device. One 92-byte hash per device (~ms). A dead
+    // device can make the readback PANIC rather than return Err, so catch that
+    // too and treat it as a loss.
+    let all_alive = pool.live().len() == pool.miners.len()
+        && pool.miners.iter().all(|m| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.self_check()))
+                .unwrap_or_else(|_| Err("device panicked during re-check".into()))
+                .is_ok()
+        });
+    let pool = if all_alive {
+        pool
+    } else {
+        // Rebuild once now (each device self-checks and falls back across its
+        // backends). A transient TDR recovers in ~2s so GPU mining resumes this
+        // command; a persistently-dead pool caches Failed and the backoff
+        // throttles further attempts.
+        rebuild_gpu()?
+    };
+    pool.reset_rates();
+    Ok(pool
+        .stats
+        .iter()
+        .map(|s| s.name.clone())
+        .collect::<Vec<_>>()
+        .join(", "))
 }
 
-fn shared_gpu() -> Option<Arc<GpuMiner>> {
+fn shared_gpu() -> Option<Arc<GpuPool>> {
     shared_gpu_arc().ok()
 }
 
@@ -788,128 +1332,19 @@ pub fn gpu_mine_attempt(
     session_progress_micro: &AtomicU64,
     stop: &std::sync::atomic::AtomicBool,
 ) -> Option<(u64, u64, u64, [u8; 32])> {
-    let gpu = shared_gpu()?;
-    let deadline = Instant::now() + budget;
-    // Per-dispatch batch amortizes the readback (THREADS threads each testing
-    // `iters` nonces per GPU->CPU sync; THREADS*iters <= 65535*256*256 =
-    // 4,294,901,760 < 2^32 keeps the kernel's per-thread u32 offset exact;
-    // THREADS stays under wgpu's 65535 workgroups-per-dimension limit at
-    // 65535*256 = 16.7M).
-    //
-    // `iters` is ADAPTIVE, targeting ~250ms of wall-clock per dispatch: the tip
-    // check below only runs BETWEEN dispatches (a submitted wgpu dispatch cannot
-    // be aborted), so the dispatch size IS the preemption granularity. The old
-    // fixed 64 iters (~2^30 nonces) took multiple SECONDS per dispatch on slower
-    // adapters — an entire block interval mining a template that was stale the
-    // moment the readback returned, which read as "the GPU miner is always a few
-    // blocks behind the tip". 250ms keeps any adapter within a fraction of a
-    // block of the live tip while still amortizing the readback ~40x per second.
-    // MAX_ITERS 256 (was 64): 64 capped a dispatch at 1.07G nonces, so any card
-    // past ~4.3 GH/s ran sub-250ms dispatches and paid the readback/submit
-    // overhead up to 3x more often than designed (~1-3% on a 5090-class card).
-    // 65535*256*256 = 4,294,901,760 < 2^32, so the kernel's per-thread u32
-    // offset stays exact; the ~250ms adaptive target still bounds preemption.
-    const THREADS: u32 = 65535 * 256;
-    const MAX_ITERS: u32 = 256;
-    // ADAPTIVE dispatch target (was a fixed 140ms tuned to the 5s cadence):
-    // dispatch length trades fixed per-dispatch overhead T_o (measured
-    // ~1-2ms: fence round-trip + map + submit) against STALENESS — a dispatch
-    // in flight when the tip moves is all dead work, costing D/2 on average
-    // per tip change. Combined waste = T_o/D + D/(2·T_tip), minimized at
-    // D* = sqrt(2·T_o·T_tip). T_tip is MEASURED (EWMA of observed tip-change
-    // intervals, see record_tip_change_observation) because the live cadence
-    // swings: ~2s while difficulty climbs → D* ≈ 77ms (waste ~4.6% → ~3.9%
-    // vs the old 140), 5s at equilibrium → D* ≈ 122ms (where a fixed 77
-    // would be WORSE than 140). Clamped [50, 250]ms so a cadence outlier can
-    // never push preemption granularity to extremes; before the first
-    // measured interval, falls back to 77ms (the deploy-time ~2s cadence).
-    let target_dispatch_ms = adaptive_dispatch_target_ms(
-        TIP_INTERVAL_EWMA_MS.load(std::sync::atomic::Ordering::Acquire),
-    );
-
-    let tip_moved = || tip_counter.load(std::sync::atomic::Ordering::Acquire) != tip_version;
-    // Random window base (see attempt_nonce_base): same-wallet rigs build
-    // identical merkle roots within the same second, and anchored-at-0 bases
-    // made them scan near-identical (timestamp, nonce) space — one rig's whole
-    // hashrate wasted. Also what makes one-process-per-card multi-GPU sound.
-    let mut base: u64 = crate::a9::miner::attempt_nonce_base();
-    let mut iters: u32 = LAST_ITERS
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .clamp(1, MAX_ITERS);
-    // A dispatch can't be aborted once submitted, so `stop` is checked here
-    // between dispatches (every ~target_dispatch_ms) — the finest-grained the
-    // GPU allows. The caller ends the whole command when this returns.
-    while Instant::now() < deadline
-        && !tip_moved()
-        && !stop.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        // Clamped to the parent's timestamp (same as the CPU loop): a local
-        // clock behind the parent stamps headers that fail parent-timestamp
-        // validation only after the grind — every solve burned.
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .max(previous_block_timestamp);
-        let difficulty = Block::consensus_next_difficulty(
-            previous_difficulty,
-            timestamp.saturating_sub(previous_block_timestamp),
-            number,
-        );
-        let zero_bits = (difficulty / 16) as u32;
-        // Header with a placeholder nonce; the kernel substitutes each thread's.
-        let header = build_header(number, previous_hash, timestamp, 0, difficulty, merkle_root);
-
-        let per_dispatch = THREADS as u64 * iters as u64;
-        let dispatch_start = Instant::now();
-        if let Some(nonce) = gpu.search_batch_iters(&header, zero_bits, base, THREADS, iters) {
-            // A tip that moved while this dispatch was in flight dooms the nonce
-            // (the finalize guard rejects a parent mismatch anyway) — drop it here
-            // and let the caller rebuild against the new tip instead of spending a
-            // validate/finalize round on a dead block.
-            if tip_moved() {
-                record_tip_change_observation();
-                return None;
-            }
-            let full = build_header(
-                number,
-                previous_hash,
-                timestamp,
-                nonce,
-                difficulty,
-                merkle_root,
-            );
-            let hash = *blake3::hash(&full).as_bytes();
-            return Some((nonce, timestamp, difficulty, hash));
-        }
-        let dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
-        base = base.wrapping_add(per_dispatch);
-        iters = next_dispatch_iters(iters, dispatch_ms, target_dispatch_ms, MAX_ITERS);
-        LAST_ITERS.store(iters, std::sync::atomic::Ordering::Relaxed);
-
-        // Telemetry only — a handful of atomic stores, nothing that can stall
-        // this thread between dispatches. Rate = EWMA over per-dispatch
-        // instantaneous rates; progress accumulates per_dispatch/expected AT
-        // THIS DISPATCH'S DIFFICULTY in micro-expected-blocks.
-        let inst_ghs = per_dispatch as f64 / (dispatch_ms.max(1.0) / 1000.0) / 1e9;
-        let prev = f64::from_bits(RATE_EWMA_BITS.load(std::sync::atomic::Ordering::Relaxed));
-        let ghs = if prev.is_finite() && prev > 0.0 {
-            prev * 0.8 + inst_ghs * 0.2
-        } else {
-            inst_ghs
-        };
-        RATE_EWMA_BITS.store(ghs.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        LAST_DIFFICULTY.store(difficulty, std::sync::atomic::Ordering::Relaxed);
-        let progress_inc =
-            ((per_dispatch as f64 / expected_hashes(difficulty)) * 1e6).max(0.0) as u64;
-        session_progress_micro.fetch_add(progress_inc, std::sync::atomic::Ordering::Relaxed);
-    }
-    // Loop exit on a moved tip is the common attempt end — feed the cadence
-    // EWMA here too (deadline/stop exits record nothing: no change observed).
-    if tip_moved() {
-        record_tip_change_observation();
-    }
-    None
+    let pool = shared_gpu()?;
+    pool.attempt(
+        number,
+        previous_hash,
+        merkle_root,
+        previous_difficulty,
+        previous_block_timestamp,
+        budget,
+        tip_counter,
+        tip_version,
+        session_progress_micro,
+        stop,
+    )
 }
 
 /// Optimal dispatch wall-clock target for the measured tip-change cadence:
@@ -1091,5 +1526,251 @@ mod tests {
     fn self_check_passes() {
         let Some(m) = miner() else { return };
         m.self_check().expect("self-check");
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    fn dev(i: u32, name: &str) -> GpuDevice {
+        GpuDevice {
+            index: i,
+            name: name.into(),
+            backend: "Vulkan".into(),
+            vendor: 0x10de,
+            device: i,
+        }
+    }
+
+    #[test]
+    fn nothing_set_selects_every_usable_adapter() {
+        let all = vec![dev(0, "A"), dev(1, "B")];
+        assert_eq!(select_indices(&all, None, None).unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn gpu_devices_picks_by_index_and_rejects_unknown_ones() {
+        let all = vec![dev(0, "A"), dev(1, "B"), dev(2, "C")];
+        assert_eq!(
+            select_indices(&all, Some("2, 0"), None).unwrap(),
+            vec![0, 2]
+        );
+        assert!(select_indices(&all, Some("3"), None).is_err());
+        assert!(select_indices(&all, Some("x"), None).is_err());
+        assert!(select_indices(&all, Some(" , "), None).is_err());
+    }
+
+    #[test]
+    fn gpu_index_means_exactly_that_one() {
+        let all = vec![dev(0, "A"), dev(1, "B")];
+        assert_eq!(select_indices(&all, None, Some("1")).unwrap(), vec![1]);
+        assert!(select_indices(&all, None, Some("2")).is_err());
+    }
+
+    // The GL view of a card carries the renderer string, not the product
+    // name ("NVIDIA GeForce RTX 5090/PCIe/SSE2"), so a name match cannot
+    // catch it. GL is never the backend to mine on when a real one exists.
+    #[test]
+    fn a_gl_view_of_a_card_is_dropped_when_a_real_backend_lists_it() {
+        let vk = GpuDevice {
+            index: 0,
+            name: "NVIDIA GeForce RTX 5090".into(),
+            backend: "Vulkan".into(),
+            vendor: 0x10de,
+            device: 0x2b85,
+        };
+        let gl = GpuDevice {
+            index: 1,
+            name: "NVIDIA GeForce RTX 5090/PCIe/SSE2".into(),
+            backend: "Gl".into(),
+            vendor: 0x10de,
+            device: 0,
+        };
+        let kept = dedup_physical(vec![vk.clone(), gl.clone()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].backend, "Vulkan");
+        // GL alone (no other backend usable) is still a device.
+        assert_eq!(dedup_physical(vec![gl]).len(), 1);
+    }
+
+    fn nv(index: u32, name: &str, backend: &str, device: u32) -> GpuDevice {
+        GpuDevice {
+            index,
+            name: name.into(),
+            backend: backend.into(),
+            vendor: 0x10de,
+            device,
+        }
+    }
+
+    // Wine's DX12 layer shows the one real card again under an invented
+    // name and id ("GTX 470"): nothing matches it to its Vulkan twin but
+    // the count. A later backend listing no more cards of a vendor than
+    // the first one did adds no card.
+    #[test]
+    fn a_later_backend_with_no_more_cards_of_a_vendor_adds_none() {
+        let list = vec![
+            nv(0, "NVIDIA GeForce RTX 5090", "Vulkan", 0x2b85),
+            nv(1, "NVIDIA GeForce GTX 470", "Dx12", 0x06cd),
+        ];
+        let kept = dedup_physical(list);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].name, "NVIDIA GeForce RTX 5090");
+    }
+
+    // Two real cards seen by both backends stay two.
+    #[test]
+    fn two_cards_under_two_backends_stay_two() {
+        let list = vec![
+            nv(0, "A", "Vulkan", 1),
+            nv(1, "B", "Vulkan", 2),
+            nv(2, "A", "Dx12", 1),
+            nv(3, "B", "Dx12", 2),
+        ];
+        let kept = dedup_physical(list);
+        assert_eq!(
+            kept.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        assert!(kept.iter().all(|d| d.backend == "Vulkan"));
+    }
+
+    // A card only DX12 can drive (a CMP card with no working Vulkan) is not
+    // lost: DX12 lists more cards of the vendor than Vulkan did.
+    #[test]
+    fn a_card_only_a_later_backend_lists_is_kept() {
+        let list = vec![
+            nv(0, "A", "Vulkan", 1),
+            nv(1, "A", "Dx12", 1),
+            nv(2, "CMP 30HX", "Dx12", 3),
+        ];
+        let kept = dedup_physical(list);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(kept[1].name, "CMP 30HX");
+        assert_eq!(kept[1].index, 1);
+    }
+
+    // Another vendor under another backend is its own card.
+    #[test]
+    fn another_vendor_is_never_folded_away() {
+        let mut intel = nv(1, "Intel Arc", "Dx12", 9);
+        intel.vendor = 0x8086;
+        let kept = dedup_physical(vec![nv(0, "A", "Vulkan", 1), intel]);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_physical_adapters_across_backends_collapse_to_one() {
+        let vk = GpuDevice {
+            index: 0,
+            name: "X".into(),
+            backend: "Vulkan".into(),
+            vendor: 1,
+            device: 7,
+        };
+        let gl = GpuDevice {
+            index: 1,
+            name: "X".into(),
+            backend: "Gl".into(),
+            vendor: 1,
+            device: 7,
+        };
+        let other = GpuDevice {
+            index: 2,
+            name: "Y".into(),
+            backend: "Vulkan".into(),
+            vendor: 1,
+            device: 8,
+        };
+        let out = dedup_physical(vec![vk.clone(), gl, other]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], vk);
+        assert_eq!(out[1].index, 1);
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn slots_start_apart_and_the_first_starts_at_base() {
+        for slots in 1..=8usize {
+            let bases: Vec<u64> = (0..slots)
+                .map(|s| nonce_base_for_slot(1000, s, slots))
+                .collect();
+            assert_eq!(bases[0], 1000);
+            for w in bases.windows(2) {
+                assert!(
+                    w[1].wrapping_sub(w[0]) >= u64::MAX / slots as u64 - 1,
+                    "{bases:?}"
+                );
+            }
+        }
+    }
+
+    /// Needs a GPU. Builds the same adapter twice and lets both search: one
+    /// hit comes back and both devices did work.
+    #[test]
+    #[ignore]
+    fn gpu_two_slots_share_one_hit() {
+        let pool = GpuPool::build_for_test(2).expect("a GPU");
+        assert_eq!(pool.live().len(), 2);
+        let tip = AtomicU64::new(0);
+        let progress = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        // difficulty 16 on an old parent: zero_bits 1, a hit within one dispatch.
+        let hit = pool.attempt(
+            1,
+            &[0u8; 32],
+            &[0u8; 32],
+            16,
+            0,
+            Duration::from_secs(10),
+            &tip,
+            0,
+            &progress,
+            &stop,
+        );
+        assert!(hit.is_some());
+        let snaps = pool.snapshots();
+        assert_eq!(snaps.len(), 2);
+        assert!(snaps.iter().all(|s| s.alive));
+        assert!(snaps.iter().any(|s| s.hashes > 0));
+    }
+
+    /// Needs a GPU: a real search with no hit runs every device until the
+    /// budget, each reporting its own hashes and rate.
+    #[test]
+    #[ignore]
+    fn gpu_every_slot_reports_its_own_rate() {
+        let pool = GpuPool::build_for_test(2).expect("a GPU");
+        let tip = AtomicU64::new(0);
+        let progress = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        // A far-future parent timestamp keeps difficulty huge: no hit.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let hit = pool.attempt(
+            1,
+            &[1u8; 32],
+            &[2u8; 32],
+            16 * 200,
+            now,
+            Duration::from_millis(1500),
+            &tip,
+            0,
+            &progress,
+            &stop,
+        );
+        assert!(hit.is_none());
+        let snaps = pool.snapshots();
+        assert!(
+            snaps.iter().all(|s| s.hashes > 0 && s.hps > 0.0),
+            "{snaps:?}"
+        );
     }
 }

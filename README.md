@@ -31,6 +31,10 @@ node-side additions the wallet needs, on top.
   76-character master seed behind the passphrase.
 - **Keys from a node.** Paste the 64-hex address seed a node's `export-seed` prints, and
   that address joins the wallet — marked apart, spendable, removable.
+- **Mining, on the GPU or the CPU.** F5 starts the wallet's own node mining to one of your
+  addresses, on every GPU at once or on the CPU with the thread count you choose, and
+  shows each card's hashrate, clocks, temperature and power. The node is given an address,
+  never a key.
 
 ## Screens
 
@@ -38,6 +42,7 @@ node-side additions the wallet needs, on top.
 |---|---|
 | **F2 Receive** — the address, its QR, and the per-address seed behind the passphrase | ![Receive](docs/images/receive.png) |
 | **F3 Send** — the payment is priced, checked against the spendable ceiling, and shown in full before anything is signed | ![Send](docs/images/send.png) |
+| **F5 Mining** — start and stop the miner, choose the address, GPU or CPU; every device's figures and the rewards that arrived | ![Mining](docs/images/mining.png) |
 | **F6 Node** — what the node process is doing, its data directory and its log tail | ![Node](docs/images/node.png) |
 | **F7 Settings** — which node is in effect, the wallet file, and export / master seed / import | ![Settings](docs/images/settings.png) |
 | **Import an address** — paste a node's address seed; the address is shown before anything is stored | ![Import](docs/images/import-checked.png) |
@@ -106,6 +111,29 @@ Linux needs the usual desktop libraries for a `wgpu` window (Mesa, Wayland or X1
 
 The wallet file lives at `~/.alphanumeric-gui/seed.enc`.
 
+## Mining
+
+F5 runs the miner inside the wallet's own node. It is off until you start it.
+
+1. **Choose the payout address** — any address in this wallet. The node is told the
+   address and nothing else; mining needs no key.
+2. **Choose GPU or CPU.** GPU mining uses every usable card at once (Vulkan, DX12 or Metal
+   through wgpu — no CUDA needed), and each card can be switched off on its own. CPU mining
+   leaves two cores free by default so the node keeps up with the chain; the stepper sets
+   an exact thread count.
+3. **START MINING.** The node restarts with those settings (a few seconds; the chain data
+   stays). Change anything while it mines and **APPLY** does the same.
+
+While it mines, F5 shows the total hashrate, the difficulty, the expected work and time to
+a block, and a row per device: hashrate, core and memory clocks, temperature, power and
+hashes. Clocks, temperature and power come from the NVIDIA driver and show a dash on other
+vendors' cards. Rewards appear in the list below as they are found, with the blocks left
+until each can be spent.
+
+The choice is saved in `~/.alphanumeric-gui/settings.json` and comes back the next time
+the wallet opens, still stopped if you stopped it. **Mining runs a GPU at its power limit
+or every CPU core flat out**; mind the cooling.
+
 ## Backup, in one paragraph
 
 Your master seed restores every address the wallet derived, in order — write it down and
@@ -135,8 +163,12 @@ The wallet needs things the upstream node did not expose, so they live here too:
 - `/explorer/status` reports what the node is mining, and `/explorer/address` returns the
   `position` a history cursor needs.
 - A `/stats` server for the console's figures.
-- Headless mining (`ALPHANUMERIC_HEADLESS=1`, `ALPHANUMERIC_MINE=<wallet>`), so the wallet
-  can supervise a node with no REPL.
+- Headless mining (`ALPHANUMERIC_HEADLESS=1`, `ALPHANUMERIC_MINE=<wallet or address>`), so
+  the wallet can supervise a node with no REPL. A bare address is a valid target: the key
+  stays in the wallet.
+- One node mining on every GPU at once (`ALPHANUMERIC_GPU_DEVICES` to choose), and a
+  status that lists the GPUs and, while mining, each one's hashrate with NVIDIA clocks,
+  temperature and power.
 - `export-seed` / `import-seed`, the bridge that moves one address key between the two.
 
 Everything else about the node — consensus, storage, networking, CLI, environment

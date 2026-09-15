@@ -457,6 +457,13 @@ mod tests {
             mining_hps: None,
             mining_blocks: None,
             mining_payout_rotation: None,
+            gpu_built: false,
+            gpu_devices: Vec::new(),
+            mining_hashes: None,
+            mining_difficulty: None,
+            mining_expected_block_secs: None,
+            mining_threads: None,
+            mining_devices: Vec::new(),
         }
     }
 

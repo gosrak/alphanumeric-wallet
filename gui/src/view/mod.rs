@@ -1,6 +1,7 @@
 pub mod console;
 pub mod history;
 pub mod kit;
+pub mod mining;
 pub mod node;
 pub mod receive;
 pub mod send;

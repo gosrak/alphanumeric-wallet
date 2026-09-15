@@ -2952,6 +2952,37 @@ impl DiscoveryState {
     }
 }
 
+/// The GPUs this node could mine on, for the status endpoint.
+pub struct GpuList {
+    /// Whether the binary was built with the `gpu_miner` feature.
+    pub built: bool,
+    /// `(index, name)` per usable adapter, in `ALPHANUMERIC_GPU_DEVICES` order.
+    pub devices: Vec<(u32, String)>,
+}
+
+impl GpuList {
+    /// Cheap after the first call: the adapter list is enumerated once.
+    pub fn current() -> Self {
+        #[cfg(feature = "gpu_miner")]
+        {
+            Self {
+                built: true,
+                devices: crate::a9::gpu_miner::usable_adapters()
+                    .into_iter()
+                    .map(|d| (d.index, d.name))
+                    .collect(),
+            }
+        }
+        #[cfg(not(feature = "gpu_miner"))]
+        {
+            Self {
+                built: false,
+                devices: Vec::new(),
+            }
+        }
+    }
+}
+
 impl Node {
     //----------------------------------------------------------------------
     // Initialization
@@ -7706,6 +7737,9 @@ impl Node {
     /// When `payout_rotation` is true, the coinbase goes to a schedule
     /// address that rotates by height, and `mining_address` is not that
     /// address -- the two diverge in pool operation.
+    // One flat call from the stats handler, the way `gpu_mine_attempt` is:
+    // every argument is a separate reading of the miner's status module.
+    #[allow(clippy::too_many_arguments)]
     fn mining_status_json(
         mining: bool,
         address: Option<String>,
@@ -7713,9 +7747,25 @@ impl Node {
         hps: u64,
         blocks: u64,
         payout_rotation: bool,
+        gpu: &GpuList,
+        hashes: u64,
+        difficulty: u64,
+        threads: u32,
+        devices: &[crate::a9::miner::status::DeviceFigures],
     ) -> Value {
         let mut out = serde_json::Map::new();
         out.insert("mining".into(), json!(mining));
+        // Always present, mining or not: the wallet offers the GPU choice
+        // before anything is mining.
+        out.insert("gpu_built".into(), json!(gpu.built));
+        out.insert(
+            "gpu_devices".into(),
+            json!(gpu
+                .devices
+                .iter()
+                .map(|(i, n)| json!({"index": i, "name": n}))
+                .collect::<Vec<_>>()),
+        );
         if mining {
             if let Some(address) = address {
                 out.insert("mining_address".into(), json!(address));
@@ -7723,9 +7773,38 @@ impl Node {
             if let Some(backend) = backend {
                 out.insert("mining_backend".into(), json!(backend));
             }
+            // Between attempts the GPU display rate is reset to 0 while each
+            // device still carries its own; the total is then their sum.
+            let device_sum = devices.iter().map(|d| d.hps).sum::<f64>() as u64;
+            let hps = if hps == 0 { device_sum } else { hps };
             out.insert("mining_hps".into(), json!(hps));
             out.insert("mining_blocks".into(), json!(blocks));
             out.insert("mining_payout_rotation".into(), json!(payout_rotation));
+            out.insert("mining_hashes".into(), json!(hashes));
+            out.insert("mining_difficulty".into(), json!(difficulty));
+            // The same arithmetic the GPU progress bar uses: 2^(difficulty/16)
+            // hashes expected per block, at the current rate. No rate yet,
+            // no estimate: a floor of 1 H/s printed millions of days.
+            let expected = (hps > 0 && difficulty > 0)
+                .then(|| 2f64.powi((difficulty / 16).min(255) as i32) / hps as f64);
+            out.insert("mining_expected_block_secs".into(), json!(expected));
+            out.insert("mining_threads".into(), json!(threads));
+            out.insert(
+                "mining_devices".into(),
+                json!(devices
+                    .iter()
+                    .map(|d| json!({
+                        "index": d.index,
+                        "name": d.name,
+                        "hps": d.hps,
+                        "hashes": d.hashes,
+                        "core_mhz": d.core_mhz,
+                        "mem_mhz": d.mem_mhz,
+                        "temp_c": d.temp_c,
+                        "power_w": d.power_w,
+                    }))
+                    .collect::<Vec<_>>()),
+            );
         }
         Value::Object(out)
     }
@@ -7808,6 +7887,11 @@ impl Node {
                 // rereads it per block anyway, "the variable is set" already
                 // means "rotation runs in this process".
                 crate::a9::miner::PayoutSchedule::configured(),
+                &GpuList::current(),
+                crate::a9::miner::status::hashes_total(),
+                crate::a9::miner::status::difficulty(),
+                crate::a9::miner::status::threads(),
+                &crate::a9::miner::status::devices(),
             ),
         ) {
             base.extend(mining);
@@ -26280,18 +26364,163 @@ mod tests {
         assert!(waited >= Duration::from_secs(10));
     }
 
+    fn no_gpu() -> GpuList {
+        GpuList {
+            built: false,
+            devices: vec![],
+        }
+    }
+
+    #[test]
+    fn the_gpu_list_is_always_in_the_status() {
+        let gpu = GpuList {
+            built: true,
+            devices: vec![(0, "RTX".into())],
+        };
+        let v = Node::mining_status_json(false, None, None, 0, 0, false, &gpu, 0, 0, 0, &[]);
+        assert_eq!(v["gpu_built"], serde_json::json!(true));
+        assert_eq!(v["gpu_devices"][0]["index"], serde_json::json!(0));
+        assert_eq!(v["gpu_devices"][0]["name"], serde_json::json!("RTX"));
+        let v = Node::mining_status_json(false, None, None, 0, 0, false, &no_gpu(), 0, 0, 0, &[]);
+        assert_eq!(v["gpu_built"], serde_json::json!(false));
+        assert_eq!(v["gpu_devices"], serde_json::json!([]));
+    }
+
     // When not mining, the other four fields **must be absent**. Sending null
     // would leave a consumer unable to tell "mining, but the address is
     // unknown" apart from "not mining".
     #[test]
     fn an_idle_node_reports_mining_false_and_omits_the_rest() {
-        let v = Node::mining_status_json(false, None, None, 0, 0, false);
+        let v = Node::mining_status_json(false, None, None, 0, 0, false, &no_gpu(), 0, 0, 0, &[]);
         assert_eq!(v["mining"], serde_json::json!(false));
         assert!(v.get("mining_address").is_none());
         assert!(v.get("mining_backend").is_none());
         assert!(v.get("mining_hps").is_none());
         assert!(v.get("mining_blocks").is_none());
         assert!(v.get("mining_payout_rotation").is_none());
+    }
+
+    // Between two attempts the GPU display rate is reset to 0 while every
+    // device still carries its rate. The total must not read 0 then, and a
+    // zero rate must not produce a time-to-block of millions of days.
+    #[test]
+    fn the_total_rate_falls_back_to_the_devices_and_a_zero_rate_has_no_eta() {
+        use crate::a9::miner::status::DeviceFigures;
+        let gpu = GpuList {
+            built: true,
+            devices: vec![(0, "RTX".into())],
+        };
+        let devs = vec![DeviceFigures {
+            index: 0,
+            name: "RTX".into(),
+            hps: 16.5e9,
+            hashes: 1,
+            core_mhz: None,
+            mem_mhz: None,
+            temp_c: None,
+            power_w: None,
+        }];
+        let v = Node::mining_status_json(
+            true,
+            Some("a".into()),
+            Some("gpu"),
+            0,
+            0,
+            false,
+            &gpu,
+            1,
+            620,
+            0,
+            &devs,
+        );
+        assert_eq!(v["mining_hps"], serde_json::json!(16_500_000_000u64));
+        assert!(v["mining_expected_block_secs"].as_f64().unwrap() < 1.0e6);
+        let v = Node::mining_status_json(
+            true,
+            Some("a".into()),
+            Some("cpu"),
+            0,
+            0,
+            false,
+            &gpu,
+            0,
+            620,
+            4,
+            &[],
+        );
+        assert!(v["mining_expected_block_secs"].is_null());
+    }
+
+    // The totals and the per-device lines: what the wallet's F5 shows.
+    #[test]
+    fn a_mining_status_carries_totals_difficulty_and_devices() {
+        use crate::a9::miner::status::DeviceFigures;
+        let gpu = GpuList {
+            built: true,
+            devices: vec![(0, "RTX".into())],
+        };
+        let devs = vec![DeviceFigures {
+            index: 0,
+            name: "RTX".into(),
+            hps: 2.0e9,
+            hashes: 4_000_000_000,
+            core_mhz: Some(2500),
+            mem_mhz: None,
+            temp_c: Some(55),
+            power_w: Some(120.5),
+        }];
+        let v = Node::mining_status_json(
+            true,
+            Some("a".into()),
+            Some("gpu"),
+            2_000_000_000,
+            1,
+            false,
+            &gpu,
+            4_000_000_000,
+            640,
+            0,
+            &devs,
+        );
+        assert_eq!(v["mining_hashes"], serde_json::json!(4_000_000_000u64));
+        assert_eq!(v["mining_difficulty"], serde_json::json!(640));
+        assert!(v["mining_expected_block_secs"].as_f64().unwrap() > 0.0);
+        assert_eq!(v["mining_devices"][0]["core_mhz"], serde_json::json!(2500));
+        assert!(v["mining_devices"][0]["mem_mhz"].is_null());
+        assert_eq!(v["mining_devices"][0]["power_w"], serde_json::json!(120.5));
+        // CPU: one pseudo-device named for its threads.
+        let cpu = vec![DeviceFigures {
+            index: 0,
+            name: "CPU × 6 threads".into(),
+            hps: 1.0e6,
+            hashes: 10,
+            core_mhz: None,
+            mem_mhz: None,
+            temp_c: None,
+            power_w: None,
+        }];
+        let v = Node::mining_status_json(
+            true,
+            Some("a".into()),
+            Some("cpu"),
+            1_000_000,
+            0,
+            false,
+            &gpu,
+            10,
+            640,
+            6,
+            &cpu,
+        );
+        assert_eq!(v["mining_threads"], serde_json::json!(6));
+        assert_eq!(
+            v["mining_devices"][0]["name"],
+            serde_json::json!("CPU × 6 threads")
+        );
+        // Not mining: none of the mining_* keys.
+        let v = Node::mining_status_json(false, None, None, 0, 0, false, &gpu, 0, 0, 0, &[]);
+        assert!(v.get("mining_devices").is_none());
+        assert!(v.get("mining_hashes").is_none());
     }
 
     // When mining, all six fields appear. hps 0 keeps meaning "not measured
@@ -26305,6 +26534,11 @@ mod tests {
             0,
             3,
             false,
+            &no_gpu(),
+            0,
+            0,
+            0,
+            &[],
         );
         assert_eq!(v["mining"], serde_json::json!(true));
         assert_eq!(
@@ -26333,6 +26567,11 @@ mod tests {
             42,
             1,
             true,
+            &no_gpu(),
+            0,
+            0,
+            0,
+            &[],
         );
         assert_eq!(
             v["mining_payout_rotation"],

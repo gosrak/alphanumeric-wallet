@@ -1576,8 +1576,7 @@ async fn async_main() -> Result<()> {
             // for days — nobody is watching a headless console to notice. This
             // file already makes the same call for a key file it cannot read
             // ("Refusing to start walletless so the condition is not masked").
-            let known = wallets.contains_key(&config.wallet)
-                || wallets.values().any(|w| w.address == config.wallet);
+            let known = headless_target_is_known(&wallets, &config.wallet);
             if !known {
                 let mut names: Vec<&str> = wallets.keys().map(|s| s.as_str()).collect();
                 names.sort_unstable();
@@ -1612,7 +1611,8 @@ async fn async_main() -> Result<()> {
                 return Err(format!(
                     "{lead} Headless cannot prompt for a passphrase, so an encrypted wallet is \
                      skipped at load and will not appear here — the mining wallet must be \
-                     unencrypted. Refusing to start a node that was told to mine and cannot.",
+                     unencrypted. Refusing to start a node that was told to mine and cannot. \
+                     A bare 40-hex address is also accepted.",
                 )
                 .into());
             }
@@ -6056,6 +6056,18 @@ pub struct HeadlessMining {
     pub use_gpu: bool,
 }
 
+/// Whether `ALPHANUMERIC_MINE` names something the node can mine to: a
+/// loaded wallet by name or address, or a bare address (mining needs no
+/// key; see `mgmt::resolve_mining_address`).
+fn headless_target_is_known(
+    wallets: &HashMap<String, alphanumeric::a9::wallet::Wallet>,
+    target: &str,
+) -> bool {
+    wallets.contains_key(target)
+        || wallets.values().any(|w| w.address == target)
+        || alphanumeric::a9::mgmt::is_bare_address(target)
+}
+
 /// Reads `ALPHANUMERIC_MINE` / `ALPHANUMERIC_MINE_BACKEND`. `headless` is
 /// `ALPHANUMERIC_HEADLESS` -- refuses if the mining variable is set but we
 /// are not headless (silently ignoring it would bring up a node that mines
@@ -9091,6 +9103,16 @@ impl WhisperAccum {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_headless_gate_lets_a_bare_address_through_without_a_wallet() {
+        let wallets: HashMap<String, alphanumeric::a9::wallet::Wallet> = HashMap::new();
+        assert!(headless_target_is_known(
+            &wallets,
+            "089b61914421754ca33e03b42c6dcd9c709c6cc1"
+        ));
+        assert!(!headless_target_is_known(&wallets, "default_wallet"));
+    }
 
     // The history gate is on the PAYLOAD, not on the verb. Gating on
     // `import-seed` was a gate on the one spelling that works: a typo, a

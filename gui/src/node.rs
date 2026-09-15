@@ -38,6 +38,19 @@ pub struct NodeConfig {
     pub p2p_port: u16,
     pub explorer_port: u16,
     pub stats_port: u16,
+    /// `None`: a node that only syncs. The wallet fills this from its
+    /// settings when mining is on.
+    pub mining: Option<MiningLaunch>,
+}
+
+/// How the node mines when the wallet asks it to. Everything the node needs
+/// is an address -- no key. `gpu_devices` is `None` for "every usable GPU".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiningLaunch {
+    pub address: String,
+    pub backend: crate::settings::Backend,
+    pub cpu_threads: Option<u32>,
+    pub gpu_devices: Option<Vec<u32>>,
 }
 
 impl NodeConfig {
@@ -99,7 +112,7 @@ pub fn locate_binary(configured: Option<&Path>, exe_dir: &Path) -> Result<PathBu
 /// would drag the wallet's node into the mining node's configuration.
 /// `inherited_env_keys` are passed separately by the caller (Task 2).
 pub fn child_env(config: &NodeConfig) -> Vec<(String, String)> {
-    vec![
+    let mut env = vec![
         // Starts as a node with no wallet. With no `private.key` it
         // proceeds without a prompt (`main.rs`'s `async_main`, the
         // "Headless mode: no private.key found" branch).
@@ -127,7 +140,27 @@ pub fn child_env(config: &NodeConfig) -> Vec<(String, String)> {
             config.stats_port.to_string(),
         ),
         ("NO_COLOR".into(), "1".into()),
-    ]
+    ];
+    if let Some(m) = &config.mining {
+        env.push(("ALPHANUMERIC_MINE".into(), m.address.clone()));
+        env.push((
+            "ALPHANUMERIC_MINE_BACKEND".into(),
+            m.backend.as_env().into(),
+        ));
+        if let Some(n) = m.cpu_threads {
+            env.push(("ALPHANUMERIC_MINE_THREADS".into(), n.to_string()));
+        }
+        if let Some(list) = &m.gpu_devices {
+            env.push((
+                "ALPHANUMERIC_GPU_DEVICES".into(),
+                list.iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ));
+        }
+    }
+    env
 }
 
 /// The parent's variables the child gets back after `env_clear`: what the
@@ -822,7 +855,44 @@ mod tests {
             p2p_port: 7178,
             explorer_port: 8096,
             stats_port: 8097,
+            mining: None,
         }
+    }
+
+    // Mining on: exactly the mining variables join the spec list; off: none.
+    #[test]
+    fn a_mining_config_adds_exactly_the_mining_variables() {
+        let mut config = sample_config();
+        let address = "089b61914421754ca33e03b42c6dcd9c709c6cc1".to_string();
+        config.mining = Some(MiningLaunch {
+            address: address.clone(),
+            backend: crate::settings::Backend::Gpu,
+            cpu_threads: None,
+            gpu_devices: Some(vec![0, 2]),
+        });
+        let env: std::collections::HashMap<String, String> =
+            child_env(&config).into_iter().collect();
+        assert_eq!(env["ALPHANUMERIC_MINE"], address);
+        assert_eq!(env["ALPHANUMERIC_MINE_BACKEND"], "gpu");
+        assert_eq!(env["ALPHANUMERIC_GPU_DEVICES"], "0,2");
+        assert!(!env.contains_key("ALPHANUMERIC_MINE_THREADS"));
+
+        config.mining = Some(MiningLaunch {
+            address,
+            backend: crate::settings::Backend::Cpu,
+            cpu_threads: Some(4),
+            gpu_devices: None,
+        });
+        let env: std::collections::HashMap<String, String> =
+            child_env(&config).into_iter().collect();
+        assert_eq!(env["ALPHANUMERIC_MINE_BACKEND"], "cpu");
+        assert_eq!(env["ALPHANUMERIC_MINE_THREADS"], "4");
+        assert!(!env.contains_key("ALPHANUMERIC_GPU_DEVICES"));
+
+        config.mining = None;
+        assert!(child_env(&config)
+            .iter()
+            .all(|(k, _)| !k.starts_with("ALPHANUMERIC_MINE") && k != "ALPHANUMERIC_GPU_DEVICES"));
     }
 
     #[test]
@@ -977,6 +1047,7 @@ mod tests {
             p2p_port: 7178,
             explorer_port: 8096,
             stats_port: 8097,
+            mining: None,
         }
     }
 
@@ -1068,6 +1139,7 @@ mod tests {
             p2p_port: 7178,
             explorer_port: 8096,
             stats_port: 8097,
+            mining: None,
         };
         let result = {
             let _gate = spawn_gate();
@@ -1343,6 +1415,7 @@ mod tests {
             p2p_port: 17378,
             explorer_port: 18296,
             stats_port: 18297,
+            mining: None,
         };
         let mut node = NodeProcess::spawn(&config).expect("the node starts");
         let lock = config.lock_path();
@@ -1408,6 +1481,7 @@ mod tests {
             p2p_port: 7178,
             explorer_port: 8096,
             stats_port: 8097,
+            mining: None,
         });
         wait_for(
             || matches!(supervisor.state(), NodeState::Failed { .. }),
@@ -1445,6 +1519,7 @@ mod tests {
                 p2p_port: 7178,
                 explorer_port: 8096,
                 stats_port: 8097,
+                mining: None,
             }
         });
         wait_for(

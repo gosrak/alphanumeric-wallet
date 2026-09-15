@@ -964,6 +964,58 @@ pub fn choice_card(selected: bool, status: button_widget::Status) -> button_widg
     }
 }
 
+/// A drop-down (F5's payout address): an input's frame, the accent ring
+/// while it is open, so it reads as a field that holds a choice.
+pub fn pick_list(
+    _: &Theme,
+    status: iced::widget::pick_list::Status,
+) -> iced::widget::pick_list::Style {
+    use iced::widget::pick_list::Status;
+    let open = matches!(status, Status::Opened { .. });
+    let hovered = matches!(
+        status,
+        Status::Hovered | Status::Opened { is_hovered: true }
+    );
+    iced::widget::pick_list::Style {
+        text_color: VALUE,
+        placeholder_color: DIM,
+        handle_color: if open { ACCENT } else { MUTED },
+        background: Background::Color(if hovered { SURFACE_HIGH } else { SURFACE }),
+        border: Border {
+            color: if open {
+                ACCENT
+            } else if hovered {
+                LINE_STRONG
+            } else {
+                LINE
+            },
+            width: if open { 1.5 } else { 1.0 },
+            radius: Radius::from(6.0),
+        },
+    }
+}
+
+/// The list a drop-down opens. Opaque, unlike the panel surfaces: it lies
+/// over other widgets, and a translucent list let the cards beneath show
+/// through its rows.
+pub fn pick_list_menu(_: &Theme) -> iced::overlay::menu::Style {
+    iced::overlay::menu::Style {
+        background: Background::Color(Color {
+            a: 1.0,
+            ..SURFACE_HIGH
+        }),
+        border: Border {
+            color: LINE_STRONG,
+            width: 1.0,
+            radius: Radius::from(6.0),
+        },
+        text_color: TEXT,
+        selected_text_color: INK,
+        selected_background: Background::Color(ACCENT),
+        shadow: Shadow::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

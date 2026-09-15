@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "alphanumeric"
-version = "8.0.1"
+version = "8.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -123,6 +123,7 @@ dependencies = [
  "inquire",
  "ipnet",
  "lazy_static",
+ "libloading",
  "libp2p-core",
  "libp2p-identity",
  "libp2p-kad",
@@ -169,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "alphanumeric-gui"
-version = "8.1.0"
+version = "8.2.0"
 dependencies = [
  "aes-gcm",
  "argon2",

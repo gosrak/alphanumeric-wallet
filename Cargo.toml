@@ -40,7 +40,7 @@ chrono = "0.4"
 
 [package]
 name = "alphanumeric"
-version = "8.0.1"
+version = "8.1.0"
 edition = "2021"
 # The node is distributed as signed binaries, not as a crates.io package. This also
 # keeps the license gate scoped to third-party code: our own crate carries no
@@ -53,6 +53,9 @@ publish = false
 wgpu = { version = "22", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
+# NVML (NVIDIA clocks, temperature, power) opened at run time; the 0.8 line
+# wgpu already pulls in, so no second entry in the lockfile.
+libloading = { version = "0.8", optional = true }
 argon2 = { workspace = true }
 arrayref = "0.3"
 byteorder = "1.4"
@@ -148,7 +151,7 @@ bootstrap_publisher = []
 # Opt-in GPU mining backend (wgpu/WGSL BLAKE3). Deliberately NOT in default:
 # the dependency tree is heavy and mining stays CPU-first; enable with
 # `--features gpu_miner` and activate at runtime via `mine <wallet> --gpu`.
-gpu_miner = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+gpu_miner = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:libloading"]
 # One-time sled->redb database conversion tool for nodes migrating in place
 # (the explorer's initial cutover). Never in client release builds.
 sled-convert = ["dep:sled"]

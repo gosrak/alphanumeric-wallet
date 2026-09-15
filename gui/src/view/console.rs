@@ -11,6 +11,14 @@ use crate::theme;
 use crate::view::kit;
 use alphanumeric_gui::backend;
 
+/// Amount units (i128) as a coin string with its unit, `1.5 ALPHA`. Delegates
+/// to the one formatter this codebase already has (`model::format_coins`)
+/// so an amount never reads differently on two screens. The mining screen's
+/// WALLET MATURING (`view/mining.rs`) is where it is used.
+pub(crate) fn fmt_units(units: i128) -> String {
+    format!("{} ALPHA", alphanumeric_gui::model::format_coins(units))
+}
+
 pub fn or_dash<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "—".to_string())
 }
@@ -134,10 +142,17 @@ fn sync_label(behind: Option<u64>) -> (String, iced::Color) {
     }
 }
 
-/// A hashrate reported in H/s (the wire unit) as GH/s, for the header's
-/// `MINING … GH/s` chip.
+/// A hashrate reported in H/s (the wire unit) for the header's `MINING …`
+/// chip, in the unit it deserves: GH/s for a GPU, MH/s for a CPU session
+/// (which read "0.0 GH/s" before), kH/s below that.
 pub(crate) fn fmt_hashrate(hps: f64) -> String {
-    format!("{:.1} GH/s", hps / 1e9)
+    if hps >= 1e9 {
+        format!("{:.1} GH/s", hps / 1e9)
+    } else if hps >= 1e6 {
+        format!("{:.1} MH/s", hps / 1e6)
+    } else {
+        format!("{:.0} kH/s", hps / 1e3)
+    }
 }
 
 /// When the node isn't mining, it omits every `mining_*` field entirely
@@ -319,6 +334,20 @@ pub fn meter_grid<'a>(data: &ConsoleData<'a>) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A CPU session runs at tens of MH/s; "MINING 0.0 GH/s" reads as broken.
+    #[test]
+    fn the_header_hashrate_picks_its_unit() {
+        assert_eq!(fmt_hashrate(2.5e9), "2.5 GH/s");
+        assert_eq!(fmt_hashrate(18_100_000.0), "18.1 MH/s");
+        assert_eq!(fmt_hashrate(950_000.0), "950 kH/s");
+    }
+
+    #[test]
+    fn fmt_units_reuses_the_shared_coin_formatter() {
+        assert_eq!(fmt_units(150_000_000), "1.5 ALPHA");
+        assert_eq!(fmt_units(0), "0 ALPHA");
+    }
 
     /// An absent value is `—`, not 0. Drawing it as 0 would lie: "0 peers"
     /// (isolated), "0 hashrate" (nobody is mining).

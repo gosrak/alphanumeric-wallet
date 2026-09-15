@@ -41,6 +41,40 @@ pub struct NodeStatus {
     pub mining_hps: Option<f64>,
     pub mining_blocks: Option<u64>,
     pub mining_payout_rotation: Option<bool>,
+    /// Whether the node was built with the GPU miner (8.1.0+; false for an
+    /// older node, which sends nothing here).
+    pub gpu_built: bool,
+    /// The GPUs the node could mine on, always sent, mining or not.
+    pub gpu_devices: Vec<GpuDevice>,
+    pub mining_hashes: Option<u64>,
+    pub mining_difficulty: Option<u64>,
+    pub mining_expected_block_secs: Option<f64>,
+    pub mining_threads: Option<u32>,
+    /// One line per device while mining; empty otherwise.
+    pub mining_devices: Vec<MiningDevice>,
+}
+
+/// One usable GPU as the node lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GpuDevice {
+    pub index: u32,
+    pub name: String,
+}
+
+/// One device's figures while mining. The clocks, temperature and power
+/// come from the NVIDIA driver and are `None` for other vendors or where
+/// the driver's library is absent. The CPU backend sends one line named
+/// `CPU × N threads` with every one of those `None`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MiningDevice {
+    pub index: u32,
+    pub name: String,
+    pub hps: f64,
+    pub hashes: u64,
+    pub core_mhz: Option<u32>,
+    pub mem_mhz: Option<u32>,
+    pub temp_c: Option<u32>,
+    pub power_w: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +178,16 @@ struct WireStatus {
     mining_hps: Option<f64>,
     mining_blocks: Option<u64>,
     mining_payout_rotation: Option<bool>,
+    #[serde(default)]
+    gpu_built: bool,
+    #[serde(default)]
+    gpu_devices: Vec<GpuDevice>,
+    mining_hashes: Option<u64>,
+    mining_difficulty: Option<u64>,
+    mining_expected_block_secs: Option<f64>,
+    mining_threads: Option<u32>,
+    #[serde(default)]
+    mining_devices: Vec<MiningDevice>,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +256,13 @@ pub fn parse_status(json: &str) -> Result<NodeStatus, String> {
         mining_hps: wire.mining_hps.filter(|h| *h != 0.0),
         mining_blocks: wire.mining_blocks,
         mining_payout_rotation: wire.mining_payout_rotation,
+        gpu_built: wire.gpu_built,
+        gpu_devices: wire.gpu_devices,
+        mining_hashes: wire.mining_hashes,
+        mining_difficulty: wire.mining_difficulty,
+        mining_expected_block_secs: wire.mining_expected_block_secs,
+        mining_threads: wire.mining_threads,
+        mining_devices: wire.mining_devices,
     })
 }
 
@@ -845,6 +896,45 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // What F5 reads: the GPU list the node always sends, and the per-device
+    // mining figures while it mines.
+    #[test]
+    fn a_gpu_mining_status_parses_its_devices() {
+        let json = r#"{"version":"8.1.0","gpu_built":true,"gpu_devices":[{"index":0,"name":"RTX"}],
+          "mining":true,"mining_backend":"gpu","mining_hps":2.0e9,"mining_blocks":0,"mining_payout_rotation":false,
+          "mining_hashes":40,"mining_difficulty":640,"mining_expected_block_secs":12.5,"mining_threads":0,
+          "mining_devices":[{"index":0,"name":"RTX","hps":2.0e9,"hashes":40,"core_mhz":2500,"mem_mhz":null,"temp_c":50,"power_w":100.5}]}"#;
+        let s = parse_status(json).expect("parses");
+        assert!(s.gpu_built);
+        assert_eq!(
+            s.gpu_devices,
+            vec![GpuDevice {
+                index: 0,
+                name: "RTX".into()
+            }]
+        );
+        assert_eq!(s.mining_hashes, Some(40));
+        assert_eq!(s.mining_difficulty, Some(640));
+        assert_eq!(s.mining_expected_block_secs, Some(12.5));
+        assert_eq!(s.mining_threads, Some(0));
+        assert_eq!(s.mining_devices.len(), 1);
+        assert_eq!(s.mining_devices[0].core_mhz, Some(2500));
+        assert_eq!(s.mining_devices[0].mem_mhz, None);
+        assert_eq!(s.mining_devices[0].power_w, Some(100.5));
+        assert_eq!(s.mining_devices[0].hps, 2.0e9);
+    }
+
+    // An 8.0.1 node sends none of this; the wallet must still open against it.
+    #[test]
+    fn an_old_node_without_the_gpu_fields_still_parses() {
+        let json = r#"{"version":"8.0.1","height":1}"#;
+        let s = parse_status(json).expect("parses");
+        assert!(!s.gpu_built);
+        assert!(s.gpu_devices.is_empty());
+        assert!(s.mining_devices.is_empty());
+        assert_eq!(s.mining_difficulty, None);
+    }
 
     #[test]
     fn maturing_is_balance_minus_spendable_across_addresses() {

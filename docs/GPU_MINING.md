@@ -87,27 +87,26 @@ Common cases:
 
 ---
 
-## 4. Multi-GPU (one process per card)
+## 4. Multi-GPU
 
-Run **one miner process per GPU** and pin each process to a specific card with
-**`ALPHANUMERIC_GPU_INDEX=N`** (N = the 0-based adapter index).
+One process mines on **every usable GPU at once** (since 8.1.0). Each card gets
+its own worker thread and its own slice of the nonce space; the first card to
+find a block wins the attempt and the others stop. Nothing needs configuring
+for that.
 
-A 3-card rig:
+To limit the set, name the cards by their 0-based index:
 
 ```sh
-# terminal / service 1
-ALPHANUMERIC_GPU_INDEX=0 ./alphanumeric      # then:  mine <wallet> --gpu --continuous
-# terminal / service 2
-ALPHANUMERIC_GPU_INDEX=1 ./alphanumeric
-# terminal / service 3
-ALPHANUMERIC_GPU_INDEX=2 ./alphanumeric
+ALPHANUMERIC_GPU_DEVICES=0,2 ./alphanumeric    # cards 0 and 2, not 1
+ALPHANUMERIC_GPU_INDEX=1 ./alphanumeric        # exactly card 1 (the older switch, still honoured)
 ```
 
-Windows: `set ALPHANUMERIC_GPU_INDEX=1` per CMD session (or one scheduled
-task / service per card).
+Windows: `set ALPHANUMERIC_GPU_DEVICES=0,2` in the CMD session that starts the
+node, or the same variable in the service definition.
 
-**Mapping index → card:** when `ALPHANUMERIC_GPU_INDEX` is set, the miner prints
-the full adapter roster first, so you can see which index is which card:
+**Mapping index → card:** the stats endpoint (`/stats` on the stats port) always
+carries `gpu_devices`, one `{index, name}` per usable card, whether or not
+anything is mining; the miner also prints the roster at start:
 
 ```
   GPU [0] NVIDIA GeForce RTX 4090 (Vulkan)
@@ -115,25 +114,24 @@ the full adapter roster first, so you can see which index is which card:
   GPU [2] NVIDIA CMP 30HX (Dx12)
 ```
 
-An out-of-range index is reported (e.g. `ALPHANUMERIC_GPU_INDEX=5 is out of
-range: 3 GPU adapter(s) found (valid indices 0..=2)`).
+A card that appears under two backends (Vulkan and GL on Linux, DX12 too on
+Windows) is listed once, under the first backend found. An out-of-range index
+is reported (e.g. `GPU index 5 is out of range: 3 usable GPU(s) found (valid
+0..=2)`).
 
-**No coordination is required or configured.** Each process seeds a **random
-nonce base per attempt**, so separate processes grind disjoint regions of the
-nonce space and never duplicate work — with zero cross-process communication.
-Because of that:
+**Per-card figures.** While mining, `/stats` adds `mining_devices`: one entry
+per card with its hashrate, hashes this session and, on NVIDIA cards with the
+driver's NVML available (`nvml.dll` on Windows, `libnvidia-ml.so.1` elsewhere),
+the core and memory clocks, temperature and power draw. Other vendors show
+`null` there. `mining_hashes`, `mining_difficulty`, `mining_expected_block_secs`
+and `mining_threads` (CPU backend) sit beside it.
 
-- You can use the **same wallet on every card** (the random base de-correlates
-  them), or a **different wallet per card** — both are fine.
-- Adding or removing a card is just starting/stopping one more process; nothing
-  else needs to change.
+**A card that dies** mid-session (driver reset, hang) drops out of the pool and
+the rest carry on; when the last one dies the session falls back to CPU mining,
+as before.
 
-**Single-GPU** is the default: leave `ALPHANUMERIC_GPU_INDEX` unset and the
-miner uses the single best (high-performance) adapter.
-
-`WGPU_BACKEND` can be combined with `ALPHANUMERIC_GPU_INDEX` if a particular card
-needs a specific backend (e.g. a CMP card at index 2 that needs DX12 — set both
-for that process).
+`WGPU_BACKEND` still applies to the whole process; set it when a particular rig
+needs one backend for every card.
 
 ---
 

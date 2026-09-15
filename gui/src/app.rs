@@ -15,6 +15,7 @@ use alphanumeric_gui::model;
 use alphanumeric_gui::node;
 use alphanumeric_gui::photo::PhotoSecret;
 use alphanumeric_gui::seed::MasterSeed;
+use alphanumeric_gui::settings;
 use alphanumeric_gui::startup;
 use alphanumeric_gui::storage;
 use alphanumeric_gui::storage::WalletMetadata;
@@ -46,6 +47,8 @@ pub enum Screen {
     Send,
     /// All addresses' transaction history, merged.
     History,
+    /// What the miner is doing, and its controls.
+    Mining,
     /// The node process this wallet drives (or the external one it points
     /// at): state, resource use, log tail.
     Node,
@@ -64,6 +67,7 @@ impl Screen {
             Screen::Receive => "receive",
             Screen::Send => "send",
             Screen::History => "history",
+            Screen::Mining => "mining",
             Screen::Node => "node",
             Screen::Settings => "settings",
         }
@@ -612,6 +616,22 @@ pub struct App {
     /// still pending. Used to let a couple of frames pass before capturing
     /// -- see `Message::CaptureScreenshot`.
     screenshot_frames_seen: u32,
+    /// What the wallet remembers between runs: node binary and ports, and
+    /// the mining choices. Loaded once at start from `settings_path`.
+    pub settings: settings::Settings,
+    pub settings_path: Option<std::path::PathBuf>,
+    /// The last failure to write the settings file, shown on F5 and F7.
+    pub settings_error: Option<String>,
+    /// The GPUs the node last reported (`gpu_devices`), so F5 can offer the
+    /// per-GPU switches before anything mines.
+    pub known_gpus: Vec<backend::GpuDevice>,
+    /// The mining launch the running node was started with, to tell an
+    /// edited setting apart from an applied one.
+    pub launched_mining: Option<node::MiningLaunch>,
+    /// F5: why the last START was refused, until the next edit.
+    pub mining_error: Option<String>,
+    /// F5: the thread count as typed, so a half-edited field is not lost.
+    pub mining_threads_input: String,
 
     /// The console strip's last-read `/stats` and `/explorer/supply`.
     /// `None` until the first `ConsoleTick` answers. `node_stats` is kept
@@ -826,6 +846,21 @@ pub enum Message {
     /// Startup: the 1-second poll of the wallet's own node while it comes up.
     NodeTick,
     NodeStatusFetched(Result<backend::NodeStatus, backend::ApiError>),
+    /// F5: the address the rewards go to.
+    MiningAddressPicked(String),
+    /// F5: copy the address the node is mining to.
+    CopyPayout(String),
+    /// F5: GPU or CPU.
+    MiningBackendPicked(settings::Backend),
+    /// F5: the CPU thread count as typed; blank means the node's default.
+    MiningThreadsChanged(String),
+    /// F5: one GPU switched on (`true`) or off by its node index.
+    MiningGpuToggled(u32, bool),
+    /// F5: start mining with the settings as they stand -- saves them and
+    /// restarts the owned node with the mining variables.
+    MiningStart,
+    /// F5: stop mining -- saves `enabled: false` and restarts without them.
+    MiningStop,
     /// Startup: the node failed to come up (or was stopped) and the user
     /// asked to try again.
     RetryNode,
@@ -1110,6 +1145,21 @@ impl App {
             screenshot_dir: SCREENSHOT_DIR.get().cloned(),
             screenshot_taken: false,
             screenshot_frames_seen: 0,
+            settings: settings::Settings::default(),
+            // `None` under test for the same reason `start_node` is false
+            // there: a test must neither read nor overwrite the settings of
+            // the wallet the person running it actually uses. Tests that
+            // exercise saving set a temporary path themselves.
+            settings_path: if cfg!(test) {
+                None
+            } else {
+                settings::default_path()
+            },
+            settings_error: None,
+            known_gpus: Vec::new(),
+            launched_mining: None,
+            mining_error: None,
+            mining_threads_input: String::new(),
             node_stats: None,
             supply: None,
             stats_in_flight: false,
@@ -1138,11 +1188,143 @@ impl App {
             master_reveal_requests: 0,
             window_width: 1000.0,
         };
+        // Before the node starts: its binary, ports and mining come from here.
+        let loaded = app
+            .settings_path
+            .as_deref()
+            .map(settings::load)
+            .unwrap_or_default();
+        app.apply_loaded_settings(loaded);
         if start_node {
             app.ensure_owned_node();
             app.screen = Screen::Startup;
         }
         (app, Task::none())
+    }
+
+    /// Seeds the node inputs from the file and keeps the rest.
+    pub fn apply_loaded_settings(&mut self, loaded: settings::Settings) {
+        self.node_binary_input = loaded.node.binary.clone().unwrap_or_default();
+        let port = |p: Option<u16>| p.map(|p| p.to_string()).unwrap_or_default();
+        self.p2p_port_input = port(loaded.node.p2p_port);
+        self.explorer_port_input = port(loaded.node.explorer_port);
+        self.stats_port_input = port(loaded.node.stats_port);
+        self.mining_threads_input = loaded
+            .mining
+            .cpu_threads
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        self.settings = loaded;
+    }
+
+    /// An edit on F5 that the running node has not been started with.
+    pub fn mining_dirty(&self) -> bool {
+        self.mining_launch() != self.launched_mining
+    }
+
+    /// Every address of the wallet as an F5 drop-down entry: own and
+    /// imported, labelled the way F1 labels them, shortened to one line.
+    pub fn mining_address_choices(&self) -> Vec<PayoutChoice> {
+        self.wallet
+            .as_ref()
+            .map(|w| {
+                w.addresses
+                    .iter()
+                    .map(|e| PayoutChoice {
+                        label: format!(
+                            "[{}] {}",
+                            e.label(),
+                            crate::view::kit::short_address(&e.address)
+                        ),
+                        address: e.address.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The drop-down's selection: the saved payout address, if this wallet
+    /// holds it. A saved address the wallet does not hold selects nothing,
+    /// so START asks for a choice rather than mining to a stranger.
+    pub fn mining_selected_choice(&self) -> Option<PayoutChoice> {
+        let saved = self.settings.mining.address.as_deref()?;
+        self.mining_address_choices()
+            .into_iter()
+            .find(|c| c.address == saved)
+    }
+
+    /// `[0]`, `[IMP]`: how the miner panel names a payout address this
+    /// wallet holds. `None` for any other address.
+    pub fn payout_label(&self, address: &str) -> Option<String> {
+        self.wallet
+            .as_ref()?
+            .addresses
+            .iter()
+            .find(|e| e.address == address)
+            .map(|e| format!("[{}]", e.label()))
+    }
+
+    /// START and STOP both end here: remember the choice, then restart the
+    /// owned node so it picks the mining variables up (or drops them). A
+    /// node the wallet merely points at cannot be told to mine.
+    fn apply_mining(&mut self) -> Task<Message> {
+        self.save_settings();
+        if self.node_source != NodeSource::Owned {
+            self.mining_error =
+                Some("Mining needs the wallet's own node; this wallet points at another.".into());
+            return Task::none();
+        }
+        self.update(Message::RetryNode)
+    }
+
+    /// Writes the settings file from the inputs as they stand (an empty
+    /// input is "the default", stored as `None`). A failure is remembered
+    /// in `settings_error`, never fatal.
+    pub fn save_settings(&mut self) {
+        let text = |s: &str| {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        let port = |s: &str| s.trim().parse::<u16>().ok();
+        self.settings.node = settings::NodeSettings {
+            binary: text(&self.node_binary_input),
+            p2p_port: port(&self.p2p_port_input),
+            explorer_port: port(&self.explorer_port_input),
+            stats_port: port(&self.stats_port_input),
+        };
+        self.settings_error = match &self.settings_path {
+            Some(path) => settings::save(path, &self.settings).err(),
+            None => Some("No home directory to keep settings in.".to_string()),
+        };
+    }
+
+    /// The mining the node is launched with: `None` unless mining is on and
+    /// an address is chosen. The GPU list is sent only when some reported
+    /// GPU is switched off; otherwise the node uses every usable card.
+    pub fn mining_launch(&self) -> Option<node::MiningLaunch> {
+        let m = &self.settings.mining;
+        if !m.enabled {
+            return None;
+        }
+        let address = m.address.clone()?;
+        let gpu_devices = match m.backend {
+            settings::Backend::Gpu if !m.disabled_gpus.is_empty() => {
+                let kept: Vec<u32> = self
+                    .known_gpus
+                    .iter()
+                    .map(|g| g.index)
+                    .filter(|i| !m.disabled_gpus.contains(i))
+                    .collect();
+                (!kept.is_empty()).then_some(kept)
+            }
+            _ => None,
+        };
+        Some(node::MiningLaunch {
+            address,
+            backend: m.backend,
+            cpu_threads: m.cpu_threads,
+            gpu_devices,
+        })
     }
 
     /// Points the wallet's client at `self.node_url`, and moves `node_epoch`
@@ -1176,6 +1358,9 @@ impl App {
     /// a retry that leaves any one of them stale either polls the node that
     /// just failed, or jumps ahead on a reading that belonged to it.
     fn ensure_owned_node(&mut self) {
+        // What this start is asked to mine, recorded before the attempt so
+        // F5 can tell an edit from what the node was given.
+        self.launched_mining = self.mining_launch();
         // Dropped here, before the new one is built below, so an old and a
         // new child's lifetimes never overlap -- two processes racing for
         // the same port. `Message::RetryNode` also drops the supervisor
@@ -1227,7 +1412,9 @@ impl App {
             explorer_port,
             stats_port,
         ) {
-            Ok(config) => {
+            Ok(mut config) => {
+                config.mining = self.mining_launch();
+                self.launched_mining = config.mining.clone();
                 // Called directly, never from a `Task::perform` -- the
                 // supervisor spawns the child from a dedicated OS thread on
                 // purpose, so `PR_SET_PDEATHSIG` fires on the death of the
@@ -2119,6 +2306,7 @@ impl App {
             Message::NodeStatusFetched(result) => {
                 self.startup_poll_in_flight = false;
                 if let Ok(status) = result {
+                    note_gpus(&mut self.known_gpus, &status);
                     if let Some(height) = status.height {
                         self.sync_rate
                             .push(self.sync_origin.elapsed().as_secs_f64(), height);
@@ -2163,6 +2351,48 @@ impl App {
                 Task::none()
             }
 
+            Message::CopyPayout(address) => iced::clipboard::write(address),
+            Message::MiningAddressPicked(address) => {
+                self.settings.mining.address = Some(address);
+                self.mining_error = None;
+                Task::none()
+            }
+            Message::MiningBackendPicked(backend) => {
+                self.settings.mining.backend = backend;
+                self.mining_error = None;
+                Task::none()
+            }
+            Message::MiningThreadsChanged(text) => {
+                let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+                self.settings.mining.cpu_threads =
+                    digits.parse::<u32>().ok().map(|n| n.clamp(1, 1024));
+                self.mining_threads_input = digits;
+                self.mining_error = None;
+                Task::none()
+            }
+            Message::MiningGpuToggled(index, on) => {
+                let list = &mut self.settings.mining.disabled_gpus;
+                if on {
+                    list.retain(|i| *i != index);
+                } else if !list.contains(&index) {
+                    list.push(index);
+                    list.sort_unstable();
+                }
+                self.mining_error = None;
+                Task::none()
+            }
+            Message::MiningStart => {
+                if self.mining_selected_choice().is_none() {
+                    self.mining_error = Some("Pick the address the rewards go to first.".into());
+                    return Task::none();
+                }
+                self.settings.mining.enabled = true;
+                self.apply_mining()
+            }
+            Message::MiningStop => {
+                self.settings.mining.enabled = false;
+                self.apply_mining()
+            }
             Message::RetryNode => {
                 // Dropping the old supervisor here (rather than calling
                 // `stop()` on it) is what actually stops the node -- see
@@ -2173,6 +2403,7 @@ impl App {
                 // `node_settings` and the owned-node restart on the wallet
                 // screen's banner -- both want the same takeover to the
                 // startup screen so the user watches the new node come up.
+                self.save_settings();
                 self.supervisor = None;
                 self.ensure_owned_node();
                 // Through `Message::Show`, not a direct assignment, so this
@@ -2223,7 +2454,7 @@ impl App {
                 if stale {
                     return Task::none();
                 }
-                apply_status(wallet, status);
+                apply_status(wallet, &mut self.known_gpus, status);
                 let active = wallet.active;
                 if let Some(entry) = wallet.addresses.get_mut(active) {
                     // The active row really is retried in ~10s by the next
@@ -2283,7 +2514,7 @@ impl App {
                     }
                     return Task::none();
                 }
-                apply_status(wallet, status);
+                apply_status(wallet, &mut self.known_gpus, status);
                 for (entry, result) in wallet.addresses.iter_mut().zip(results) {
                     // No follow-up is scheduled for any of these rows until
                     // the next screen entry or manual refresh, so a retryable
@@ -2999,7 +3230,7 @@ impl App {
                 let Some(wallet) = &mut self.wallet else {
                     return Task::none();
                 };
-                apply_status(wallet, status);
+                apply_status(wallet, &mut self.known_gpus, status);
                 Task::none()
             }
             Message::HistoryMore => {
@@ -4007,7 +4238,7 @@ impl App {
                     return Task::none();
                 }
                 if let Some(wallet) = &mut self.wallet {
-                    apply_status(wallet, result);
+                    apply_status(wallet, &mut self.known_gpus, result);
                 }
                 Task::none()
             }
@@ -4224,6 +4455,7 @@ impl App {
             Screen::Receive => crate::view::receive::view(self),
             Screen::Send => crate::view::send::view(self),
             Screen::History => crate::view::history::view(self),
+            Screen::Mining => crate::view::mining::view(self),
             Screen::Node => crate::view::node::view(self),
             Screen::Settings => crate::view::settings::view(self),
         };
@@ -4439,11 +4671,38 @@ fn mining_from_status(
     })
 }
 
+/// One entry of F5's payout drop-down. The drop-down prints `label`; the
+/// selection carries `address`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayoutChoice {
+    pub label: String,
+    pub address: String,
+}
+
+impl std::fmt::Display for PayoutChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// Keeps the node's GPU roster whenever a status carries one (an 8.0.1 node
+/// sends none, and an empty list must not erase a roster already seen).
+fn note_gpus(known: &mut Vec<backend::GpuDevice>, status: &backend::NodeStatus) {
+    if !status.gpu_devices.is_empty() {
+        *known = status.gpu_devices.clone();
+    }
+}
+
 /// Applies a status fetch to wallet state. A retryable error is not a failure
 /// (spec 4.2): the last known status stays on screen, unchanged.
-fn apply_status(wallet: &mut WalletState, status: Result<backend::NodeStatus, backend::ApiError>) {
+fn apply_status(
+    wallet: &mut WalletState,
+    known_gpus: &mut Vec<backend::GpuDevice>,
+    status: Result<backend::NodeStatus, backend::ApiError>,
+) {
     match status {
         Ok(status) => {
+            note_gpus(known_gpus, &status);
             wallet.node_status = Some(status);
             wallet.node_status_error = None;
         }
@@ -4650,6 +4909,7 @@ fn build_node_config(
         p2p_port,
         explorer_port,
         stats_port,
+        mining: None,
     })
 }
 
@@ -4959,6 +5219,215 @@ async fn discover_via_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The launch the node gets: nothing unless mining is on and an address
+    // is chosen; the GPU list only when some GPU was switched off.
+    #[test]
+    fn the_mining_launch_follows_the_settings_and_the_reported_gpus() {
+        let (mut app, _) = App::new();
+        app.settings.mining.enabled = true;
+        app.settings.mining.address = Some("089b61914421754ca33e03b42c6dcd9c709c6cc1".into());
+        app.settings.mining.disabled_gpus = vec![1];
+        app.known_gpus = vec![
+            backend::GpuDevice {
+                index: 0,
+                name: "A".into(),
+            },
+            backend::GpuDevice {
+                index: 1,
+                name: "B".into(),
+            },
+            backend::GpuDevice {
+                index: 2,
+                name: "C".into(),
+            },
+        ];
+        let launch = app.mining_launch().expect("enabled with an address");
+        assert_eq!(launch.gpu_devices, Some(vec![0, 2]));
+        assert_eq!(launch.backend, settings::Backend::Gpu);
+        app.settings.mining.disabled_gpus.clear();
+        assert_eq!(app.mining_launch().unwrap().gpu_devices, None);
+        app.settings.mining.backend = settings::Backend::Cpu;
+        app.settings.mining.disabled_gpus = vec![1];
+        assert_eq!(
+            app.mining_launch().unwrap().gpu_devices,
+            None,
+            "CPU: no GPU list"
+        );
+        app.settings.mining.enabled = false;
+        assert!(app.mining_launch().is_none());
+        app.settings.mining.enabled = true;
+        app.settings.mining.address = None;
+        assert!(
+            app.mining_launch().is_none(),
+            "no address, nothing to mine to"
+        );
+    }
+
+    // Node settings from the file land in the inputs the node is built from.
+    #[test]
+    fn node_settings_from_the_file_seed_the_inputs() {
+        let (mut app, _) = App::new();
+        let mut s = settings::Settings::default();
+        s.node.p2p_port = Some(7180);
+        s.node.binary = Some("/opt/node".into());
+        app.apply_loaded_settings(s);
+        assert_eq!(app.p2p_port_input, "7180");
+        assert_eq!(app.explorer_port_input, "");
+        assert_eq!(app.node_binary_input, "/opt/node");
+        assert_eq!(app.resolved_ports().0, 7180);
+    }
+
+    // START remembers the choice, records the launch the node got, and
+    // notices when an edit since then has not been applied.
+    #[test]
+    fn start_saves_the_choice_and_relaunches_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_a_wallet(dir.path());
+        app.settings_path = Some(dir.path().join("settings.json"));
+        app.node_source = NodeSource::Owned;
+        let address = address_at(&app, 0);
+        let _ = app.update(Message::MiningAddressPicked(address.clone()));
+        let _ = app.update(Message::MiningBackendPicked(settings::Backend::Cpu));
+        let _ = app.update(Message::MiningThreadsChanged("3".into()));
+        let _ = app.update(Message::MiningStart);
+        assert!(app.settings.mining.enabled);
+        assert_eq!(app.settings.mining.cpu_threads, Some(3));
+        assert_eq!(
+            app.settings.mining.address.as_deref(),
+            Some(address.as_str())
+        );
+        let saved = settings::load(&dir.path().join("settings.json"));
+        assert!(saved.mining.enabled);
+        assert_eq!(saved.mining.backend, settings::Backend::Cpu);
+        assert_eq!(
+            app.launched_mining.as_ref().map(|l| l.backend),
+            Some(settings::Backend::Cpu)
+        );
+        assert!(!app.mining_dirty());
+        let _ = app.update(Message::MiningThreadsChanged("5".into()));
+        assert!(app.mining_dirty(), "an edit not yet applied");
+        let _ = app.update(Message::MiningStop);
+        assert!(!app.settings.mining.enabled);
+        assert!(app.launched_mining.is_none());
+        assert!(
+            !settings::load(&dir.path().join("settings.json"))
+                .mining
+                .enabled
+        );
+    }
+
+    // A saved address this wallet does not hold (the wallet was replaced
+    // since) is not mined to: START asks for a choice instead.
+    #[test]
+    fn start_refuses_a_saved_address_the_wallet_does_not_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_a_wallet(dir.path());
+        app.settings.mining.address = Some("ff".repeat(20));
+        let _ = app.update(Message::MiningStart);
+        assert!(!app.settings.mining.enabled);
+        assert!(app.mining_error.is_some());
+    }
+
+    #[test]
+    fn start_without_an_address_refuses_with_a_message() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::MiningStart);
+        assert!(!app.settings.mining.enabled);
+        assert!(app
+            .mining_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("address"));
+    }
+
+    // Switching a GPU off is remembered by its index; on again removes it.
+    #[test]
+    fn a_gpu_switch_edits_the_disabled_list() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::MiningGpuToggled(1, false));
+        let _ = app.update(Message::MiningGpuToggled(2, false));
+        assert_eq!(app.settings.mining.disabled_gpus, vec![1, 2]);
+        let _ = app.update(Message::MiningGpuToggled(1, true));
+        assert_eq!(app.settings.mining.disabled_gpus, vec![2]);
+    }
+
+    // The drop-down offers every address of the wallet, each labelled the way
+    // F1 labels it and shortened to fit one line.
+    #[test]
+    fn the_payout_choices_are_every_address_labelled_and_shortened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = app_with_two_addresses(dir.path());
+        let choices = app.mining_address_choices();
+        assert_eq!(choices.len(), 2);
+        for (position, choice) in choices.iter().enumerate() {
+            let address = address_at(&app, position);
+            assert_eq!(choice.address, address);
+            assert_eq!(
+                choice.label,
+                format!("[{position}] {}", crate::view::kit::short_address(&address))
+            );
+            assert_eq!(
+                choice.to_string(),
+                choice.label,
+                "what the drop-down prints"
+            );
+        }
+    }
+
+    // The drop-down shows the saved address as selected, and nothing when
+    // the saved address is not one of this wallet's (a restored or replaced
+    // wallet must not appear to mine to an address it does not hold).
+    #[test]
+    fn the_selected_payout_is_the_saved_address_when_the_wallet_holds_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_two_addresses(dir.path());
+        assert_eq!(app.mining_selected_choice(), None);
+        let second = address_at(&app, 1);
+        let _ = app.update(Message::MiningAddressPicked(second.clone()));
+        assert_eq!(
+            app.mining_selected_choice().map(|c| c.address),
+            Some(second)
+        );
+        app.settings.mining.address = Some("ff".repeat(20));
+        assert_eq!(app.mining_selected_choice(), None);
+    }
+
+    // What the miner panel names the payout by: this wallet's label for one
+    // of its own addresses, nothing for any other.
+    #[test]
+    fn the_payout_label_names_only_this_wallets_addresses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = app_with_two_addresses(dir.path());
+        assert_eq!(
+            app.payout_label(&address_at(&app, 1)).as_deref(),
+            Some("[1]")
+        );
+        assert_eq!(app.payout_label(&"ff".repeat(20)), None);
+    }
+
+    // COPY on the miner panel copies the address the node is mining to.
+    #[test]
+    fn copy_payout_writes_the_address_it_is_given() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_a_wallet(dir.path());
+        let _ = app.update(Message::CopyPayout(address_at(&app, 0)));
+    }
+
+    // What save_settings writes back: the inputs as they stand, empty = None.
+    #[test]
+    fn save_settings_records_the_inputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _) = App::new();
+        app.settings_path = Some(dir.path().join("settings.json"));
+        app.p2p_port_input = "7181".into();
+        app.node_binary_input = "  ".into();
+        app.save_settings();
+        assert!(app.settings_error.is_none());
+        let saved = settings::load(&dir.path().join("settings.json"));
+        assert_eq!(saved.node.p2p_port, Some(7181));
+        assert_eq!(saved.node.binary, None);
+    }
 
     // The hint names the file `node::locate_binary` will actually look
     // for. On Windows that is `alphanumeric.exe`; a hint without the suffix
@@ -6384,6 +6853,13 @@ mod tests {
                 mining_hps: None,
                 mining_blocks: None,
                 mining_payout_rotation: None,
+                gpu_built: false,
+                gpu_devices: Vec::new(),
+                mining_hashes: None,
+                mining_difficulty: None,
+                mining_expected_block_secs: None,
+                mining_threads: None,
+                mining_devices: Vec::new(),
             }),
         ));
         assert_eq!(
@@ -6914,6 +7390,13 @@ mod tests {
             mining_hps: None,
             mining_blocks: None,
             mining_payout_rotation: None,
+            gpu_built: false,
+            gpu_devices: Vec::new(),
+            mining_hashes: None,
+            mining_difficulty: None,
+            mining_expected_block_secs: None,
+            mining_threads: None,
+            mining_devices: Vec::new(),
         }
     }
 
