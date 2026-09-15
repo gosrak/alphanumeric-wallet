@@ -112,4 +112,8 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories licenses sources
-          arguments: --locked
+          # --workspace: without it cargo-deny roots the graph at the root
+          # package (the node) and never sees the wallet's dependencies --
+          # the ttf-parser exception in deny.toml was reported "not
+          # encountered" for exactly that reason.
+          arguments: --locked --workspace
